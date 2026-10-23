@@ -62,6 +62,11 @@ pub enum PoolError {
         message: String,
     },
 
+    /// TLS could not be set up, or the server would not offer it when it
+    /// was required.
+    #[error("tls: {0}")]
+    Tls(String),
+
     /// The pool has been shut down.
     #[error("the pool is closed")]
     Closed,

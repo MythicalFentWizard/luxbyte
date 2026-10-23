@@ -25,6 +25,7 @@ pub mod buf;
 pub mod error;
 pub mod frontend;
 pub mod startup;
+pub mod stream;
 pub mod types;
 
 mod framed;
@@ -33,6 +34,7 @@ mod raw;
 pub use error::{Peer, ProtocolError};
 pub use framed::Framed;
 pub use raw::{RawMessage, tag};
+pub use stream::Stream;
 
 /// The protocol version this crate implements, in the wire's packed form:
 /// major 3 in the high 16 bits, minor 0 in the low 16.

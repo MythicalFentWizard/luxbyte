@@ -14,6 +14,16 @@ commit_log = "./commit-log"
 user = "postgres"
 database = "shop"
 # password = "..."
+# libpq's sslmode names. prefer encrypts when the server offers it;
+# verify-full is what stops a man in the middle.
+tls = "prefer"
+# tls_ca_file = "/etc/luxbyte/backend-ca.pem"
+
+# TLS to clients. Without a certificate, clients that ask are declined.
+# [tls]
+# cert_file = "/etc/luxbyte/server.pem"
+# key_file = "/etc/luxbyte/server.key"
+# required = true
 
 [pool]
 max_size = 16
@@ -45,6 +55,8 @@ passthrough = true
 [admin]
 listen = "127.0.0.1:9187"
 # password_env = "LUXBYTE_ADMIN_PASSWORD"
+# Serve HTTPS with the [tls] certificate.
+# tls = true
 
 [topology]
 home_region = "eu-west"

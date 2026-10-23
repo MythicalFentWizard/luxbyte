@@ -69,6 +69,12 @@ impl<S> Framed<S> {
         self.read_buf.len()
     }
 
+    /// The stream underneath.
+    #[must_use]
+    pub const fn get_ref(&self) -> &S {
+        &self.stream
+    }
+
     /// Unwraps the stream, discarding any buffered input.
     ///
     /// Only sound once the protocol is at a message boundary with nothing

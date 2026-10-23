@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 use crate::metrics::Gauge;
 use crate::session::Shared;
@@ -63,6 +63,9 @@ pub struct AdminConfig {
     /// Serve a non-loopback address with no password anyway, for a
     /// deployment that authenticates in front of the proxy.
     pub open: bool,
+    /// Serve HTTPS with the `[tls]` certificate. A plain request to an
+    /// HTTPS port is dropped, never answered in the clear.
+    pub tls: bool,
 }
 
 impl AdminConfig {
@@ -148,6 +151,7 @@ fn evict(addresses: &mut HashMap<IpAddr, Attempts>) {
 /// The admin port's state.
 pub struct Admin {
     shared: Arc<Shared>,
+    tls: Option<crate::tls::Acceptor>,
     /// SHA-256 of the password; never the password itself.
     password: Option<[u8; 32]>,
     lockout: Lockout,
@@ -170,9 +174,14 @@ fn digest(text: &str) -> [u8; 32] {
 impl Admin {
     /// Prepares the admin port.
     #[must_use]
-    pub fn new(shared: Arc<Shared>, password: Option<&str>) -> Self {
+    pub fn new(
+        shared: Arc<Shared>,
+        password: Option<&str>,
+        tls: Option<crate::tls::Acceptor>,
+    ) -> Self {
         Self {
             shared,
+            tls,
             password: password.map(digest),
             lockout: Lockout::default(),
         }
@@ -218,7 +227,14 @@ pub async fn serve(listener: TcpListener, admin: Arc<Admin>) {
         };
         let admin = Arc::clone(&admin);
         tokio::spawn(async move {
-            if let Err(error) = handle(stream, peer, &admin).await {
+            let outcome = match &admin.tls {
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(encrypted) => handle(encrypted, peer, &admin).await,
+                    Err(error) => Err(error),
+                },
+                None => handle(stream, peer, &admin).await,
+            };
+            if let Err(error) = outcome {
                 tracing::debug!(%peer, %error, "admin request ended");
             }
         });
@@ -232,7 +248,7 @@ struct Request {
     authorization: Option<String>,
 }
 
-async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Option<Request>> {
     let mut head = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 1024];
     let complete = tokio::time::timeout(READ_TIMEOUT, async {
@@ -304,7 +320,11 @@ impl Response {
     }
 }
 
-async fn handle(mut stream: TcpStream, peer: SocketAddr, admin: &Admin) -> std::io::Result<()> {
+async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    peer: SocketAddr,
+    admin: &Admin,
+) -> std::io::Result<()> {
     let Some(request) = read_request(&mut stream).await? else {
         return write(
             &mut stream,
@@ -374,7 +394,7 @@ fn route(admin: &Admin, request: &Request) -> Response {
     }
 }
 
-async fn write(stream: &mut TcpStream, response: &Response) -> std::io::Result<()> {
+async fn write<S: AsyncWrite + Unpin>(stream: &mut S, response: &Response) -> std::io::Result<()> {
     let mut head = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\
          Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\

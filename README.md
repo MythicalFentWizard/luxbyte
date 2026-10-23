@@ -408,9 +408,15 @@ finished, transaction outcomes, pool occupancy — plus a JSON `/snapshot`,
 loopback without a password; the password is compared in constant time, and
 repeated wrong answers lock an address out for longer each time.
 
-Not written yet:
-
-- TLS, to clients and to backends.
+TLS runs both ways. To backends it takes libpq's `sslmode` names —
+`disable`, `prefer` (the default), `require`, `verify-ca`, `verify-full` —
+with their libpq meanings, against a configured CA or Mozilla's roots. To
+clients it answers `SSLRequest` with a configured certificate, can refuse
+clients that do not ask, closes a connection that sends bytes between its
+`SSLRequest` and the handshake (CVE-2021-23214), and declines a GSSAPI
+encryption request with the `N` that libpq expects rather than an error.
+The admin port can serve HTTPS with the same certificate; it then drops a
+plain request unanswered rather than reply in the clear.
 
 Alongside, not part of the proxy:
 

@@ -26,6 +26,8 @@ pub struct PoolConfig {
     pub idle_timeout: Duration,
     /// When a returned connection is reset before reuse.
     pub reset: ResetPolicy,
+    /// How connections are encrypted.
+    pub tls: crate::tls::BackendTls,
     /// The statement that resets one. `DISCARD ALL` undoes settings,
     /// prepared statements, cursors, `LISTEN`s and temporary tables.
     pub reset_query: String,
@@ -48,6 +50,7 @@ impl Default for PoolConfig {
             max_lifetime: Duration::from_secs(1_800),
             reset: ResetPolicy::WhenChanged,
             reset_query: "DISCARD ALL".to_owned(),
+            tls: crate::tls::BackendTls::disabled(),
         }
     }
 }
@@ -218,10 +221,11 @@ impl Pool {
             });
         }
 
-        let connection = Connection::connect(
+        let connection = Connection::connect_with(
             &self.shared.target,
             &self.shared.credentials,
             self.shared.config.connect_timeout,
+            &self.shared.config.tls,
         )
         .await?;
         self.shared.counters.opened.fetch_add(1, Ordering::Relaxed);

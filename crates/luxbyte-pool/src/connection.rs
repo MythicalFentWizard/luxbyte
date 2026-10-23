@@ -7,11 +7,13 @@ use luxbyte_proto::auth::{ScramClient, ScramKeys, md5_password};
 use luxbyte_proto::backend::{Authentication, Backend, TransactionStatus};
 use luxbyte_proto::startup::StartupParameters;
 use luxbyte_proto::tag;
-use luxbyte_proto::{Framed, Peer, ProtocolError, frontend};
+use luxbyte_proto::{Framed, Peer, ProtocolError, Stream, frontend};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::error::PoolError;
 use crate::pipeline::{Step, StepKind, StepReply};
+use crate::tls::{BackendTls, TlsMode};
 
 /// How a connection authenticates.
 #[derive(Clone, PartialEq, Eq)]
@@ -116,7 +118,7 @@ impl QueryResult {
 /// An open connection to a backend.
 #[derive(Debug)]
 pub struct Connection {
-    framed: Framed<TcpStream>,
+    framed: Framed<Stream>,
     target: ConnectionTarget,
     status: TransactionStatus,
     /// Reported by the server, needed to route a later `CancelRequest`.
@@ -140,11 +142,27 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Opens and authenticates a connection.
+    /// Opens and authenticates an unencrypted connection.
     pub async fn connect(
         target: &ConnectionTarget,
         credentials: &Credentials,
         connect_timeout: Duration,
+    ) -> Result<Self, PoolError> {
+        Self::connect_with(
+            target,
+            credentials,
+            connect_timeout,
+            &BackendTls::disabled(),
+        )
+        .await
+    }
+
+    /// Opens, encrypts as `tls` says, and authenticates a connection.
+    pub async fn connect_with(
+        target: &ConnectionTarget,
+        credentials: &Credentials,
+        connect_timeout: Duration,
+        tls: &BackendTls,
     ) -> Result<Self, PoolError> {
         let address = format!("{}:{}", target.host, target.port);
         let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(&address))
@@ -160,6 +178,12 @@ impl Connection {
         // Routing decisions are small and latency-sensitive; waiting 40 ms
         // for Nagle to fill a segment is the wrong trade here.
         stream.set_nodelay(true)?;
+        let stream = tokio::time::timeout(connect_timeout, negotiate(stream, target, tls))
+            .await
+            .map_err(|_| PoolError::ConnectTimeout {
+                target: target.to_string(),
+                after: connect_timeout,
+            })??;
 
         let mut connection = Self {
             framed: Framed::new(stream, Peer::Backend),
@@ -478,6 +502,12 @@ impl Connection {
         self.needs_reset = false;
     }
 
+    /// Whether the connection is encrypted.
+    #[must_use]
+    pub const fn is_encrypted(&self) -> bool {
+        self.framed.get_ref().is_encrypted()
+    }
+
     /// The transaction state last reported by the server.
     #[must_use]
     pub const fn status(&self) -> TransactionStatus {
@@ -540,5 +570,44 @@ impl Connection {
     pub async fn close(mut self) {
         let _ = frontend::terminate().map(|bytes| self.framed.queue_raw(&bytes));
         let _ = self.framed.shutdown().await;
+    }
+}
+
+/// Asks for TLS, inside PostgreSQL's own protocol, when the mode wants it.
+///
+/// The server answers one unframed byte: `S` to go ahead, `N` to decline.
+/// Only `prefer` may carry on in the clear after a refusal.
+async fn negotiate(
+    mut stream: TcpStream,
+    target: &ConnectionTarget,
+    tls: &BackendTls,
+) -> Result<Stream, PoolError> {
+    let Some(connector) = tls.connector() else {
+        return Ok(Stream::Plain(stream));
+    };
+    stream
+        .write_all(&luxbyte_proto::startup::encode_ssl_request()?)
+        .await?;
+    let mut answer = [0_u8; 1];
+    stream.read_exact(&mut answer).await?;
+    match answer {
+        [b'S'] => {
+            let name = rustls_pki_types::ServerName::try_from(target.host.clone())
+                .map_err(|error| PoolError::Tls(format!("{}: {error}", target.host)))?;
+            let encrypted = connector
+                .connect(name, stream)
+                .await
+                .map_err(|error| PoolError::Tls(format!("{target}: {error}")))?;
+            Ok(Stream::Client(Box::new(encrypted)))
+        }
+        [b'N'] if tls.mode() == TlsMode::Prefer => Ok(Stream::Plain(stream)),
+        [b'N'] => Err(PoolError::Tls(format!(
+            "{target} does not offer TLS, and the mode is {}",
+            tls.mode()
+        ))),
+        [other] => Err(PoolError::Protocol(ProtocolError::UnexpectedTag {
+            tag: char::from(other),
+            peer: Peer::Backend,
+        })),
     }
 }

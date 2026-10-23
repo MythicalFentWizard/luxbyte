@@ -11,7 +11,7 @@ use luxbyte_pool::{
 use luxbyte_proto::backend::{TransactionStatus, build};
 use luxbyte_proto::frontend::Frontend;
 use luxbyte_proto::startup::{CancelRequest, SSL_REQUEST_CODE, StartupRequest};
-use luxbyte_proto::{Framed, Peer, ProtocolError};
+use luxbyte_proto::{Framed, Peer, ProtocolError, Stream};
 use luxbyte_sql::combine::{AggregateFinish, Aggregates, Finish, RowsFinish};
 use luxbyte_sql::{Access, AnalysisCache, StatementAnalysis, TransactionOp};
 use luxbyte_txn::{Coordinator, Transaction};
@@ -50,6 +50,10 @@ pub struct Shared {
     pub cancels: crate::cancel::CancelRegistry,
     /// What the proxy has been doing.
     pub metrics: crate::metrics::Metrics,
+    /// Accepts TLS from clients, when a certificate is configured.
+    pub tls: Option<crate::tls::Acceptor>,
+    /// Refuse clients that do not ask for TLS.
+    pub tls_required: bool,
     /// The aggregate functions the database lists, and when they were read.
     pub aggregates: parking_lot::Mutex<Option<(std::time::Instant, Arc<Aggregates>)>>,
 }
@@ -96,7 +100,7 @@ pub enum SessionError {
 /// One client connection.
 pub struct Session {
     shared: Arc<Shared>,
-    client: Framed<TcpStream>,
+    client: Framed<Stream>,
     status: TransactionStatus,
     /// `SET` statements to replay onto every backend this session uses.
     settings: Vec<String>,
@@ -129,8 +133,11 @@ impl Session {
         let counted = Arc::clone(&shared);
         let _session = counted.metrics.session();
         stream.set_nodelay(true)?;
+        let Some((client, first)) = negotiate(&shared, stream).await? else {
+            return Ok(());
+        };
         let mut session = Self {
-            client: Framed::new(stream, Peer::Frontend),
+            client,
             status: TransactionStatus::Idle,
             settings: Vec::new(),
             transaction: None,
@@ -142,26 +149,25 @@ impl Session {
             key: None,
             shared,
         };
-        if session.startup().await? {
+        if session.startup(&first).await? {
             session.serve().await?;
         }
         Ok(())
     }
 
     /// Handles the startup phase. Returns whether to go on to serving.
-    async fn startup(&mut self) -> Result<bool, SessionError> {
-        let mut first = self.client.read_untagged().await?;
-
-        if is_request(&first, SSL_REQUEST_CODE) {
-            // TLS to the client is not implemented, and declining is the
-            // protocol's own answer rather than an error.
-            self.client.queue_raw(b"N");
-            self.client.flush().await?;
-            first = self.client.read_untagged().await?;
-        }
-
-        match StartupRequest::decode(&first)? {
+    async fn startup(&mut self, first: &luxbyte_proto::RawMessage) -> Result<bool, SessionError> {
+        match StartupRequest::decode(first)? {
             StartupRequest::Startup(parameters) => {
+                if self.shared.tls_required && !self.client.get_ref().is_encrypted() {
+                    self.fatal(
+                        "28000",
+                        "this proxy accepts only TLS connections; connect with sslmode=require \
+                         or stricter",
+                    )
+                    .await?;
+                    return Ok(false);
+                }
                 let Some(user) = parameters.get("user").map(ToOwned::to_owned) else {
                     self.fatal(
                         "28000",
@@ -211,8 +217,10 @@ impl Session {
                 }
                 Ok(false)
             }
+            // A second encryption request after the first was answered is
+            // a client out of step with the protocol.
             StartupRequest::GssEnc | StartupRequest::Ssl => {
-                self.fatal("0A000", "GSSAPI encryption is not supported")
+                self.fatal("08P01", "encryption was already negotiated")
                     .await?;
                 Ok(false)
             }
@@ -1110,6 +1118,60 @@ impl Session {
         self.client.flush().await?;
         Ok(())
     }
+}
+
+/// Answers the client's encryption requests and returns the connection,
+/// encrypted if it asked and a certificate is configured, with the first
+/// message that follows. `None` when the client went away or broke the
+/// protocol.
+async fn negotiate(
+    shared: &Shared,
+    stream: TcpStream,
+) -> Result<Option<(Framed<Stream>, luxbyte_proto::RawMessage)>, SessionError> {
+    let mut client = Framed::new(Stream::Plain(stream), Peer::Frontend);
+    let mut first = client.read_untagged().await?;
+    // At most one GSSAPI request and one TLS request, in that order, as
+    // libpq sends them.
+    for _ in 0..2 {
+        if is_request(&first, luxbyte_proto::startup::GSSENC_REQUEST_CODE) {
+            // Declining is the protocol's own answer, and a client built
+            // with GSSAPI tries TLS or plain text next.
+            client.queue_raw(b"N");
+            client.flush().await?;
+            first = client.read_untagged().await?;
+            continue;
+        }
+        if !is_request(&first, SSL_REQUEST_CODE) || client.get_ref().is_encrypted() {
+            break;
+        }
+        let Some(acceptor) = shared.tls.clone() else {
+            client.queue_raw(b"N");
+            client.flush().await?;
+            first = client.read_untagged().await?;
+            continue;
+        };
+        // Bytes sent after the request arrived unencrypted; taking them as
+        // part of the encrypted session is the injection CVE-2021-23214
+        // describes.
+        if client.buffered_input() > 0 {
+            return Ok(None);
+        }
+        client.queue_raw(b"S");
+        client.flush().await?;
+        let Some(plain) = client.into_inner().into_plain() else {
+            return Ok(None);
+        };
+        let encrypted = match acceptor.accept(plain).await {
+            Ok(encrypted) => encrypted,
+            Err(error) => {
+                tracing::debug!(%error, "a client's TLS handshake failed");
+                return Ok(None);
+            }
+        };
+        client = Framed::new(Stream::Server(Box::new(encrypted)), Peer::Frontend);
+        first = client.read_untagged().await?;
+    }
+    Ok(Some((client, first)))
 }
 
 fn is_request(message: &luxbyte_proto::RawMessage, code: i32) -> bool {
