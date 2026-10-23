@@ -29,4 +29,4 @@ pub use cancel::{CancelScope, CancelTarget, send_cancel};
 pub use connection::{Connection, ConnectionTarget, Credentials, QueryResult};
 pub use error::PoolError;
 pub use pipeline::{Step, StepKind, StepReply};
-pub use pool::{Pool, PoolConfig, PoolSet, PoolStats, PooledConnection};
+pub use pool::{Pool, PoolConfig, PoolSet, PoolStats, PooledConnection, ResetPolicy};

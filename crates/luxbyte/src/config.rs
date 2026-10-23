@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use luxbyte_core::Topology;
-use luxbyte_pool::{Credentials, PoolConfig};
+use luxbyte_pool::{Credentials, PoolConfig, ResetPolicy};
 use serde::{Deserialize, Serialize};
 
 /// The whole configuration file.
@@ -125,6 +125,23 @@ pub struct PoolSettings {
     pub idle_timeout_s: u64,
     /// Seconds a connection may live.
     pub max_lifetime_s: u64,
+    /// When a returned connection is reset: `when_changed`, `always` or
+    /// `never`.
+    pub reset: Reset,
+    /// The statement that resets one.
+    pub reset_query: String,
+}
+
+/// When a returned connection is reset, as the configuration spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reset {
+    /// Never.
+    Never,
+    /// When a statement visibly changed the session, such as a `SET`.
+    WhenChanged,
+    /// Every time, which also catches temporary tables.
+    Always,
 }
 
 impl Default for PoolSettings {
@@ -135,6 +152,8 @@ impl Default for PoolSettings {
             connect_timeout_ms: 5_000,
             idle_timeout_s: 300,
             max_lifetime_s: 1_800,
+            reset: Reset::WhenChanged,
+            reset_query: "DISCARD ALL".to_owned(),
         }
     }
 }
@@ -142,13 +161,19 @@ impl Default for PoolSettings {
 impl PoolSettings {
     /// Converts to the pool's own configuration.
     #[must_use]
-    pub const fn to_pool_config(&self) -> PoolConfig {
+    pub fn to_pool_config(&self) -> PoolConfig {
         PoolConfig {
             max_size: self.max_size,
             acquire_timeout: Duration::from_millis(self.acquire_timeout_ms),
             connect_timeout: Duration::from_millis(self.connect_timeout_ms),
             idle_timeout: Duration::from_secs(self.idle_timeout_s),
             max_lifetime: Duration::from_secs(self.max_lifetime_s),
+            reset: match self.reset {
+                Reset::Never => ResetPolicy::Never,
+                Reset::WhenChanged => ResetPolicy::WhenChanged,
+                Reset::Always => ResetPolicy::Always,
+            },
+            reset_query: self.reset_query.clone(),
         }
     }
 }

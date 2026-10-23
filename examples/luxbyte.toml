@@ -17,6 +17,11 @@ database = "shop"
 
 [pool]
 max_size = 16
+# Connections are shared between clients, so one that ran a SET, LISTEN or
+# PREPARE is reset before reuse, in the background. "always" also catches
+# temporary tables, at the cost of a reset on every return.
+reset = "when_changed"
+reset_query = "DISCARD ALL"
 
 # Clients authenticate with SCRAM-SHA-256 against PostgreSQL's own stored
 # verifiers. With nothing here the proxy trusts every client, and refuses to

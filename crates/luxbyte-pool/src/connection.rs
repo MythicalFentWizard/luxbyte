@@ -127,6 +127,10 @@ pub struct Connection {
     /// Set when the connection is known to be unusable, so it is retired
     /// rather than handed to someone else.
     poisoned: bool,
+    /// Set when a statement changed session state that would outlive it —
+    /// a `SET`, a `LISTEN`, a named prepared statement — so the connection
+    /// is reset before anyone else borrows it.
+    needs_reset: bool,
     /// Set while extended-query messages have been sent without a `Sync`.
     ///
     /// `ReadyForQuery` only arrives after a `Sync`, so until then the last
@@ -166,6 +170,7 @@ impl Connection {
             opened_at: Instant::now(),
             returned_at: Instant::now(),
             poisoned: false,
+            needs_reset: false,
             awaiting_sync: false,
         };
         connection.handshake(credentials).await?;
@@ -326,7 +331,10 @@ impl Connection {
                             .collect(),
                     );
                 }
-                Backend::CommandComplete { tag } => result.tags.push(tag.to_owned()),
+                Backend::CommandComplete { tag } => {
+                    self.note(tag);
+                    result.tags.push(tag.to_owned());
+                }
                 Backend::EmptyQueryResponse => result.tags.push(String::new()),
                 Backend::Error(notice) => failure = Some(notice.to_error()),
                 Backend::ReadyForQuery { status } => {
@@ -415,6 +423,9 @@ impl Connection {
                         break;
                     }
                     other if step.kind.ends_with(other) => {
+                        if let Ok(Backend::CommandComplete { tag }) = Backend::decode(&message) {
+                            self.note(tag);
+                        }
                         reply.messages.push(message);
                         break;
                     }
@@ -435,6 +446,36 @@ impl Connection {
             replies.push(reply);
         }
         Ok(replies)
+    }
+
+    /// Records what a completed command did to the session.
+    ///
+    /// Read from the command tag because that is where every route ends up:
+    /// a `SET` the proxy replayed, one the client sent inside a transaction,
+    /// one sent through the extended protocol. State that leaves no tag of
+    /// its own, such as a temporary table, needs `reset = always`.
+    fn note(&mut self, tag: &str) {
+        let verb = tag.split(' ').next().unwrap_or("");
+        let changes_session = matches!(
+            verb,
+            "SET" | "RESET" | "DISCARD" | "LISTEN" | "PREPARE" | "DECLARE"
+        ) && tag != "PREPARE TRANSACTION";
+        self.needs_reset |= changes_session;
+    }
+
+    /// Whether a statement left session state behind.
+    #[must_use]
+    pub const fn needs_reset(&self) -> bool {
+        self.needs_reset
+    }
+
+    /// Marks the connection as needing a reset before reuse.
+    pub const fn mark_for_reset(&mut self) {
+        self.needs_reset = true;
+    }
+
+    pub(crate) const fn reset_done(&mut self) {
+        self.needs_reset = false;
     }
 
     /// The transaction state last reported by the server.

@@ -335,7 +335,9 @@ Done, tested, and working:
   relocation state machine, and the routing planner.
 - **`luxbyte-pool`** — per-endpoint connection pooling, keyed by endpoint,
   database and role. A connection goes back to the pool only once the server
-  has reported it idle.
+  has reported it idle, and one that changed session state — a `SET`, a
+  `LISTEN`, a named statement — is reset in the background first, so one
+  client's settings never reach another.
 - **`luxbyte-txn`** — the two-phase commit coordinator, with a durable
   decision log and recovery in both directions.
 - **`luxbyte-testkit`** — an in-process PostgreSQL backend speaking the real

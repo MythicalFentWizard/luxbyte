@@ -24,6 +24,11 @@ pub struct PoolConfig {
     pub connect_timeout: Duration,
     /// Retire a connection that has sat unused for longer than this.
     pub idle_timeout: Duration,
+    /// When a returned connection is reset before reuse.
+    pub reset: ResetPolicy,
+    /// The statement that resets one. `DISCARD ALL` undoes settings,
+    /// prepared statements, cursors, `LISTEN`s and temporary tables.
+    pub reset_query: String,
     /// Retire a connection older than this, however busy it has been.
     ///
     /// Bounds the damage from anything that accumulates per connection on
@@ -41,8 +46,25 @@ impl Default for PoolConfig {
             connect_timeout: Duration::from_secs(5),
             idle_timeout: Duration::from_secs(300),
             max_lifetime: Duration::from_secs(1_800),
+            reset: ResetPolicy::WhenChanged,
+            reset_query: "DISCARD ALL".to_owned(),
         }
     }
+}
+
+/// When a connection is reset before it is reused.
+///
+/// Whatever one borrower changes about a session — `search_path`,
+/// `statement_timeout`, a temporary table — the next borrower inherits,
+/// silently. Resetting is what stops that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetPolicy {
+    /// Never; the caller guarantees nothing session-level is changed.
+    Never,
+    /// When a statement's command tag shows it changed the session.
+    WhenChanged,
+    /// Every time, for state that leaves no tag, such as temporary tables.
+    Always,
 }
 
 /// What a pool has been doing.
@@ -98,6 +120,12 @@ impl Shared {
             return Some(connection);
         }
         None
+    }
+
+    /// Counts a connection retired without being pooled.
+    fn discard(&self) {
+        self.counters.closed.fetch_add(1, Ordering::Relaxed);
+        self.counters.discarded.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Puts a connection back, or retires it.
@@ -361,6 +389,39 @@ impl Drop for PooledConnection {
             self.poison();
         }
         if let Some(connection) = self.connection.take() {
+            let reset = match self.shared.config.reset {
+                ResetPolicy::Never => false,
+                ResetPolicy::WhenChanged => connection.needs_reset(),
+                ResetPolicy::Always => true,
+            };
+            if reset && connection.is_reusable() {
+                // The reset runs behind the borrower's back, so nobody waits
+                // for it, and it keeps the permit, so the pool never holds
+                // more connections than it is allowed while one is resetting.
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    let shared = Arc::clone(&self.shared);
+                    let permit = self.permit.take();
+                    runtime.spawn(async move {
+                        let mut connection = connection;
+                        if connection
+                            .simple_query(&shared.config.reset_query)
+                            .await
+                            .is_ok()
+                        {
+                            connection.reset_done();
+                            shared.give_back(connection);
+                        } else {
+                            shared.discard();
+                        }
+                        drop(permit);
+                    });
+                    return;
+                }
+                // No runtime to reset it on, so it cannot be reused safely.
+                self.shared.discard();
+                drop(self.permit.take());
+                return;
+            }
             self.shared.give_back(connection);
         }
         // Dropped after the connection is back, so a waiter that is woken
