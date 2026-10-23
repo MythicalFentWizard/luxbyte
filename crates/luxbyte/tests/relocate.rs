@@ -11,14 +11,14 @@ use luxbyte_pool::{Connection, ConnectionTarget, Credentials, QueryResult};
 use luxbyte_proto::auth::ScramVerifier;
 use luxbyte_testkit::{Backend, BackendConfig, PreparedOutcome, Reply};
 
-const STORE: &str = "[directory_store]\noperators = [\"ops\"]\n";
+const STORE: &str = "[directory_store]\n";
 
 /// Two users: `ops`, an operator, and `app`, who is not.
 fn auth() -> String {
     let ops = ScramVerifier::derive("ops-pw", b"salt-ops", 4096).unwrap();
     let app = ScramVerifier::derive("app-pw", b"salt-app", 4096).unwrap();
     format!(
-        "[auth]\n\n[[auth.users]]\nname = \"ops\"\nverifier = \"{}\"\n\n\
+        "[auth]\noperators = [\"ops\"]\n\n[[auth.users]]\nname = \"ops\"\nverifier = \"{}\"\n\n\
          [[auth.users]]\nname = \"app\"\nverifier = \"{}\"\n",
         ops.to_postgres_string(),
         app.to_postgres_string()
@@ -540,10 +540,7 @@ async fn a_statement_that_cannot_wait_is_refused_with_a_retryable_error() {
             "INSERT INTO \"public\".\"orders\"",
             Duration::from_millis(600),
         ),
-        &format!(
-            "{}\n[directory_store]\noperators = [\"ops\"]\nhold_ms = 50\n",
-            auth()
-        ),
+        &format!("{}\n[directory_store]\nhold_ms = 50\n", auth()),
     )
     .await;
     let mut ops = connect(&proxy, "ops").await;
@@ -706,10 +703,7 @@ async fn a_move_waits_for_writes_already_under_way() {
     let (eu, us, proxy) = start(
         europe().slow_on("UPDATE users SET name = 'slow'", Duration::from_millis(500)),
         america(),
-        &format!(
-            "{}\n[directory_store]\noperators = [\"ops\"]\nlock_timeout_ms = 100\n",
-            auth()
-        ),
+        &format!("{}\n[directory_store]\nlock_timeout_ms = 100\n", auth()),
     )
     .await;
     let mut app = connect(&proxy, "app").await;

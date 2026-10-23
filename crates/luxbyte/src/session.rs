@@ -459,11 +459,7 @@ impl Session {
             return self.ready().await;
         }
 
-        if let Some(command) = crate::relocate::parse(sql) {
-            match self.relocate(command).await {
-                Ok(result) => self.respond(&result)?,
-                Err(refusal) => self.error(&refusal)?,
-            }
+        if self.operator_command(sql).await? {
             return self.ready().await;
         }
 
@@ -617,6 +613,83 @@ impl Session {
         }
     }
 
+    /// Runs `DRAIN`, `UNDRAIN` or `RELOCATE`, if that is what `sql` is.
+    /// Returns whether it was.
+    async fn operator_command(&mut self, sql: &str) -> Result<bool, SessionError> {
+        if let Some(command) = crate::health::parse_drain(sql) {
+            match self.drain(command).await {
+                Ok(tag) => self.command_complete(tag)?,
+                Err(refusal) => self.error(&refusal)?,
+            }
+            return Ok(true);
+        }
+        if let Some(command) = crate::relocate::parse(sql) {
+            match self.relocate(command).await {
+                Ok(result) => self.respond(&result)?,
+                Err(refusal) => self.error(&refusal)?,
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Refuses an operator's command to anyone who is not one.
+    fn operator(&self, verb: &str) -> Result<(), Refusal> {
+        if self.shared.auth.is_operator(&self.user) {
+            return Ok(());
+        }
+        // With trust authentication any client can claim any role, so
+        // nobody qualifies.
+        let trust = self.shared.auth.method() == crate::auth::Method::Trust;
+        Err(Refusal {
+            sqlstate: "42501".to_owned(),
+            message: if trust {
+                format!("{verb} needs clients to authenticate")
+            } else {
+                format!("role \"{}\" may not run {verb}", self.user)
+            },
+            hint: Some(if trust {
+                "configure [auth], and list the operator in auth.operators".to_owned()
+            } else {
+                "list it in auth.operators".to_owned()
+            }),
+            retryable: false,
+        })
+    }
+
+    /// Runs `DRAIN` or `UNDRAIN`, for an operator. A drained replica takes
+    /// no new reads, and the idle connections held for it are closed;
+    /// statements already running on it finish where they are.
+    async fn drain(
+        &mut self,
+        command: Result<(bool, String), String>,
+    ) -> Result<&'static str, Refusal> {
+        let plain = |sqlstate: &str, message: String| Refusal {
+            sqlstate: sqlstate.to_owned(),
+            message,
+            hint: None,
+            retryable: false,
+        };
+        let (drain, endpoint) = command.map_err(|usage| plain("42601", usage))?;
+        self.operator(if drain { "DRAIN" } else { "UNDRAIN" })?;
+        self.shared
+            .health
+            .set_drained(&endpoint, drain)
+            .map_err(|reason| plain("22023", reason))?;
+        if drain {
+            if let Some((host, port)) = endpoint
+                .rsplit_once(':')
+                .and_then(|(host, port)| Some((host, port.parse::<u16>().ok()?)))
+            {
+                for pool in self.shared.pools.to_endpoint(host, port) {
+                    pool.drain().await;
+                }
+            }
+        }
+        tracing::info!(user = %self.user, %endpoint, drain, "drain changed");
+        Ok(if drain { "DRAIN" } else { "UNDRAIN" })
+    }
+
     /// Runs `RELOCATE`, for an operator.
     async fn relocate(
         &mut self,
@@ -629,29 +702,14 @@ impl Session {
             retryable: false,
         };
         let (key, to) = command.map_err(|usage| refuse("42601", usage, None))?;
-        let Some(store) = self.shared.moves.store() else {
+        if self.shared.moves.store().is_none() {
             return Err(refuse(
                 "55000",
                 "RELOCATE needs a durable directory".to_owned(),
                 Some("add a [directory_store] section"),
             ));
-        };
-        // Moving data is an operator's act. With trust authentication any
-        // client can claim any role, so nobody qualifies.
-        if self.shared.auth.method() == crate::auth::Method::Trust {
-            return Err(refuse(
-                "42501",
-                "RELOCATE needs clients to authenticate".to_owned(),
-                Some("configure [auth], and list the operator in directory_store.operators"),
-            ));
         }
-        if !store.operators.contains(&self.user) {
-            return Err(refuse(
-                "42501",
-                format!("role \"{}\" may not run RELOCATE", self.user),
-                Some("list it in directory_store.operators"),
-            ));
-        }
+        self.operator("RELOCATE")?;
         if self.transaction.is_some() {
             return Err(refuse(
                 "25001",

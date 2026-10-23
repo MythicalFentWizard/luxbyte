@@ -39,11 +39,15 @@ max_size = 16
 # temporary tables, at the cost of a reset on every return.
 reset = "when_changed"
 reset_query = "DISCARD ALL"
+# Connections opened to every backend at startup.
+warm = 2
 
 # Clients authenticate with SCRAM-SHA-256 against PostgreSQL's own stored
 # verifiers. With nothing here the proxy trusts every client, and refuses to
 # listen anywhere but loopback unless method = "trust" says so on purpose.
 [auth]
+# Roles allowed RELOCATE, DRAIN and UNDRAIN, once authenticated.
+operators = ["ops"]
 # Read a role's verifier from the home region's primary. A SECURITY DEFINER
 # function over pg_authid lets the backend role do this without superuser.
 query = "SELECT rolpassword FROM pg_authid WHERE rolname = $1"
@@ -70,8 +74,6 @@ listen = "127.0.0.1:9187"
 # the place of the [[directory]] entries at the end of this file.
 # [directory_store]
 # table = "luxbyte_directory"
-# Roles allowed to run RELOCATE; they must authenticate.
-# operators = ["ops"]
 # How long a statement waits for a moving key before 40001.
 # hold_ms = 10000
 # How long a move waits for writes under way and for its locks.

@@ -486,6 +486,7 @@ fn snapshot(shared: &Shared) -> Value {
         "pools": rows_as_json(&console(shared, "SHOW POOLS")),
         "in_doubt": rows_as_json(&console(shared, "SHOW IN DOUBT")),
         "health": rows_as_json(&console(shared, "SHOW HEALTH")),
+        "alerts": rows_as_json(&console(shared, "SHOW ALERTS")),
         "directory_keys": shared.directory.snapshot().len(),
         "statement_cache": {
             "hits": cache.hits,
@@ -516,7 +517,7 @@ fn gauges(shared: &Shared) -> Vec<Gauge> {
         help,
         values: vec![(Vec::new(), value)],
     };
-    vec![
+    let mut gauges = vec![
         per_pool(
             "luxbyte_pool_idle",
             "Idle connections in each pool.",
@@ -573,6 +574,28 @@ fn gauges(shared: &Shared) -> Vec<Gauge> {
             "Reads that went to a primary after their replica could not be reached.",
             shared.health.failovers(),
         ),
+    ];
+    gauges.extend(health_gauges(shared));
+    gauges
+}
+
+/// Alerts, and gauges about each backend.
+fn health_gauges(shared: &Shared) -> Vec<Gauge> {
+    vec![
+        Gauge {
+            name: "luxbyte_alert",
+            help: "Conditions worth waking someone for, one series per condition and subject; \
+                   SHOW ALERTS says more.",
+            values: crate::alerts::current(shared)
+                .into_iter()
+                .map(|alert| {
+                    (
+                        vec![("alert", alert.name.to_owned()), ("subject", alert.subject)],
+                        1,
+                    )
+                })
+                .collect(),
+        },
         health_gauge(
             shared,
             "luxbyte_endpoint_up",
@@ -720,11 +743,14 @@ fn dashboard(shared: &Shared) -> String {
          <h2>Where is a key?</h2><form action=\"/key\" method=\"get\">\
          <input name=\"table\" placeholder=\"table\" required>\
          <input name=\"key\" placeholder=\"key\" required><button>Look up</button></form>\
+         <h2>Alerts</h2>{alerts}<h2>Health</h2>{health}\
          <h2>Regions</h2>{regions}<h2>Pools</h2>{pools}\
          <h2>In-doubt transactions</h2>{in_doubt}</body></html>",
         home = escape_html(&shared.router.topology().home_region),
         uptime = shared.metrics.uptime().as_secs(),
         counters = counters.join(""),
+        alerts = html_table(&console(shared, "SHOW ALERTS")),
+        health = html_table(&console(shared, "SHOW HEALTH")),
         regions = html_table(&console(shared, "SHOW REGIONS")),
         pools = html_table(&console(shared, "SHOW POOLS")),
         in_doubt = html_table(&console(shared, "SHOW IN DOUBT")),

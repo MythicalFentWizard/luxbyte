@@ -84,8 +84,12 @@ shop=> WHERE IS users alice;
 
 The console answers over the same connection, so the only tool needed to see
 what the router is doing is the one already on the machine. It also has
-`SHOW PLACEMENT`, `SHOW POOLS`, `SHOW DIRECTORY`, `SHOW IN DOUBT` and
-`SHOW HEALTH`, and, for operators, `RELOCATE`.
+`SHOW PLACEMENT`, `SHOW POOLS`, `SHOW DIRECTORY`, `SHOW IN DOUBT`,
+`SHOW HEALTH`, `SHOW ALERTS`, and `ROUTE <statement>`, which says where a
+statement would run and how its answer would be combined, using the live
+directory, without running it. Roles listed in `auth.operators`, once
+authenticated, also have `RELOCATE`, and `DRAIN`/`UNDRAIN <host:port>` to take
+a replica out of service and back.
 
 To see a routing decision without starting anything:
 
@@ -227,7 +231,7 @@ copy, which also waits for any open transaction that wrote to them; a move
 that cannot get its locks within `lock_timeout_ms` gives up and leaves
 everything as it was.
 
-Only roles listed in `operators` may run it, and only after authenticating:
+Only roles listed in `auth.operators` may run it, and only after authenticating:
 with `trust` authentication nobody can. A key with no entry is looked for in
 every region, and a key with rows in two regions is refused rather than
 guessed. A table outside the move with a foreign key onto one inside it is
@@ -469,6 +473,14 @@ yet. A stale replica is never used because the primary is down: a read that
 fails says so, where a stale one would look like an answer. The proxy observes
 and never promotes; a primary that reports being in recovery is shown as such
 in `SHOW HEALTH` and the admin port.
+
+Alerts are facts the proxy already knows, stated once rather than inferred
+from thresholds: a backend down, a replica too far behind to serve reads, a
+server playing a role the topology does not give it, a two-phase commit not
+yet acknowledged everywhere, a move awaiting a region's confirmation. They are
+`luxbyte_alert` series on the admin port and rows in `SHOW ALERTS`. With
+`pool.warm` set, connections to every backend are opened before the first
+client arrives.
 
 An admin port, off unless configured, serves Prometheus metrics at
 `/metrics` — statement latency by plan, errors by SQLSTATE, statements per

@@ -197,7 +197,49 @@ impl Server {
         };
         server.open_directory().await?;
         server.start_probing(config).await?;
+        server.warm(config.pool.warm).await;
         Ok(server)
+    }
+
+    /// Opens `per_backend` connections to every backend and leaves them
+    /// idle in the pools. Best effort: a backend that cannot be reached now
+    /// is reported and connected to later, when it is needed.
+    async fn warm(&self, per_backend: usize) {
+        if per_backend == 0 {
+            return;
+        }
+        let shared = &self.shared;
+        let mut tasks = tokio::task::JoinSet::new();
+        for region in &shared.router.topology().regions {
+            for endpoint in std::iter::once(&region.primary).chain(&region.replicas) {
+                let target = luxbyte_pool::ConnectionTarget::new(
+                    endpoint,
+                    &shared.backend_database,
+                    &shared.backend_user,
+                );
+                let pool = shared.pools.pool(&target, &shared.credentials);
+                tasks.spawn(async move {
+                    let mut held = Vec::with_capacity(per_backend);
+                    for _ in 0..per_backend {
+                        match pool.acquire().await {
+                            Ok(connection) => held.push(connection),
+                            Err(error) => {
+                                tracing::warn!(backend = %target, %error, "could not warm a connection");
+                                break;
+                            }
+                        }
+                    }
+                    // Dropped together, so each is a new connection rather
+                    // than the same one borrowed again.
+                    held.len()
+                });
+            }
+        }
+        let mut opened = 0_usize;
+        while let Some(joined) = tasks.join_next().await {
+            opened = opened.saturating_add(joined.unwrap_or(0));
+        }
+        tracing::info!(opened, "warmed backend connections");
     }
 
     /// Probes every backend once, if probing is on, and keeps the prober

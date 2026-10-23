@@ -124,6 +124,8 @@ pub struct Status {
     pub in_recovery: Option<bool>,
     /// How long the last good probe took.
     pub probe_time: Option<Duration>,
+    /// Taken out of service by an operator: serves no new reads.
+    pub drained: bool,
 }
 
 impl Status {
@@ -205,6 +207,7 @@ impl Health {
                         position: None,
                         in_recovery: None,
                         probe_time: None,
+                        drained: false,
                     },
                 );
             }
@@ -223,6 +226,12 @@ impl Health {
         self.config.interval_ms > 0
     }
 
+    /// The furthest a replica may lag and still serve reads.
+    #[must_use]
+    pub const fn max_replica_lag_bytes(&self) -> u64 {
+        self.config.max_replica_lag_bytes
+    }
+
     /// The endpoint a read in `region` should use, given when this session
     /// last wrote there: the `nth` replica of those that qualify, or the
     /// primary when none does.
@@ -235,10 +244,22 @@ impl Health {
         if region.replicas.is_empty() {
             return &region.primary;
         }
-        if !self.probing() {
-            return region.read_endpoint(nth);
-        }
         let endpoints = self.endpoints.read();
+        if !self.probing() {
+            // Without probes nothing is known about lag, so every replica an
+            // operator has not drained takes its turn.
+            let serving: Vec<&Endpoint> = region
+                .replicas
+                .iter()
+                .filter(|replica| {
+                    endpoints
+                        .get(&key(replica))
+                        .is_none_or(|status| !status.drained)
+                })
+                .collect();
+            let index = nth.checked_rem(serving.len().max(1)).unwrap_or(0);
+            return serving.get(index).copied().unwrap_or(&region.primary);
+        }
         let primary = endpoints.get(&key(&region.primary));
         let needs = match wrote {
             None => Needs::Nothing,
@@ -271,7 +292,7 @@ impl Health {
     }
 
     fn serves_reads(&self, primary: Option<&Status>, replica: &Status, needs: Needs) -> bool {
-        if !replica.state.usable() {
+        if !replica.state.usable() || replica.drained {
             return false;
         }
         let Some((here, _)) = replica.position else {
@@ -306,6 +327,22 @@ impl Health {
         status.failures = FAILURES_TO_DOWN;
         status.successes = 0;
         status.last_error = Some(error.to_string());
+    }
+
+    /// Takes a replica out of service, or puts it back. A primary cannot be
+    /// drained: there is nowhere else for its writes to go.
+    pub fn set_drained(&self, endpoint: &str, drained: bool) -> Result<(), String> {
+        let mut endpoints = self.endpoints.write();
+        let status = endpoints
+            .get_mut(endpoint)
+            .ok_or_else(|| format!("no backend is configured at {endpoint}"))?;
+        if !status.replica {
+            return Err(format!(
+                "{endpoint} is a primary, and its writes have nowhere else to go"
+            ));
+        }
+        status.drained = drained;
+        Ok(())
     }
 
     /// Counts a read that went to the primary after its replica failed.
@@ -393,6 +430,23 @@ impl Health {
     pub fn failovers(&self) -> u64 {
         self.failovers.load(Ordering::Relaxed)
     }
+}
+
+/// Reads `DRAIN <host:port>` and `UNDRAIN <host:port>`: whether to drain,
+/// and the endpoint. `None` if the statement is something else.
+#[must_use]
+pub fn parse_drain(sql: &str) -> Option<Result<(bool, String), String>> {
+    let text = sql.trim().trim_end_matches(';').trim();
+    let mut words = text.split_whitespace();
+    let drain = match words.next()?.to_ascii_uppercase().as_str() {
+        "DRAIN" => true,
+        "UNDRAIN" => false,
+        _ => return None,
+    };
+    Some(match (words.next(), words.next()) {
+        (Some(endpoint), None) => Ok((drain, endpoint.trim_matches('\'').to_owned())),
+        _ => Err("say it as: DRAIN <host:port> or UNDRAIN <host:port>".to_owned()),
+    })
 }
 
 /// One endpoint's probe and the connection it keeps.

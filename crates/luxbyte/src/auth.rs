@@ -68,6 +68,10 @@ pub struct AuthConfig {
     /// every backend, which `CREATE ROLE ... PASSWORD 'SCRAM-SHA-256$...'`
     /// makes easy.
     pub passthrough: bool,
+    /// Roles allowed the operator's commands, `RELOCATE`, `DRAIN` and
+    /// `UNDRAIN`. With `trust` nobody qualifies, since any client could
+    /// claim any role.
+    pub operators: Vec<String>,
 }
 
 impl Default for AuthConfig {
@@ -78,6 +82,7 @@ impl Default for AuthConfig {
             query: None,
             cache_ttl_s: 60,
             passthrough: true,
+            operators: Vec::new(),
         }
     }
 }
@@ -139,6 +144,13 @@ impl std::fmt::Debug for Authenticator {
 }
 
 impl Authenticator {
+    /// Whether `role`, having authenticated, may run the operator's
+    /// commands. Never under `trust`.
+    #[must_use]
+    pub fn is_operator(&self, role: &str) -> bool {
+        self.method != Method::Trust && self.config.operators.iter().any(|name| name == role)
+    }
+
     /// Validates the configuration, so a malformed verifier stops the proxy
     /// at startup rather than locking out a role at its first login.
     pub fn new(config: &AuthConfig) -> Result<Self, AuthError> {

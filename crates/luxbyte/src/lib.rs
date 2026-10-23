@@ -6,10 +6,12 @@
 //! without a process boundary.
 
 pub mod admin;
+pub mod alerts;
 pub mod auth;
 pub mod cancel;
 pub mod config;
 pub mod console;
+pub mod explain;
 pub mod health;
 pub mod merge;
 pub mod metrics;

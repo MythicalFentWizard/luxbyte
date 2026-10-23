@@ -5,8 +5,7 @@
 //! deployment. Point it at a topology and a statement and it prints the plan,
 //! including the refusals and the reasons for them.
 //!
-//! The proxy server itself is the next thing to land here; the planner it
-//! will use is already complete and tested.
+//! `luxbyte serve` runs the proxy.
 
 use std::fmt::Write as _;
 use std::process::ExitCode;
@@ -14,7 +13,6 @@ use std::sync::Arc;
 
 use luxbyte_core::directory::Directory;
 use luxbyte_core::{MemoryDirectory, ParameterValues, Plan, Router, Topology};
-use luxbyte_sql::MergeStrategy;
 
 const USAGE: &str = "\
 luxbyte — a geo-distributed PostgreSQL proxy
@@ -241,99 +239,8 @@ fn load_directory(directory: &MemoryDirectory, path: &str) -> Result<(), String>
 
 fn describe(sql: &str, analysis: &luxbyte_sql::StatementAnalysis, plan: &Plan) -> String {
     let mut out = String::new();
-    let tables: Vec<String> = analysis.tables.iter().map(ToString::to_string).collect();
-    let _ = writeln!(
-        out,
-        "  kind    {:?}, {:?}{}",
-        analysis.kind,
-        analysis.access,
-        if tables.is_empty() {
-            String::new()
-        } else {
-            format!(", tables: {}", tables.join(", "))
-        }
-    );
-
-    match plan {
-        Plan::Local(intent) => {
-            let _ = writeln!(out, "  plan    handled in the session ({intent:?})");
-        }
-        Plan::Single { region, access } => {
-            let _ = writeln!(out, "  plan    one region: {region} ({access:?})");
-        }
-        Plan::ScatterGather { regions, merge } => {
-            let _ = writeln!(out, "  plan    scatter-gather over {}", regions.join(", "));
-            let combined =
-                luxbyte_sql::combine::plan(sql, &luxbyte_sql::combine::Aggregates::default());
-            match (merge, combined) {
-                (MergeStrategy::Concatenate, Ok(_)) => {
-                    let _ = writeln!(out, "  merge   concatenate");
-                }
-                (_, Ok(plan)) => {
-                    let _ = writeln!(out, "  regions {}", plan.region_sql);
-                    let _ = writeln!(
-                        out,
-                        "  finish  {}",
-                        match plan.finish {
-                            luxbyte_sql::combine::Finish::Rows(rows) => format!(
-                                "rows: {}{}{}{}",
-                                if rows.order.is_empty() {
-                                    "concatenated"
-                                } else {
-                                    "merged in order"
-                                },
-                                if rows.distinct { ", deduplicated" } else { "" },
-                                rows.limit
-                                    .map(|limit| format!(", limit {limit}"))
-                                    .unwrap_or_default(),
-                                if rows.offset > 0 {
-                                    format!(", offset {}", rows.offset)
-                                } else {
-                                    String::new()
-                                }
-                            ),
-                            luxbyte_sql::combine::Finish::Aggregate(aggregates) => format!(
-                                "{} partial aggregate(s) regrouped in the home region",
-                                aggregates.aggregates.len()
-                            ),
-                        }
-                    );
-                }
-                (_, Err(reason)) => {
-                    let _ = writeln!(out, "  combine refused [0A000]");
-                    let _ = writeln!(out, "  reason  {reason}");
-                }
-            }
-        }
-        Plan::Distributed { regions } => {
-            let _ = writeln!(
-                out,
-                "  plan    distributed write over {} (two-phase commit)",
-                regions.join(", ")
-            );
-        }
-        Plan::NeedsParameters { parameters } => {
-            let _ = writeln!(
-                out,
-                "  plan    deferred until {} is bound",
-                parameters
-                    .iter()
-                    .map(|index| format!("${index}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            let _ = writeln!(out, "  hint    pass --param to see the resolved plan");
-        }
-        Plan::Refuse(refusal) => {
-            let _ = writeln!(out, "  plan    refused [{}]", refusal.sqlstate);
-            let _ = writeln!(out, "  reason  {}", refusal.message);
-            if let Some(hint) = &refusal.hint {
-                let _ = writeln!(out, "  hint    {hint}");
-            }
-            if refusal.retryable {
-                let _ = writeln!(out, "  retry   yes, the client should retry unchanged");
-            }
-        }
+    for (label, detail) in luxbyte::explain::lines(sql, analysis, plan) {
+        let _ = writeln!(out, "  {label:<7} {detail}");
     }
     out
 }
