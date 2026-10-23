@@ -83,7 +83,9 @@ shop=> WHERE IS users alice;
 ```
 
 The console answers over the same connection, so the only tool needed to see
-what the router is doing is the one already on the machine.
+what the router is doing is the one already on the machine. It also has
+`SHOW PLACEMENT`, `SHOW POOLS`, `SHOW DIRECTORY`, `SHOW IN DOUBT` and
+`SHOW HEALTH`, and, for operators, `RELOCATE`.
 
 To see a routing decision without starting anything:
 
@@ -442,6 +444,21 @@ pooled, so a cancel that arrives late can never stop another client's query
 on a reused connection. Once a two-phase commit's decision is durable, cancels
 no longer reach its participants, so a cancel cannot leave a committed
 transaction prepared.
+
+Every backend is probed on a connection of its own (`application_name =
+luxbyte health`, so it is easy to tell apart in `pg_stat_activity`) for whether
+it is in recovery and its WAL position. A replica more than
+`max_replica_lag_bytes` behind its primary serves no reads. After a session
+writes in a region, its reads there go to the primary until a replica has
+replayed past the write: the primary's position at its first probe after the
+write is at or past it, so a replica that has reached that position has it —
+read-your-writes with no extra query. Three failed probes mark a backend down,
+a failed connection on the data path marks it down at once, and a read whose
+replica cannot be reached goes to the primary instead, since nothing was sent
+yet. A stale replica is never used because the primary is down: a read that
+fails says so, where a stale one would look like an answer. The proxy observes
+and never promotes; a primary that reports being in recovery is shown as such
+in `SHOW HEALTH` and the admin port.
 
 An admin port, off unless configured, serves Prometheus metrics at
 `/metrics` — statement latency by plan, errors by SQLSTATE, statements per

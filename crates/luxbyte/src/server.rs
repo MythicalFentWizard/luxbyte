@@ -86,6 +86,8 @@ pub struct Server {
     listener: TcpListener,
     /// The admin port, its password and its TLS, when configured.
     admin: Option<(TcpListener, Option<String>, Option<crate::tls::Acceptor>)>,
+    /// Probes the backends, when probing is on.
+    prober: Option<crate::health::Prober>,
 }
 
 impl Server {
@@ -145,6 +147,7 @@ impl Server {
             aggregates: parking_lot::Mutex::new(None),
             metrics: crate::metrics::Metrics::default(),
             moves: crate::relocate::Moves::new(config.directory_store.clone()),
+            health: crate::health::Health::new(config.health.clone(), &config.topology.regions),
         });
 
         let listener = TcpListener::bind(&config.server.listen)
@@ -186,13 +189,42 @@ impl Server {
             }
         };
 
-        let server = Self {
+        let mut server = Self {
             shared,
             listener,
             admin,
+            prober: None,
         };
         server.open_directory().await?;
+        server.start_probing(config).await?;
         Ok(server)
+    }
+
+    /// Probes every backend once, if probing is on, and keeps the prober
+    /// for the background.
+    async fn start_probing(&mut self, config: &Config) -> Result<(), ServerError> {
+        if config.health.interval_ms == 0 {
+            return Ok(());
+        }
+        let mut prober = crate::health::Prober::new(
+            &config.health,
+            &config.topology.regions,
+            &config.backend.database,
+            &config.backend.user,
+            config.backend.credentials(),
+            config.backend.backend_tls().map_err(ServerError::Tls)?,
+        );
+        // Before the first client: until a replica has been probed, its lag
+        // is unknown and it serves no reads.
+        prober.round(&self.shared.health).await;
+        self.prober = Some(prober);
+        Ok(())
+    }
+
+    /// Starts probing in the background, if it is on.
+    fn start_prober(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        let prober = self.prober.take()?;
+        Some(tokio::spawn(prober.run(Arc::clone(&self.shared))))
     }
 
     /// Loads the durable directory, when one is configured.
@@ -272,6 +304,7 @@ impl Server {
     /// Serves until the listener fails.
     pub async fn serve(mut self) {
         let _admin = self.start_admin();
+        let _prober = self.start_prober();
         loop {
             let (stream, peer) = match self.listener.accept().await {
                 Ok(accepted) => accepted,
@@ -296,6 +329,7 @@ impl Server {
         let addr = self.local_addr()?;
         let admin_addr = self.admin_addr();
         let admin = self.start_admin();
+        let prober = self.start_prober();
         let shared = Arc::clone(&self.shared);
         let task = tokio::spawn(self.serve());
         Ok(ServerHandle {
@@ -304,6 +338,7 @@ impl Server {
             shared,
             task,
             admin,
+            prober,
         })
     }
 }
@@ -319,6 +354,7 @@ pub struct ServerHandle {
     shared: Arc<Shared>,
     task: tokio::task::JoinHandle<()>,
     admin: Option<tokio::task::JoinHandle<()>>,
+    prober: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ServerHandle {
@@ -352,6 +388,9 @@ impl Drop for ServerHandle {
         self.task.abort();
         if let Some(admin) = &self.admin {
             admin.abort();
+        }
+        if let Some(prober) = &self.prober {
+            prober.abort();
         }
     }
 }

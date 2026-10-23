@@ -28,6 +28,9 @@ pub struct Config {
     /// TLS to clients.
     #[serde(default)]
     pub tls: ClientTls,
+    /// Probing backends: which are up, and how far replicas lag.
+    #[serde(default)]
+    pub health: crate::health::HealthConfig,
     /// Regions and table placement.
     pub topology: Topology,
     /// Keys to seed the directory with, for a deployment that does not yet
