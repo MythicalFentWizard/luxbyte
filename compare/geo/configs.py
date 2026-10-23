@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Writes one Luxbyte and one shahrah config per region, and the relay map.
+"""Writes a Luxbyte config per region, the relay map, and how to reach
+every region from each, for configuring any other proxy the same way.
 
 Usage: configs.py OUT_DIR EU_PORT US_PORT AP_PORT DIRECTORY_TOML
 
@@ -14,7 +15,6 @@ import sys
 REGIONS = ["eu-west", "us-east", "ap-south"]
 ROUND_TRIP_MS = {(0, 1): 75, (0, 2): 110, (1, 2): 42}
 LUXBYTE_PORT = 6460
-SHAHRAH_PORT = 6470
 
 
 def round_trip(a, b):
@@ -40,6 +40,7 @@ def main():
     ]
     (out / "relays").write_text(" ".join(mappings) + "\n")
 
+    lines = []
     for index, region in enumerate(REGIONS):
         regions = "".join(
             f'\n[[topology.regions]]\nid = "{other}"\n'
@@ -58,7 +59,7 @@ tls = "disable"
 query = "SELECT rolpassword FROM pg_authid WHERE rolname = $1"
 passthrough = false
 
-# One connection to every region opened at startup, as shahrah does.
+# One connection to every region opened at startup.
 [pool]
 warm = 1
 
@@ -82,31 +83,13 @@ placement = "global_replicated"
 writer = "eu-west"
 
 {directory}""")
-        shards = "".join(
-            f"""
-[[shards]]
-number = {other_index + 1}
-region = "{other}"
-primary = {{ address = "127.0.0.1:{reach(index, other_index)}", region = "{other}" }}
-logical = [{{ start = 0, end = 65535 }}]
-""" for other_index, other in enumerate(REGIONS))
-        (out / f"shahrah-{region}.toml").write_text(f"""region = "{region}"
-
-[policy]
-broadcast = ["users", "orders"]
-
-[policy.replicated.currencies]
-writer_region = "eu-west"
-
-[policy.keys.users]
-column = "tenant_id"
-type = "text"
-
-[policy.keys.orders]
-column = "tenant_id"
-type = "text"
-{shards}""")
-
+        # How this region's proxy reaches every region, for configuring any
+        # other proxy the same way: directly at home, through a relay away.
+        lines.extend(
+            f"{region},{other},127.0.0.1,{reach(index, other_index)}"
+            for other_index, other in enumerate(REGIONS))
+    (out / "reach.csv").write_text(
+        "proxy_region,database_region,host,port\n" + "\n".join(lines) + "\n")
 
 if __name__ == "__main__":
     main()

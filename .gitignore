@@ -1,7 +1,11 @@
-# Build output, at the workspace root and in compare/
+# Build output
 target/
 **/*.rs.bk
 *.pdb
 
 # Created by `luxbyte serve` with the example configuration
 /commit-log/
+
+# Left behind by benchmark runs
+*.pid
+*.log

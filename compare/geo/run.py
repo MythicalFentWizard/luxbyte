@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Latency across three regions, Luxbyte against shahrah.
+"""Latency across three regions, through Luxbyte and other alternatives.
 
 Usage: run.py NAME=PORT [NAME=PORT ...] [--seconds N] [--rounds N] [--clients N]
               [--only TEXT] [--json FILE]

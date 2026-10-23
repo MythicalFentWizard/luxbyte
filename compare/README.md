@@ -1,22 +1,19 @@
-# Head-to-head comparison
+# Comparing Luxbyte with other PostgreSQL proxies
 
-Compiles Luxbyte's routing analysis and
-[shahrah](https://github.com/rs-alireza/shahrah)'s into one process and runs
-them against the same statements on the same machine, so the comparison
-contains no estimation and no cross-machine arithmetic.
+Two kits for measuring a geo-distributed PostgreSQL proxy against PostgreSQL
+itself and against other alternatives, on real PostgreSQL databases. Both
+talk to proxies only through the PostgreSQL wire protocol, so any proxy that
+speaks it can be put in the same run.
 
-It is kept out of the main workspace because shahrah parses with `pg_query`,
-which binds to PostgreSQL's C parser and needs `libclang` at build time.
-Nothing in Luxbyte itself needs it.
+- **[`fidelity/`](fidelity)** — correctness. 51 statements PostgreSQL
+  accepts (point and scatter reads, joins, subqueries, `WITH`, set
+  operations, replicated tables, writes, and grammar many SQL parsers miss)
+  run through each proxy on data split across three regions. Every answer is
+  graded against one database holding every row: correct, refused, or wrong.
+- **[`geo/`](geo)** — latency across regions. Three PostgreSQL databases a
+  real round trip apart on one machine, a proxy per region, and pgbench
+  percentiles (p50, p95, p99) and throughput per workload: home-region
+  reads and writes, reads in a distant region, scatter over every region,
+  and new keys.
 
-## Running it
-
-```bash
-# Windows, if LLVM is not installed: pip install libclang
-export LIBCLANG_PATH=/path/to/directory/containing/libclang.dll
-
-cargo run --release --manifest-path compare/Cargo.toml   # correctness table
-cargo bench --manifest-path compare/Cargo.toml           # speed
-```
-
-The shahrah revision is pinned so the numbers stay reproducible.
+Results and method are in [`docs/NUMBERS.md`](../docs/NUMBERS.md).

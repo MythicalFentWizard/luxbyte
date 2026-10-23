@@ -1,11 +1,16 @@
 [package]
 name = "luxbyte"
-description = "A geo-distributed PostgreSQL proxy: routes every statement to the region that holds the data."
+description = "A geo-distributed PostgreSQL proxy for multi-region Postgres: routes every statement to the region that holds the data, with sharding, data residency, connection pooling and two-phase commit."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["postgresql", "proxy", "multi-region", "sharding", "geo-distributed"]
+categories = ["database", "network-programming", "command-line-utilities"]
 default-run = "luxbyte"
 
 [features]
