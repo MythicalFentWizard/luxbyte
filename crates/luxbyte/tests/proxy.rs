@@ -258,6 +258,32 @@ async fn a_read_without_a_key_fans_out_and_the_rows_are_merged() {
 }
 
 #[tokio::test]
+async fn a_join_on_the_shard_key_runs_in_every_region_and_the_rows_are_merged() {
+    // Each region joins its own users with its own orders: rows only meet
+    // where their keys match, and matching keys live together.
+    let rows =
+        |value: &str| BackendConfig::new("x").reply_to("SELECT", Reply::rows(&["id"], &[&[value]]));
+    let f = fixture_with(rows("1"), rows("2"), rows("3"), &placed()).await;
+    let mut client = client(&f.proxy).await;
+    let join = "SELECT o.id FROM users u JOIN orders o ON o.tenant_id = u.tenant_id \
+                WHERE u.name = 'ada'";
+    let result = client.simple_query(join).await.expect("should succeed");
+    let mut found = values(&result, 0);
+    found.sort();
+    assert_eq!(found, ["1", "2", "3"]);
+    for backend in [&f.eu, &f.us, &f.ap] {
+        assert!(backend.saw(join));
+    }
+
+    // Not tied by the key, rows could meet across regions: refused.
+    let error = client
+        .simple_query("SELECT * FROM users WHERE id IN (SELECT buyer FROM orders)")
+        .await
+        .expect_err("refused");
+    assert_eq!(error.sqlstate(), Some("0A000"), "{error}");
+}
+
+#[tokio::test]
 async fn an_ordered_scatter_comes_back_in_order() {
     // int4 ids, so the regions' sorted rows are merged here exactly.
     let ids =
@@ -724,7 +750,7 @@ async fn a_cross_region_join_is_refused_rather_than_answered_wrongly() {
     let mut client = client(&f.proxy).await;
     let error = client
         .simple_query(
-            "SELECT * FROM users u JOIN orders o ON o.tenant_id = u.tenant_id \
+            "SELECT * FROM users u JOIN orders o ON o.buyer = u.id \
              WHERE u.tenant_id = 'bob' AND o.tenant_id = 'alice'",
         )
         .await

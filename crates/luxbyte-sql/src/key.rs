@@ -235,6 +235,20 @@ impl KeyConstraints {
         Self { columns: merged }
     }
 
+    /// The same constraints with every qualifier dropped, for constraints
+    /// already known to be about one table.
+    #[must_use]
+    pub fn unqualified(self) -> Self {
+        self.columns
+            .into_iter()
+            .fold(Self::unconstrained(), |acc, (column, values)| {
+                acc.and(Self::pinned_to_any_of(
+                    ColumnRef::bare(column.column),
+                    values,
+                ))
+            })
+    }
+
     /// Rewrites qualifiers through an alias map, so that `u.tenant` becomes
     /// `users.tenant`.
     #[must_use]

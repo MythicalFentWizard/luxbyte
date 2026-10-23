@@ -524,6 +524,9 @@ impl Router {
         let mut regions: BTreeSet<String> = BTreeSet::new();
         let mut pending: BTreeSet<u16> = BTreeSet::new();
         let mut unclaimed: Option<Vec<(String, String)>> = claims.then(Vec::new);
+        // Read alone, a replicated table is read nearest; read with other
+        // tables, from the copy where those are.
+        let mut reads_a_copy = false;
 
         for table in &user_tables {
             let Some(placement) = self
@@ -566,8 +569,8 @@ impl Router {
                             None => regions.extend(self.all_regions()),
                         }
                     } else {
-                        // Any copy will do, so read the nearest one.
-                        regions.insert(self.topology.home_region.clone());
+                        // Any copy will do.
+                        reads_a_copy = true;
                     }
                 }
                 Placement::GeoPartitioned { key } => {
@@ -617,6 +620,12 @@ impl Router {
             });
         }
 
+        if regions.is_empty() && reads_a_copy {
+            regions.insert(self.topology.home_region.clone());
+        }
+        if let Some(refusal) = self.copies_written_from_partial_rows(analysis, &regions) {
+            return Routing::Ready(Plan::Refuse(refusal));
+        }
         let regions: Vec<String> = regions.into_iter().collect();
         Routing::Ready(match regions.len() {
             0 => Plan::Single {
@@ -627,11 +636,129 @@ impl Router {
                 region: regions.into_iter().next().unwrap_or_default(),
                 access: analysis.access,
             },
-            _ => Self::plan_multi_region(analysis, &user_tables, regions),
+            _ => self.plan_multi_region(analysis, &user_tables, regions),
         })
     }
 
+    /// A write to a replicated table that reads rows only some regions
+    /// hold: each copy would be changed from different rows, and the copies
+    /// would no longer agree. Fine only when one region writes, for a writer
+    /// whose replication carries the change, and holds every row read.
+    fn copies_written_from_partial_rows(
+        &self,
+        analysis: &StatementAnalysis,
+        regions: &BTreeSet<String>,
+    ) -> Option<Refusal> {
+        if !matches!(
+            analysis.kind,
+            StatementKind::Insert | StatementKind::Update | StatementKind::Delete
+        ) {
+            return None;
+        }
+        let target = analysis.tables.first()?;
+        let Some(Placement::GlobalReplicated { writer }) = self
+            .topology
+            .placement(target.schema.as_deref(), &target.name)
+        else {
+            return None;
+        };
+        let partial = analysis
+            .tables
+            .iter()
+            .skip(1)
+            .filter(|table| !is_catalog_table(table))
+            .find(|table| {
+                !matches!(
+                    self.topology
+                        .placement(table.schema.as_deref(), &table.name),
+                    Some(Placement::GlobalReplicated { .. })
+                )
+            })?;
+        let one_writer = writer
+            .as_ref()
+            .is_some_and(|writer| regions.len() == 1 && regions.contains(writer));
+        if one_writer {
+            return None;
+        }
+        Some(
+            Refusal::new(
+                "0A000",
+                format!(
+                    "this statement changes every copy of \"{target}\" from rows of \"{partial}\", \
+                     which each region holds only some of, so the copies would differ"
+                ),
+            )
+            .with_hint(
+                "read the rows first and write the values, or give the table a writer and \
+                 constrain the rows read to that region",
+            ),
+        )
+    }
+
+    /// Whether running a statement in each region on its own rows gives
+    /// the whole answer: every geo-partitioned read is tied to the others
+    /// shard key to shard key, so rows only ever meet in the region they
+    /// share, and every other table is replicated, so each region has all
+    /// of it.
+    fn colocated(&self, analysis: &StatementAnalysis) -> bool {
+        let mut geo: Vec<(usize, &str)> = Vec::new();
+        for (index, table) in analysis.tables.iter().enumerate() {
+            if is_catalog_table(table) {
+                continue;
+            }
+            match self
+                .topology
+                .placement(table.schema.as_deref(), &table.name)
+            {
+                Some(Placement::GeoPartitioned { key }) => geo.push((index, key.as_str())),
+                Some(Placement::GlobalReplicated { .. }) => {}
+                // A pinned or unplaced table lives in one region only.
+                _ => return false,
+            }
+        }
+        // Replicated tables only: every region has all of every one.
+        if geo.is_empty() {
+            return true;
+        }
+        let key_of = |read: usize| {
+            geo.iter()
+                .find(|(index, _)| *index == read)
+                .map(|(_, key)| *key)
+        };
+        // Union-find over the geo-partitioned reads.
+        let root = |parent: &[usize], mut at: usize| {
+            while let Some(&up) = parent.get(at) {
+                if up == at {
+                    break;
+                }
+                at = up;
+            }
+            at
+        };
+        let mut parent: Vec<usize> = (0..analysis.tables.len()).collect();
+        for link in &analysis.links {
+            if key_of(link.left) == Some(link.left_column.as_str())
+                && key_of(link.right) == Some(link.right_column.as_str())
+            {
+                let (a, b) = (root(&parent, link.left), root(&parent, link.right));
+                if let Some(slot) = parent.get_mut(a) {
+                    *slot = b;
+                }
+            }
+        }
+        let mut roots = geo.iter().map(|(index, _)| root(&parent, *index));
+        let first = roots.next();
+        // A result row drawn only from replicated tables would come back
+        // once from every region.
+        let anchored = analysis
+            .anchors
+            .iter()
+            .any(|anchor| key_of(*anchor).is_some());
+        anchored && roots.all(|other| Some(other) == first)
+    }
+
     fn plan_multi_region(
+        &self,
         analysis: &StatementAnalysis,
         user_tables: &[&TableRef],
         regions: Vec<String>,
@@ -642,7 +769,7 @@ impl Router {
         // operation's branches are read independently, so only tables within
         // one branch count as joined.
         let joined = if analysis.branches.is_empty() {
-            user_tables.len() > 1
+            user_tables.len() > 1 && !self.colocated(analysis)
         } else {
             analysis.branches.iter().any(|branch| {
                 branch

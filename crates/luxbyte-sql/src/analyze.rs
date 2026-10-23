@@ -3,15 +3,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sqlparser::ast::{
-    BinaryOperator, CopySource, Delete, Expr, FromTable, GroupByExpr, Ident, Insert, ObjectName,
-    OrderByKind, OrderBySort, Query, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
-    UnaryOperator, Update, Value, Values, Visit, visit_expressions,
+    BinaryOperator, CopySource, Expr, GroupByExpr, Ident, Insert, ObjectName, OrderByKind,
+    OrderBySort, Query, SetExpr, Statement, UnaryOperator, Update, Value, Values, Visit,
+    visit_expressions,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::key::{ColumnRef, KeyConstraints, KeyValue};
 use crate::merge::{PostProcessing, SortKey, is_aggregate_name};
+use crate::scope::Walker;
 use crate::{Access, SqlError, StatementAnalysis, StatementKind, TableRef, TransactionOp};
 
 pub(crate) fn analyze(sql: &str) -> Result<Vec<StatementAnalysis>, SqlError> {
@@ -26,7 +27,7 @@ pub(crate) fn analyze(sql: &str) -> Result<Vec<StatementAnalysis>, SqlError> {
 
 /// Folds an identifier the way PostgreSQL does: unquoted names become lower
 /// case, quoted ones are taken literally.
-fn fold(ident: &Ident) -> String {
+pub(crate) fn fold(ident: &Ident) -> String {
     if ident.quote_style.is_some() {
         ident.value.clone()
     } else {
@@ -35,7 +36,7 @@ fn fold(ident: &Ident) -> String {
 }
 
 /// Splits an object name into its schema and table parts.
-fn table_from_name(name: &ObjectName, alias: Option<String>) -> TableRef {
+pub(crate) fn table_from_name(name: &ObjectName, alias: Option<String>) -> TableRef {
     let parts: Vec<String> = name
         .0
         .iter()
@@ -89,7 +90,7 @@ fn literal(value: &Value) -> Option<KeyValue> {
 }
 
 /// Reads an expression as a column reference, if that is what it is.
-fn column_of(expr: &Expr) -> Option<ColumnRef> {
+pub(crate) fn column_of(expr: &Expr) -> Option<ColumnRef> {
     match expr {
         Expr::Identifier(ident) => Some(ColumnRef::bare(fold(ident))),
         // `table.column` and `schema.table.column` both qualify by the
@@ -156,7 +157,7 @@ fn equality(left: &Expr, right: &Expr) -> KeyConstraints {
 }
 
 /// Derives the key constraints a predicate implies.
-fn constraints_of(expr: &Expr) -> KeyConstraints {
+pub(crate) fn constraints_of(expr: &Expr) -> KeyConstraints {
     match expr {
         Expr::Nested(inner) => constraints_of(inner),
         Expr::BinaryOp { left, op, right } => match op {
@@ -190,95 +191,12 @@ fn constraints_of(expr: &Expr) -> KeyConstraints {
     }
 }
 
-/// Collects every table named in a `FROM` clause, including joins.
-fn tables_of_from(from: &[TableWithJoins], out: &mut Vec<TableRef>) {
-    for item in from {
-        table_factor(&item.relation, out);
-        for join in &item.joins {
-            table_factor(&join.relation, out);
-        }
-    }
-}
-
-fn table_factor(factor: &TableFactor, out: &mut Vec<TableRef>) {
-    match factor {
-        TableFactor::Table { name, alias, .. } => {
-            let alias = alias.as_ref().map(|alias| fold(&alias.name));
-            out.push(table_from_name(name, alias));
-        }
-        TableFactor::Derived { subquery, .. } => tables_of_query(subquery, out),
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => tables_of_from(std::slice::from_ref(table_with_joins), out),
-        _ => {}
-    }
-}
-
-/// The tables each branch of a set operation reads, one list per branch.
-/// Empty for anything that is not a set operation.
-///
-/// A `UNION` reads its branches independently, so two tables in different
-/// branches are not a join, and each region can answer its part.
-fn branches_of(body: &SetExpr, out: &mut Vec<Vec<TableRef>>) {
-    if let SetExpr::SetOperation { left, right, .. } = body {
-        for side in [left, right] {
-            if matches!(side.as_ref(), SetExpr::SetOperation { .. }) {
-                branches_of(side, out);
-            } else {
-                let mut tables = Vec::new();
-                tables_of_set_expr(side, &mut tables);
-                out.push(tables);
-            }
-        }
-    }
-}
-
-fn tables_of_query(query: &Query, out: &mut Vec<TableRef>) {
-    tables_of_set_expr(&query.body, out);
-}
-
-fn tables_of_set_expr(body: &SetExpr, out: &mut Vec<TableRef>) {
-    match body {
-        SetExpr::Select(select) => tables_of_from(&select.from, out),
-        SetExpr::Query(query) => tables_of_query(query, out),
-        SetExpr::SetOperation { left, right, .. } => {
-            tables_of_set_expr(left, out);
-            tables_of_set_expr(right, out);
-        }
-        _ => {}
-    }
-}
-
-/// The `WHERE` clause of a query, when it has exactly one.
-///
-/// A set operation has two, which may disagree, so the honest answer for one
-/// is no constraint at all.
-fn selection_of_query(query: &Query) -> Option<&Expr> {
-    match query.body.as_ref() {
-        SetExpr::Select(select) => select.selection.as_ref(),
-        SetExpr::Query(inner) => selection_of_query(inner),
-        _ => None,
-    }
-}
-
-fn alias_map(tables: &[TableRef]) -> BTreeMap<String, String> {
-    tables
-        .iter()
-        .filter_map(|table| {
-            table
-                .alias
-                .as_ref()
-                .map(|alias| (alias.clone(), table.name.clone()))
-        })
-        .collect()
-}
-
 /// Reads the key constraints an `INSERT ... VALUES` implies.
 ///
 /// Each row pins the shard key to its own value, so a multi-row insert can
 /// legitimately span regions — and the router needs to see every value to
 /// know that.
-fn insert_constraints(insert: &Insert, table: &TableRef) -> KeyConstraints {
+pub(crate) fn insert_constraints(insert: &Insert, table: &TableRef) -> KeyConstraints {
     let columns: Vec<String> = insert
         .columns
         .iter()
@@ -430,6 +348,8 @@ fn analyze_statement(statement: &Statement, highest_parameter: u16) -> Statement
                     assigned_columns: Vec::new(),
                     highest_parameter,
                     post_processing: PostProcessing::default(),
+                    links: Vec::new(),
+                    anchors: vec![0],
                     branches: Vec::new(),
                 },
             };
@@ -443,75 +363,51 @@ fn analyze_statement(statement: &Statement, highest_parameter: u16) -> Statement
         _ => {}
     }
 
-    let mut tables = Vec::new();
-    let mut constraints = KeyConstraints::unconstrained();
+    let mut walker = Walker::over(statement);
     let mut assigned_columns = Vec::new();
     let mut post_processing = PostProcessing::default();
     let mut branches = Vec::new();
+    let reads_rows = matches!(
+        statement,
+        Statement::Query(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+    );
 
     let (kind, access) = match statement {
-        Statement::Query(query) => {
-            tables_of_query(query, &mut tables);
-            branches_of(&query.body, &mut branches);
-            if let Some(selection) = selection_of_query(query) {
-                constraints = constraints_of(selection);
-            }
-            post_processing = post_processing_of(query);
-            let access = if select_is_locking(query) {
-                Access::ReadWrite
-            } else {
-                Access::ReadOnly
-            };
-            (StatementKind::Select, access)
-        }
-        Statement::Insert(insert) => {
-            if let TableObject::TableName(name) = &insert.table {
-                let table = table_from_name(name, None);
-                constraints = insert_constraints(insert, &table);
-                tables.push(table);
-            }
-            (StatementKind::Insert, Access::ReadWrite)
-        }
-        Statement::Update(Update {
-            table,
-            assignments,
-            from,
-            selection,
-            ..
-        }) => {
-            table_factor(&table.relation, &mut tables);
-            if let Some(from) = from {
-                match from {
-                    sqlparser::ast::UpdateTableFromKind::BeforeSet(items)
-                    | sqlparser::ast::UpdateTableFromKind::AfterSet(items) => {
-                        tables_of_from(items, &mut tables);
-                    }
+        Statement::Query(query) => match query.body.as_ref() {
+            // `WITH ... INSERT/UPDATE/DELETE`: the statement it ends in is
+            // what it does, and its table comes first.
+            SetExpr::Insert(inner) | SetExpr::Update(inner) | SetExpr::Delete(inner) => {
+                walker.name_ctes(query);
+                walker.statement(inner);
+                walker.walk_ctes(query);
+                if let Statement::Update(update) = inner {
+                    assigned_columns = assigned(update);
                 }
+                (data_kind(inner), Access::ReadWrite)
             }
-            for assignment in assignments {
-                if let sqlparser::ast::AssignmentTarget::ColumnName(name) = &assignment.target {
-                    if let Some(ident) = name.0.last().and_then(|part| part.as_ident()) {
-                        assigned_columns.push(fold(ident));
-                    }
+            body => {
+                post_processing = post_processing_of(query);
+                if matches!(body, SetExpr::SetOperation { .. }) {
+                    branches = walk_branches(&mut walker, query);
+                } else {
+                    walker.result_query(query);
                 }
+                let access = if select_is_locking(query) || walker.writes {
+                    Access::ReadWrite
+                } else {
+                    Access::ReadOnly
+                };
+                (StatementKind::Select, access)
             }
-            if let Some(selection) = selection {
-                constraints = constraints_of(selection);
-            }
+        },
+        Statement::Insert(_) | Statement::Delete(_) => {
+            walker.statement(statement);
+            (data_kind(statement), Access::ReadWrite)
+        }
+        Statement::Update(update) => {
+            walker.statement(statement);
+            assigned_columns = assigned(update);
             (StatementKind::Update, Access::ReadWrite)
-        }
-        Statement::Delete(Delete {
-            from, selection, ..
-        }) => {
-            match from {
-                FromTable::WithFromKeyword(items) | FromTable::WithoutKeyword(items) => {
-                    tables_of_from(items, &mut tables);
-                }
-            }
-            if let Some(selection) = selection {
-                constraints = constraints_of(selection);
-            }
-            (StatementKind::Delete, Access::ReadWrite)
         }
         Statement::StartTransaction { .. } => (
             StatementKind::TransactionControl(TransactionOp::Begin),
@@ -553,17 +449,77 @@ fn analyze_statement(statement: &Statement, highest_parameter: u16) -> Statement
         _ => (StatementKind::Other, Access::ReadWrite),
     };
 
-    let aliases = alias_map(&tables);
+    // Whatever the walk missed is still read.
+    if reads_rows {
+        walker.sweep();
+    }
+    let (tables, constraints, links, anchors) = walker.finish();
     StatementAnalysis {
         kind,
         access,
-        constraints: constraints.resolve_aliases(&aliases),
         tables,
+        constraints,
         assigned_columns,
         highest_parameter,
         post_processing,
+        links,
+        anchors,
         branches,
     }
+}
+
+/// What kind a data-modifying statement is.
+fn data_kind(statement: &Statement) -> StatementKind {
+    match statement {
+        Statement::Insert(_) => StatementKind::Insert,
+        Statement::Update(_) => StatementKind::Update,
+        Statement::Delete(_) => StatementKind::Delete,
+        _ => StatementKind::Other,
+    }
+}
+
+/// The columns an `UPDATE` assigns to.
+fn assigned(update: &Update) -> Vec<String> {
+    update
+        .assignments
+        .iter()
+        .filter_map(|assignment| match &assignment.target {
+            sqlparser::ast::AssignmentTarget::ColumnName(name) => {
+                name.0.last().and_then(|part| part.as_ident()).map(fold)
+            }
+            sqlparser::ast::AssignmentTarget::Tuple(_) => None,
+        })
+        .collect()
+}
+
+/// Walks a set operation branch by branch, and says which tables each
+/// branch reads: its own, and those of the `WITH` queries it may use.
+fn walk_branches(walker: &mut Walker, query: &Query) -> Vec<Vec<TableRef>> {
+    fn leaves<'a>(body: &'a SetExpr, out: &mut Vec<&'a SetExpr>) {
+        match body {
+            SetExpr::SetOperation { left, right, .. } => {
+                leaves(left, out);
+                leaves(right, out);
+            }
+            other => out.push(other),
+        }
+    }
+    walker.name_ctes(query);
+    walker.walk_ctes(query);
+    let shared = walker.tables().len();
+    let mut found = Vec::new();
+    leaves(&query.body, &mut found);
+    let mut branches = Vec::with_capacity(found.len());
+    for leaf in found {
+        let start = walker.tables().len();
+        walker.set_expr(leaf);
+        let tables = walker.tables();
+        let mut branch: Vec<TableRef> = tables.get(..shared).unwrap_or_default().to_vec();
+        branch.extend(tables.get(start..).unwrap_or_default().iter().cloned());
+        branches.push(branch);
+    }
+    walker.ordering(query);
+    branches
 }
 
 /// Finds the highest `$n` placeholder in raw SQL text.
@@ -1074,5 +1030,153 @@ mod tests {
     #[test]
     fn a_dollar_quoted_body_that_is_never_closed_does_not_loop() {
         assert_eq!(scan_highest_placeholder("SELECT $tag$ unterminated"), 0);
+    }
+
+    // ------------------------------------------------- every block read
+
+    fn names(sql: &str) -> Vec<String> {
+        one(sql).tables.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn tables_hidden_in_subqueries_and_with_queries_are_found() {
+        assert_eq!(
+            names("WITH u AS (SELECT * FROM users) SELECT * FROM u"),
+            ["users"],
+            "a WITH query's name is not a table; what it reads is"
+        );
+        for sql in [
+            "SELECT * FROM currencies WHERE code IN (SELECT currency FROM orders)",
+            "SELECT *, (SELECT count(*) FROM orders o WHERE o.code = c.code) FROM currencies c",
+            "SELECT * FROM currencies WHERE EXISTS (SELECT 1 FROM orders)",
+            "UPDATE currencies SET rate = (SELECT max(rate) FROM orders)",
+            "INSERT INTO currencies SELECT * FROM orders",
+            "DELETE FROM currencies USING orders WHERE orders.code = currencies.code",
+            "SELECT * FROM currencies c JOIN LATERAL (SELECT * FROM orders) o ON true",
+        ] {
+            assert_eq!(names(sql), ["currencies", "orders"], "{sql}");
+        }
+        // Set-returning functions are not tables.
+        assert_eq!(
+            names("SELECT * FROM generate_series(1, 3)"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_subquery_pins_its_own_tables_and_never_the_outer_ones() {
+        let analysis = one("SELECT * FROM users WHERE NOT EXISTS \
+             (SELECT 1 FROM orders WHERE tenant_id = 'b' AND users.tenant_id = 'a')");
+        assert_eq!(
+            analysis
+                .shard_key_values("orders", "tenant_id")
+                .map(|set| set.iter().map(ToString::to_string).collect::<Vec<_>>()),
+            Some(vec!["b".to_owned()])
+        );
+        // Under NOT EXISTS the subquery's predicate on users says nothing
+        // about which users rows are returned.
+        assert!(analysis.shard_key_values("users", "tenant_id").is_none());
+    }
+
+    #[test]
+    fn a_key_flows_into_a_correlated_subquery_and_along_inner_joins() {
+        for sql in [
+            "SELECT * FROM users u WHERE u.tenant_id = 'a' AND EXISTS \
+             (SELECT 1 FROM orders o WHERE o.tenant_id = u.tenant_id)",
+            "SELECT * FROM users u JOIN orders o ON o.tenant_id = u.tenant_id \
+             WHERE u.tenant_id = 'a'",
+            "SELECT * FROM users u, orders o WHERE o.tenant_id = u.tenant_id \
+             AND u.tenant_id = 'a'",
+            "SELECT * FROM users u LEFT JOIN orders o ON o.tenant_id = u.tenant_id \
+             WHERE u.tenant_id = 'a'",
+            "SELECT * FROM users u JOIN orders o USING (tenant_id) WHERE u.tenant_id = 'a'",
+        ] {
+            assert_eq!(values(sql, "orders", "tenant_id"), ["a"], "{sql}");
+            assert_eq!(values(sql, "users", "tenant_id"), ["a"], "{sql}");
+        }
+    }
+
+    #[test]
+    fn an_outer_join_restricts_only_the_side_it_may_leave_out() {
+        // Every users row comes back whatever the ON clause asks of orders.
+        let sql = "SELECT * FROM users u LEFT JOIN orders o \
+                   ON o.tenant_id = u.tenant_id AND o.tenant_id = 'b'";
+        assert_eq!(values(sql, "orders", "tenant_id"), ["b"]);
+        assert!(one(sql).shard_key_values("users", "tenant_id").is_none());
+        assert!(
+            one(
+                "SELECT * FROM users u FULL JOIN orders o ON o.tenant_id = u.tenant_id \
+                 WHERE true AND o.tenant_id IS NULL"
+            )
+            .shard_key_values("orders", "tenant_id")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_table_read_twice_is_restricted_only_as_far_as_both_reads_are() {
+        assert_eq!(
+            values(
+                "SELECT * FROM users WHERE tenant_id = 'a' \
+                 UNION ALL SELECT * FROM users WHERE tenant_id = 'b'",
+                "users",
+                "tenant_id"
+            ),
+            ["a", "b"]
+        );
+        assert!(
+            one("SELECT * FROM users WHERE tenant_id = 'a' AND manager IN \
+                 (SELECT id FROM users)")
+            .shard_key_values("users", "tenant_id")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_statement_that_writes_through_with_is_a_write() {
+        let analysis = one(
+            "WITH moved AS (UPDATE orders SET total = 0 WHERE tenant_id = 'a' RETURNING *) \
+             SELECT * FROM moved",
+        );
+        assert_eq!(analysis.access, Access::ReadWrite);
+        let analysis = one("WITH gone AS (SELECT id FROM users WHERE tenant_id = 'a') \
+             UPDATE orders SET tenant_id = 'b' WHERE tenant_id = 'a'");
+        assert_eq!(analysis.kind, StatementKind::Update);
+        assert_eq!(
+            analysis.tables.first().map(ToString::to_string).as_deref(),
+            Some("orders"),
+            "the written table first"
+        );
+        assert!(analysis.assigns_to("tenant_id"));
+        assert_eq!(
+            one("SELECT * INTO copy FROM users").access,
+            Access::ReadWrite
+        );
+    }
+
+    #[test]
+    fn links_and_anchors_say_how_rows_meet_and_where_results_come_from() {
+        let analysis = one("SELECT * FROM users u WHERE EXISTS \
+             (SELECT 1 FROM orders o WHERE o.tenant_id = u.tenant_id)");
+        assert_eq!(
+            analysis.links,
+            [crate::Link {
+                left: 1,
+                left_column: "tenant_id".to_owned(),
+                right: 0,
+                right_column: "tenant_id".to_owned(),
+            }]
+        );
+        assert_eq!(analysis.anchors, [0], "only users rows are returned");
+        // The side an outer join may leave out anchors nothing.
+        assert_eq!(
+            one("SELECT * FROM currencies c LEFT JOIN orders o ON o.code = c.code").anchors,
+            [0]
+        );
+        assert_eq!(
+            one("SELECT * FROM (SELECT * FROM orders) s, currencies c").anchors,
+            [0, 1]
+        );
+        assert_eq!(one("UPDATE orders SET x = 1 FROM users").anchors, [0]);
     }
 }

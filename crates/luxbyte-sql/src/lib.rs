@@ -20,6 +20,7 @@ pub mod combine;
 pub mod hint;
 pub mod key;
 pub mod merge;
+mod scope;
 pub mod shape;
 pub mod statements;
 
@@ -126,6 +127,26 @@ impl std::fmt::Display for TableRef {
     }
 }
 
+/// Two columns a statement requires to be equal for rows to meet: a join
+/// condition, or a correlated subquery's tie to the outer row it is asked
+/// about. Each side is an index into [`StatementAnalysis::tables`] and a
+/// column of that read.
+///
+/// Between shard keys, a link means rows only meet where their keys are
+/// equal, and so in the same region, which lets a statement over every key
+/// run in each region at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    /// One read.
+    pub left: usize,
+    /// Its column.
+    pub left_column: String,
+    /// The other read.
+    pub right: usize,
+    /// Its column.
+    pub right_column: String,
+}
+
 /// Everything the router needs to know about one statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementAnalysis {
@@ -133,7 +154,10 @@ pub struct StatementAnalysis {
     pub kind: StatementKind,
     /// Whether it needs a primary.
     pub access: Access,
-    /// Tables it reads or writes, in the order they appear.
+    /// Every read or write of a table, wherever in the statement: in a
+    /// subquery, a `WITH` query or a set operation's branch as much as in
+    /// the outer `FROM`. A data-modifying statement's own table comes
+    /// first. A table read twice appears twice.
     pub tables: Vec<TableRef>,
     /// What its predicates pin each column to.
     pub constraints: KeyConstraints,
@@ -148,6 +172,15 @@ pub struct StatementAnalysis {
     /// What the statement does to its rows after collecting them, which
     /// decides whether a result can be assembled from several regions.
     pub post_processing: PostProcessing,
+    /// Columns the statement requires equal for rows of two reads to meet.
+    pub links: Vec<Link>,
+    /// Reads every result row is drawn from, as indexes into `tables`: the
+    /// outer query's own tables and those of subqueries in its `FROM`,
+    /// apart from a side an outer join may leave out; for `UPDATE` and
+    /// `DELETE`, the table written. A statement over every key can run
+    /// region by region only if one of them is geo-partitioned, so that
+    /// each result row comes from exactly one region.
+    pub anchors: Vec<usize>,
     /// For a set operation, the tables each branch reads; empty otherwise.
     ///
     /// Branches are read independently, so tables in different branches are

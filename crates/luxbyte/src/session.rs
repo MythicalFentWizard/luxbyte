@@ -177,6 +177,8 @@ impl Shared {
                 assigned_columns: Vec::new(),
                 highest_parameter: 0,
                 post_processing: luxbyte_sql::PostProcessing::default(),
+                links: Vec::new(),
+                anchors: Vec::new(),
                 branches: Vec::new(),
             }]),
             literals: Vec::new(),
