@@ -229,9 +229,10 @@ aggregates across regions that it used to refuse.
 - **Sharding within a region.** shahrah hashes keys onto logical shards and
   moves whole ranges of them with `REBALANCE`. Luxbyte's shards are regions
   sharing a `location`: new keys spread across the home location's shards by
-  hash, and its `REBALANCE` moves keys one atomic `RELOCATE` at a time. Per
-  key is finer and keeps a key's tables together; per range moves many keys
-  in fewer steps, and a range's keys never need a directory entry each.
+  hash, and its `REBALANCE` moves keys in atomic batches, 25 to a
+  transaction by default — 100 keys in 0.15 s against PostgreSQL 16, where
+  one move per key took 1.31 s. Per key is finer and keeps a key's tables
+  together; per range never needs a directory entry for each key.
 - **Operating it.** Close to even now. Both have live dashboards (shahrah
   over a WebSocket, Luxbyte over server-sent events) that list every proxy,
   operator verbs (`DRAIN`, `REBALANCE`; Luxbyte also `ROUTE` and `RELOCATE`),

@@ -423,8 +423,8 @@ async fn a_key_with_no_entry_moves_from_wherever_its_rows_are() {
             ),
         BackendConfig::new("us-east")
             .reply_to(
-                "SELECT 1 FROM \"public\".\"users\"",
-                Reply::rows(&["?column?"], &[&["1"]]),
+                "SELECT DISTINCT \"tenant_id\"::text FROM \"public\".\"users\"",
+                Reply::rows(&["tenant_id"], &[&["carol"]]),
             )
             .reply_to(
                 "FROM \"public\".\"users\" AS t",
@@ -458,10 +458,11 @@ async fn a_key_with_no_entry_moves_from_wherever_its_rows_are() {
 
 #[tokio::test]
 async fn a_key_with_rows_in_two_regions_is_refused_rather_than_guessed() {
-    let probe = || Reply::rows(&["?column?"], &[&["1"]]);
+    let probe = || Reply::rows(&["tenant_id"], &[&["carol"]]);
+    let users = "SELECT DISTINCT \"tenant_id\"::text FROM \"public\".\"users\"";
     let (eu, us, proxy) = start(
-        europe().reply_to("SELECT 1 FROM \"public\".\"users\"", probe()),
-        america().reply_to("SELECT 1 FROM \"public\".\"users\"", probe()),
+        europe().reply_to(users, probe()),
+        america().reply_to(users, probe()),
         &sections(),
     )
     .await;
@@ -472,6 +473,7 @@ async fn a_key_with_rows_in_two_regions_is_refused_rather_than_guessed() {
         .expect_err("refused");
     assert_eq!(error.sqlstate(), Some("55000"), "{error}");
     assert!(error.to_string().contains("eu-west and us-east"), "{error}");
+    assert!(error.to_string().contains("carol"), "{error}");
     assert_eq!(region_of(&proxy, "users", "carol"), Location::Unseen);
     nothing_moved(&eu, &us, &proxy);
 }
@@ -822,19 +824,20 @@ async fn rebalance_moves_each_key_the_source_holds_with_its_own_relocate() {
 #[tokio::test]
 async fn rebalance_stops_at_the_first_key_that_cannot_move() {
     // zoe is unknown to the directory and has rows in both regions, which
-    // RELOCATE refuses to guess about; nothing after her is tried.
-    let both = "\"tenant_id\" = E'zoe' LIMIT 1";
+    // RELOCATE refuses to guess about; key by key, nothing after her is
+    // tried.
+    let both = "\"tenant_id\" = E'zoe'";
     let (_eu, _us, proxy) = start(
         europe()
             .reply_to(KEYS, Reply::rows(&["k"], &[&["alice"], &["zoe"], &["zz"]]))
-            .reply_to(both, Reply::rows(&["?column?"], &[&["1"]])),
-        america().reply_to(both, Reply::rows(&["?column?"], &[&["1"]])),
+            .reply_to(both, Reply::rows(&["tenant_id"], &[&["zoe"]])),
+        america().reply_to(both, Reply::rows(&["tenant_id"], &[&["zoe"]])),
         &sections(),
     )
     .await;
     let mut ops = connect(&proxy, "ops").await;
     let result = ops
-        .simple_query("REBALANCE eu-west TO us-east")
+        .simple_query("REBALANCE eu-west TO us-east BATCH 1")
         .await
         .expect("a report, not an error");
     let rows = rows(&result);
@@ -944,4 +947,64 @@ async fn without_guards_no_trigger_is_installed() {
     let (eu, us, _proxy) = start(europe(), america(), &sections()).await;
     assert!(!eu.saw("luxbyte_guard"));
     assert!(!us.saw("luxbyte_guard"));
+}
+
+#[tokio::test]
+async fn several_keys_move_together_in_one_transaction() {
+    // dave has no directory entry; his rows are found in Europe, with
+    // alice's, so both come from one region in one move.
+    let (eu, us, proxy) = start(
+        europe().reply_to(
+            "SELECT DISTINCT \"tenant_id\"::text FROM \"public\".\"users\"",
+            Reply::rows(&["tenant_id"], &[&["dave"]]),
+        ),
+        america(),
+        &sections(),
+    )
+    .await;
+    let mut ops = connect(&proxy, "ops").await;
+    let result = ops
+        .simple_query("RELOCATE alice, dave TO us-east")
+        .await
+        .expect("both move");
+    assert_eq!(rows(&result).len(), 2, "one row per table");
+
+    // One lock, one read, one delete per table for both keys...
+    assert!(eu.saw("DELETE FROM \"public\".\"users\" WHERE \"tenant_id\" IN (E'alice', E'dave')"));
+    // ...and one two-phase commit for the whole move.
+    for backend in [&eu, &us] {
+        assert_eq!(
+            backend.prepared_transactions().len(),
+            1,
+            "{}",
+            backend.name()
+        );
+        assert!(backend.saw("(E'users', E'dave', E'us-east')"));
+    }
+    for key in ["alice", "dave"] {
+        assert_eq!(region_of(&proxy, "users", key), resident("us-east"));
+        assert_eq!(region_of(&proxy, "orders", key), resident("us-east"));
+    }
+}
+
+#[tokio::test]
+async fn a_key_already_at_the_destination_stays_while_the_others_move() {
+    // alice is in Europe; bob has no entry, and his rows are in America.
+    let (eu, us, proxy) = start(
+        europe(),
+        america().reply_to(
+            "SELECT DISTINCT \"tenant_id\"::text FROM \"public\".\"users\"",
+            Reply::rows(&["tenant_id"], &[&["bob"]]),
+        ),
+        &sections(),
+    )
+    .await;
+    let mut ops = connect(&proxy, "ops").await;
+    ops.simple_query("RELOCATE alice, bob TO eu-west")
+        .await
+        .expect("bob moves; alice is there already");
+    assert!(us.saw("DELETE FROM \"public\".\"users\" WHERE \"tenant_id\" = E'bob'"));
+    assert!(!eu.saw("DELETE FROM \"public\".\"users\""));
+    assert_eq!(region_of(&proxy, "users", "bob"), resident("eu-west"));
+    assert_eq!(region_of(&proxy, "users", "alice"), resident("eu-west"));
 }

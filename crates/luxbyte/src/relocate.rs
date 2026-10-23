@@ -184,23 +184,25 @@ impl Moves {
 
 // ------------------------------------------------------------- the command
 
-/// Reads `RELOCATE <key> TO <region>`. `None` if the statement is something
-/// else; `Some(Err(_))` if it is a malformed `RELOCATE`.
+/// Reads `RELOCATE <key>[, <key> ...] TO <region>`. `None` if the statement
+/// is something else; `Some(Err(_))` if it is a malformed `RELOCATE`.
 #[must_use]
-pub fn parse(sql: &str) -> Option<Result<(String, String), String>> {
+pub fn parse(sql: &str) -> Option<Result<(Vec<String>, String), String>> {
     let text = sql.trim().trim_end_matches(';').trim();
     let first = text.split_whitespace().next()?;
     if !first.eq_ignore_ascii_case("RELOCATE") {
         return None;
     }
-    let usage = "say it as: RELOCATE <key> TO <region>, quoting a key that has spaces in it \
-                 as 'like this'"
+    let usage = "say it as: RELOCATE <key>[, <key> ...] TO <region>, quoting a key that has \
+                 spaces or commas in it as 'like this'"
         .to_owned();
     let Some(words) = words(text.get(first.len()..).unwrap_or_default()) else {
         return Some(Err(usage));
     };
     Some(match words.as_slice() {
-        [key, to, region] if to.eq_ignore_ascii_case("TO") => Ok((key.clone(), region.clone())),
+        [keys @ .., to, region] if !keys.is_empty() && to.eq_ignore_ascii_case("TO") => {
+            Ok((keys.to_vec(), region.clone()))
+        }
         _ => Err(usage),
     })
 }
@@ -214,14 +216,22 @@ pub struct Rebalance {
     pub to: String,
     /// The most keys to move.
     pub limit: u64,
+    /// How many keys each move carries.
+    pub batch: u64,
 }
 
 /// How many keys a `REBALANCE` without `LIMIT` moves: enough to matter,
 /// few enough that one command cannot hold an operator's terminal for long.
 const REBALANCE_DEFAULT: u64 = 100;
 
-/// Reads `REBALANCE <from> TO <to> [LIMIT <n>]`. `None` if the statement is
-/// something else; `Some(Err(_))` if it is a malformed `REBALANCE`.
+/// How many keys one move of a `REBALANCE` carries without `BATCH`: one
+/// lock, one read, one insert, one delete and one commit for all of them,
+/// while each holds its writes no longer than a single move would.
+const BATCH_DEFAULT: u64 = 25;
+
+/// Reads `REBALANCE <from> TO <to> [LIMIT <n>] [BATCH <n>]`. `None` if the
+/// statement is something else; `Some(Err(_))` if it is a malformed
+/// `REBALANCE`.
 #[must_use]
 pub fn parse_rebalance(sql: &str) -> Option<Result<Rebalance, String>> {
     let text = sql.trim().trim_end_matches(';').trim();
@@ -229,38 +239,52 @@ pub fn parse_rebalance(sql: &str) -> Option<Result<Rebalance, String>> {
     if !first.eq_ignore_ascii_case("REBALANCE") {
         return None;
     }
-    let usage = "say it as: REBALANCE <from-region> TO <to-region> [LIMIT <keys>]".to_owned();
+    let usage = "say it as: REBALANCE <from-region> TO <to-region> [LIMIT <keys>] [BATCH <keys>]"
+        .to_owned();
     let Some(words) = words(text.get(first.len()..).unwrap_or_default()) else {
         return Some(Err(usage));
     };
-    let rebalance = |from: &str, to: &str, limit: u64| Rebalance {
-        from: from.to_owned(),
-        to: to.to_owned(),
-        limit,
+    let [from, word, to, options @ ..] = words.as_slice() else {
+        return Some(Err(usage));
     };
-    Some(match words.as_slice() {
-        [from, word, to] if word.eq_ignore_ascii_case("TO") => {
-            Ok(rebalance(from, to, REBALANCE_DEFAULT))
+    if !word.eq_ignore_ascii_case("TO") {
+        return Some(Err(usage));
+    }
+    let mut rebalance = Rebalance {
+        from: from.clone(),
+        to: to.clone(),
+        limit: REBALANCE_DEFAULT,
+        batch: BATCH_DEFAULT,
+    };
+    let mut seen = BTreeSet::new();
+    for pair in options.chunks(2) {
+        let [name, value] = pair else {
+            return Some(Err(usage));
+        };
+        let Ok(value) = value.parse::<u64>() else {
+            return Some(Err(usage));
+        };
+        let name = name.to_ascii_uppercase();
+        if value == 0 || !seen.insert(name.clone()) {
+            return Some(Err(usage));
         }
-        [from, word, to, limit_word, limit]
-            if word.eq_ignore_ascii_case("TO") && limit_word.eq_ignore_ascii_case("LIMIT") =>
-        {
-            match limit.parse::<u64>() {
-                Ok(limit) if limit > 0 => Ok(rebalance(from, to, limit)),
-                _ => Err(usage),
-            }
+        match name.as_str() {
+            "LIMIT" => rebalance.limit = value,
+            "BATCH" => rebalance.batch = value,
+            _ => return Some(Err(usage)),
         }
-        _ => Err(usage),
-    })
+    }
+    Some(Ok(rebalance))
 }
 
-/// Moves up to `limit` keys from one region to another, one `RELOCATE` at
-/// a time, and says what happened to each.
+/// Moves up to `limit` keys from one region to another, `batch` keys to a
+/// move, and says what happened to each.
 ///
-/// Each key moves atomically; the rebalance as a whole does not. It stops at
-/// the first key that cannot move, since what stopped it — a lock, a proxy
-/// that did not confirm — would most likely stop the next one too, and
-/// reports the keys moved before it.
+/// Each move is atomic; the rebalance as a whole is not. It stops at the
+/// first move that is refused, since what stopped it — a lock, a proxy that
+/// did not confirm, a key with rows in two regions — would most likely stop
+/// the next one too, and reports the keys moved before it. `BATCH 1` moves
+/// key by key, so that one troublesome key stops only itself.
 ///
 /// The keys are read from the source's rows, in order, so a key whose rows
 /// predate the directory moves too.
@@ -269,7 +293,12 @@ pub fn parse_rebalance(sql: &str) -> Option<Result<Rebalance, String>> {
 ///
 /// When the regions are wrong or the source cannot be read.
 pub async fn rebalance(shared: Arc<Shared>, command: Rebalance) -> Result<QueryResult, Refusal> {
-    let Rebalance { from, to, limit } = command;
+    let Rebalance {
+        from,
+        to,
+        limit,
+        batch,
+    } = command;
     let topology = shared.router.topology();
     for region in [&from, &to] {
         if topology.region(region).is_none() {
@@ -315,22 +344,27 @@ pub async fn rebalance(shared: Arc<Shared>, command: Rebalance) -> Result<QueryR
         .collect();
 
     let mut rows: Vec<Vec<Option<String>>> = Vec::with_capacity(keys.len());
-    for key in keys {
-        match relocate(Arc::clone(&shared), key.clone(), to.clone()).await {
+    let size = usize::try_from(batch).unwrap_or(usize::MAX).max(1);
+    for chunk in keys.chunks(size) {
+        match relocate_many(Arc::clone(&shared), chunk.to_vec(), to.clone()).await {
             Ok(report) => {
-                let moved: u64 = report.tables.iter().map(|table| table.rows).sum();
-                rows.push(vec![
-                    Some(key),
-                    Some(moved.to_string()),
-                    Some(report.state()),
-                ]);
+                let state = report.state();
+                for (key, moved) in &report.keys {
+                    rows.push(vec![
+                        Some(key.clone()),
+                        Some(moved.to_string()),
+                        Some(state.clone()),
+                    ]);
+                }
             }
             Err(refusal) => {
-                rows.push(vec![
-                    Some(key),
-                    Some("0".to_owned()),
-                    Some(format!("refused: {}; stopped here", refusal.message)),
-                ]);
+                for key in chunk {
+                    rows.push(vec![
+                        Some(key.clone()),
+                        Some("0".to_owned()),
+                        Some(format!("refused: {}; stopped here", refusal.message)),
+                    ]);
+                }
                 break;
             }
         }
@@ -345,12 +379,13 @@ pub async fn rebalance(shared: Arc<Shared>, command: Rebalance) -> Result<QueryR
     })
 }
 
-/// Splits on whitespace, reading `'quoted words'` with `''` for a quote.
+/// Splits on whitespace and commas, reading `'quoted words'` with `''` for a
+/// quote.
 fn words(text: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut chars = text.chars().peekable();
     loop {
-        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        while chars.next_if(|c| c.is_whitespace() || *c == ',').is_some() {}
         let Some(first) = chars.next() else {
             return Some(words);
         };
@@ -365,7 +400,7 @@ fn words(text: &str) -> Option<Vec<String>> {
             }
         } else {
             word.push(first);
-            while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
+            while let Some(c) = chars.next_if(|c| !c.is_whitespace() && *c != ',') {
                 word.push(c);
             }
         }
@@ -395,6 +430,8 @@ pub struct Report {
     /// happened; while the destination or a source is among them, the key
     /// waits for them.
     pub pending: Vec<String>,
+    /// Each key, and how many rows moved with it across every table.
+    pub keys: Vec<(String, u64)>,
 }
 
 impl Report {
@@ -477,20 +514,34 @@ struct Part {
     qualified: String,
     /// The key column, quoted.
     column: String,
+    /// The key column as the rows' JSON names it.
+    field: String,
     /// Where its rows are; `None` if it has none in any region.
     source: Option<String>,
     /// Whether the directory already had the key in the destination.
     settled: bool,
     /// The rows taken from the source, as a JSON array, and how many.
     rows: Option<(String, u64)>,
+    /// How many of those rows each key had.
+    per_key: BTreeMap<String, u64>,
 }
 
 /// Undoes a cutover unless the move committed, however the move ends.
 struct Cutover {
     shared: Arc<Shared>,
-    key: String,
+    keys: Vec<String>,
     tables: Vec<String>,
     committed: bool,
+}
+
+impl Cutover {
+    /// Lets one key go, as it was, without waiting for the move to end.
+    fn release(&mut self, key: &str) {
+        for table in &self.tables {
+            let _ = self.shared.directory.abort_relocation(table, key);
+        }
+        self.keys.retain(|held| held != key);
+    }
 }
 
 impl Drop for Cutover {
@@ -498,8 +549,10 @@ impl Drop for Cutover {
         if self.committed {
             return;
         }
-        for table in &self.tables {
-            let _ = self.shared.directory.abort_relocation(table, &self.key);
+        for key in &self.keys {
+            for table in &self.tables {
+                let _ = self.shared.directory.abort_relocation(table, key);
+            }
         }
         self.shared.moves.announce();
     }
@@ -512,8 +565,20 @@ impl Drop for Cutover {
 /// move halfway through its commit and leave prepared transactions holding
 /// the source's tables locked.
 pub async fn relocate(shared: Arc<Shared>, key: String, to: String) -> Result<Report, Refusal> {
+    relocate_many(shared, vec![key], to).await
+}
+
+/// Moves several keys to `to` in one transaction: one lock, one read, one
+/// insert and one delete per table, one commit. All of them move or none
+/// does. Their rows have to be in one region, table by table; keys with
+/// rows already in `to` are left where they are.
+pub async fn relocate_many(
+    shared: Arc<Shared>,
+    keys: Vec<String>,
+    to: String,
+) -> Result<Report, Refusal> {
     tokio::spawn(async move {
-        let outcome = run_move(&shared, &key, &to).await;
+        let outcome = run_move(&shared, &keys, &to).await;
         shared
             .metrics
             .relocation(if outcome.is_ok() { "moved" } else { "refused" });
@@ -523,8 +588,23 @@ pub async fn relocate(shared: Arc<Shared>, key: String, to: String) -> Result<Re
     .unwrap_or_else(|_| Err(fail("XX000", "the move stopped unexpectedly")))
 }
 
+/// The condition that picks the keys' rows: `= key` for one, `IN (...)` for
+/// several.
+fn matching(keys: &[String]) -> String {
+    match keys {
+        [key] => format!("= {}", literal(key)),
+        _ => format!(
+            "IN ({})",
+            keys.iter()
+                .map(|key| literal(key))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
-async fn run_move(shared: &Arc<Shared>, key: &str, to: &str) -> Result<Report, Refusal> {
+async fn run_move(shared: &Arc<Shared>, keys: &[String], to: &str) -> Result<Report, Refusal> {
     let Some(store) = shared.moves.store() else {
         return Err(hinted(
             "55000",
@@ -536,6 +616,15 @@ async fn run_move(shared: &Arc<Shared>, key: &str, to: &str) -> Result<Report, R
     let topology = shared.router.topology();
     if topology.region(to).is_none() {
         return Err(fail("22023", format!("there is no region \"{to}\"")));
+    }
+    let keys: Vec<String> = keys
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if keys.is_empty() {
+        return Err(fail("22023", "there is no key to move"));
     }
     let lock_timeout = Duration::from_millis(store.lock_timeout_ms);
 
@@ -549,9 +638,11 @@ async fn run_move(shared: &Arc<Shared>, key: &str, to: &str) -> Result<Report, R
                 name: policy.table.clone(),
                 qualified: format!("{}.{}", ident(&policy.schema), ident(&policy.table)),
                 column: ident(column),
+                field: column.clone(),
                 source: None,
                 settled: false,
                 rows: None,
+                per_key: BTreeMap::new(),
             }),
             _ => None,
         })
@@ -563,29 +654,41 @@ async fn run_move(shared: &Arc<Shared>, key: &str, to: &str) -> Result<Report, R
         ));
     }
 
-    // With other proxies sharing the directory, they hold the key too.
-    let announcement = match &shared.peers {
-        Some(peers) => Some(peers.announce(shared, key, to).await?),
-        None => None,
-    };
+    // With other proxies sharing the directory, they hold the keys too.
+    let mut announcements = Vec::new();
+    if let Some(peers) = &shared.peers {
+        for key in &keys {
+            announcements.push(peers.announce(shared, key, to).await?);
+        }
+    }
 
-    // 1. Cutover: writes to the key wait from here on.
+    // Where this proxy's directory had each key, before the move marks it.
+    let at_destination: BTreeSet<(String, String)> = parts
+        .iter()
+        .flat_map(|part| keys.iter().map(move |key| (part.name.clone(), key.clone())))
+        .filter(|(table, key)| {
+            matches!(
+                shared.directory.locate(table, key),
+                Location::Known(KeyState::Resident { ref region }) if region == to
+            )
+        })
+        .collect();
+
+    // 1. Cutover: writes to the keys wait from here on.
     let mut cutover = Cutover {
         shared: Arc::clone(shared),
-        key: key.to_owned(),
-        tables: Vec::new(),
+        keys: Vec::new(),
+        tables: parts.iter().map(|part| part.name.clone()).collect(),
         committed: false,
     };
-    for part in &mut parts {
-        part.settled = matches!(
-            shared.directory.locate(&part.name, key),
-            Location::Known(KeyState::Resident { ref region }) if region == to
-        );
-        shared
-            .directory
-            .begin_relocation(&part.name, key, to)
-            .map_err(|error| fail("55006", error.to_string()))?;
-        cutover.tables.push(part.name.clone());
+    for key in &keys {
+        for part in &parts {
+            shared
+                .directory
+                .begin_relocation(&part.name, key, to)
+                .map_err(|error| fail("55006", error.to_string()))?;
+        }
+        cutover.keys.push(key.clone());
     }
     shared.moves.announce();
     let generation = shared.moves.gate.advance();
@@ -599,47 +702,58 @@ async fn run_move(shared: &Arc<Shared>, key: &str, to: &str) -> Result<Report, R
             "try again when the database is less busy, or raise directory_store.lock_timeout_ms",
         ));
     }
-    if let Some(announcement) = &announcement {
+    for announcement in &announcements {
         announcement
             .confirmed(crate::peers::Phase::Cutover, lock_timeout)
             .await?;
     }
 
-    // Where each table's rows are: as the shared directory says, when there
-    // is one, since this proxy's copy may know less. A key the directory
-    // did not know may have rows anywhere, so every region is asked.
-    let shared_regions = match &shared.peers {
-        Some(peers) => Some(
-            peers
-                .regions_of(shared, key)
-                .await
-                .map_err(|error| fail("57P03", format!("{error}; nothing was moved")))?,
-        ),
-        None => None,
-    };
-    let literal_key = literal(key);
-    for part in &mut parts {
-        part.source = match &shared_regions {
-            Some(regions) => regions
-                .iter()
-                .find(|(table, _)| *table == part.name)
-                .map(|(_, region)| region.clone()),
-            None => match shared.directory.locate(&part.name, key) {
-                Location::Known(state) => state.source().map(ToOwned::to_owned),
-                Location::Unseen => None,
-            },
+    // Where each key's rows are, table by table: as the shared directory
+    // says, when there is one, since this proxy's copy may know less.
+    let mut known: BTreeMap<(String, String), Option<String>> = BTreeMap::new();
+    for key in &keys {
+        let shared_regions = match &shared.peers {
+            Some(peers) => Some(
+                peers
+                    .regions_of(shared, key)
+                    .await
+                    .map_err(|error| fail("57P03", format!("{error}; nothing was moved")))?,
+            ),
+            None => None,
         };
-        if shared_regions.is_some() {
-            part.settled = part.source.as_deref() == Some(to);
-        }
-        if part.source.is_none() {
-            part.source = find_rows(shared, part, &literal_key).await?;
-            let _ = shared
-                .directory
-                .found_source(&part.name, key, part.source.as_deref());
+        for part in &parts {
+            let source = match &shared_regions {
+                Some(regions) => regions
+                    .iter()
+                    .find(|(table, _)| *table == part.name)
+                    .map(|(_, region)| region.clone()),
+                None => match shared.directory.locate(&part.name, key) {
+                    Location::Known(state) => state.source().map(ToOwned::to_owned),
+                    Location::Unseen => None,
+                },
+            };
+            known.insert((part.name.clone(), key.clone()), source);
         }
     }
-    if parts.iter().all(|part| part.settled) {
+    let settled = |table: &str, key: &str| {
+        if shared.peers.is_some() {
+            known
+                .get(&(table.to_owned(), key.to_owned()))
+                .is_some_and(|source| source.as_deref() == Some(to))
+        } else {
+            at_destination.contains(&(table.to_owned(), key.to_owned()))
+        }
+    };
+    // A key already in the destination everywhere stays as it is.
+    let moving: Vec<String> = keys
+        .iter()
+        .filter(|key| !parts.iter().all(|part| settled(&part.name, key)))
+        .cloned()
+        .collect();
+    for key in keys.iter().filter(|key| !moving.contains(key)) {
+        cutover.release(key);
+    }
+    if moving.is_empty() {
         // Already there: nothing to do, and the cutover is undone on return.
         return Ok(Report {
             to: to.to_owned(),
@@ -647,12 +761,64 @@ async fn run_move(shared: &Arc<Shared>, key: &str, to: &str) -> Result<Report, R
                 .iter()
                 .map(|part| Moved {
                     table: part.name.clone(),
-                    from: part.source.clone(),
+                    from: known
+                        .iter()
+                        .find(|((table, _), _)| *table == part.name)
+                        .and_then(|(_, source)| source.clone()),
                     rows: 0,
                 })
                 .collect(),
             pending: Vec::new(),
+            keys: keys.iter().map(|key| (key.clone(), 0)).collect(),
         });
+    }
+    // A key the directory did not know may have rows anywhere, so every
+    // region is asked about it. The keys of one move have to agree.
+    for part in &mut parts {
+        part.settled = moving.iter().all(|key| settled(&part.name, key));
+        let unknown: Vec<String> = moving
+            .iter()
+            .filter(|key| {
+                known
+                    .get(&(part.name.clone(), (*key).clone()))
+                    .is_none_or(Option::is_none)
+            })
+            .cloned()
+            .collect();
+        let found = if unknown.is_empty() {
+            BTreeMap::new()
+        } else {
+            find_rows(shared, part, &unknown).await?
+        };
+        let mut regions: BTreeSet<String> = BTreeSet::new();
+        for key in &moving {
+            let source = known
+                .get(&(part.name.clone(), key.clone()))
+                .cloned()
+                .flatten()
+                .or_else(|| found.get(key).cloned());
+            if known
+                .get(&(part.name.clone(), key.clone()))
+                .is_none_or(Option::is_none)
+            {
+                let _ = shared
+                    .directory
+                    .found_source(&part.name, key, source.as_deref());
+            }
+            regions.extend(source);
+        }
+        if regions.len() > 1 {
+            return Err(hinted(
+                "55000",
+                format!(
+                    "the keys' rows of \"{}\" are in {}, and one move takes them from one region",
+                    part.name,
+                    regions.into_iter().collect::<Vec<_>>().join(" and ")
+                ),
+                "move them separately, or one region's keys at a time",
+            ));
+        }
+        part.source = regions.into_iter().next();
     }
 
     // 2. The transaction.
@@ -668,7 +834,7 @@ async fn run_move(shared: &Arc<Shared>, key: &str, to: &str) -> Result<Report, R
         &mut transaction,
         &mut parts,
         &sources,
-        key,
+        &moving,
         to,
         store,
     )
@@ -679,11 +845,13 @@ async fn run_move(shared: &Arc<Shared>, key: &str, to: &str) -> Result<Report, R
     }
 
     // 3. Commit. Reads wait too while the regions commit one by one.
-    for part in &parts {
-        let _ = shared.directory.begin_committing(&part.name, key);
+    for key in &moving {
+        for part in &parts {
+            let _ = shared.directory.begin_committing(&part.name, key);
+        }
     }
     shared.moves.announce();
-    if let Some(announcement) = &announcement {
+    for announcement in &announcements {
         let agreed = match announcement.advance(crate::peers::Phase::Committing).await {
             Ok(()) => {
                 announcement
@@ -706,27 +874,28 @@ async fn run_move(shared: &Arc<Shared>, key: &str, to: &str) -> Result<Report, R
         CommitOutcome::CommittedPendingAcknowledgement { unresolved, .. } => unresolved,
         _ => Vec::new(),
     };
-    // The rows are where the key now is unless the destination or a source
-    // has yet to confirm, and until they do the key keeps waiting.
+    // The rows are where the keys now are unless the destination or a source
+    // has yet to confirm, and until they do the keys keep waiting.
     let holding = pending
         .iter()
         .any(|region| region == to || sources.contains(region));
     if !holding {
-        settle(shared, &parts, key);
+        settle(shared, &parts, &moving);
     }
-    // The other proxies read where the key went from the authority region,
+    // The other proxies read where the keys went from the authority region,
     // so they are let go once it has committed.
     let authority_pending = shared
         .peers
         .as_ref()
         .is_some_and(|peers| pending.iter().any(|region| region == peers.authority()));
-    let announcement = match announcement {
-        Some(announcement) if !holding && !authority_pending => {
-            let tables: Vec<String> = parts.iter().map(|part| part.name.clone()).collect();
+    let tables: Vec<String> = parts.iter().map(|part| part.name.clone()).collect();
+    let announcements = if !holding && !authority_pending {
+        for announcement in announcements {
             announcement.moved(&tables, to);
-            None
         }
-        other => other,
+        Vec::new()
+    } else {
+        announcements
     };
     if !pending.is_empty() {
         finish_later(
@@ -735,12 +904,12 @@ async fn run_move(shared: &Arc<Shared>, key: &str, to: &str) -> Result<Report, R
             &pending,
             holding,
             &parts,
-            key,
+            &moving,
             to,
-            announcement,
+            announcements,
         );
     }
-    tracing::info!(key, to, "relocated a key");
+    tracing::info!(keys = moving.len(), to, "relocated keys");
 
     Ok(Report {
         to: to.to_owned(),
@@ -753,12 +922,24 @@ async fn run_move(shared: &Arc<Shared>, key: &str, to: &str) -> Result<Report, R
             })
             .collect(),
         pending,
+        keys: keys
+            .iter()
+            .map(|key| {
+                let moved = parts
+                    .iter()
+                    .map(|part| part.per_key.get(key).copied().unwrap_or(0))
+                    .fold(0, u64::saturating_add);
+                (key.clone(), moved)
+            })
+            .collect(),
     })
 }
 
-fn settle(shared: &Shared, parts: &[Part], key: &str) {
-    for part in parts {
-        let _ = shared.directory.finish_relocation(&part.name, key);
+fn settle(shared: &Shared, parts: &[Part], keys: &[String]) {
+    for key in keys {
+        for part in parts {
+            let _ = shared.directory.finish_relocation(&part.name, key);
+        }
     }
     shared.moves.announce();
 }
@@ -772,9 +953,9 @@ fn finish_later(
     pending: &[String],
     holding: bool,
     parts: &[Part],
-    key: &str,
+    keys: &[String],
     to: &str,
-    announcement: Option<crate::peers::Announcement>,
+    announcements: Vec<crate::peers::Announcement>,
 ) {
     let pools: Vec<Pool> = pending
         .iter()
@@ -782,7 +963,7 @@ fn finish_later(
         .collect();
     let tables: Vec<String> = parts.iter().map(|part| part.name.clone()).collect();
     let shared = Arc::clone(shared);
-    let key = key.to_owned();
+    let keys = keys.to_vec();
     let to = to.to_owned();
     tokio::spawn(async move {
         let mut wait = Duration::from_millis(250);
@@ -794,26 +975,34 @@ fn finish_later(
             wait = wait.saturating_mul(2).min(Duration::from_secs(30));
         }
         if holding {
-            for table in &tables {
-                let _ = shared.directory.finish_relocation(table, &key);
+            for key in &keys {
+                for table in &tables {
+                    let _ = shared.directory.finish_relocation(table, key);
+                }
             }
             shared.moves.announce();
         }
-        if let Some(announcement) = announcement {
+        for announcement in announcements {
             announcement.moved(&tables, &to);
         }
         tracing::info!(%gid, "every region acknowledged a relocation");
     });
 }
 
-/// The regions holding rows for the key, asked of each primary so that a
-/// lagging replica cannot hide one.
-async fn find_rows(shared: &Shared, part: &Part, key: &str) -> Result<Option<String>, Refusal> {
+/// The region holding rows for each of `keys` that has any, asked of each
+/// primary so that a lagging replica cannot hide one.
+async fn find_rows(
+    shared: &Shared,
+    part: &Part,
+    keys: &[String],
+) -> Result<BTreeMap<String, String>, Refusal> {
     let probe = format!(
-        "SELECT 1 FROM {} WHERE {} = {key} LIMIT 1",
-        part.qualified, part.column
+        "SELECT DISTINCT {column}::text FROM {table} WHERE {column} {keys}",
+        column = part.column,
+        table = part.qualified,
+        keys = matching(keys)
     );
-    let mut found = Vec::new();
+    let mut found: BTreeMap<String, String> = BTreeMap::new();
     for region in shared.router.topology().region_ids() {
         let Some(pool) = shared.pool_for(region, Access::ReadWrite, 0) else {
             continue;
@@ -822,24 +1011,25 @@ async fn find_rows(shared: &Shared, part: &Part, key: &str) -> Result<Option<Str
             .simple_query(&probe)
             .await
             .map_err(|error| region_error(region, &error))?;
-        if !result.rows.is_empty() {
-            found.push(region.to_owned());
+        for key in result
+            .rows
+            .iter()
+            .filter_map(|row| row.first().cloned().flatten())
+        {
+            if let Some(other) = found.insert(key.clone(), region.to_owned()) {
+                return Err(hinted(
+                    "55000",
+                    format!(
+                        "\"{}\" has rows for {key} in {other} and {region}, and the directory \
+                         does not say which is right",
+                        part.name
+                    ),
+                    "merge them into one region by hand, then RELOCATE",
+                ));
+            }
         }
     }
-    match found.as_slice() {
-        [] => Ok(None),
-        [region] => Ok(Some(region.clone())),
-        _ => Err(hinted(
-            "55000",
-            format!(
-                "\"{}\" has rows for the key in {}, and the directory does not say which is \
-                 right",
-                part.name,
-                found.join(" and ")
-            ),
-            "merge them into one region by hand, then RELOCATE",
-        )),
-    }
+    Ok(found)
 }
 
 /// Copies the rows, deletes them from the source and records the new
@@ -849,7 +1039,7 @@ async fn copy(
     transaction: &mut Transaction,
     parts: &mut [Part],
     sources: &BTreeSet<String>,
-    key: &str,
+    keys: &[String],
     to: &str,
     store: &DirectoryStore,
 ) -> Result<(), Refusal> {
@@ -883,22 +1073,24 @@ async fn copy(
         run(transaction, region, &set_timeout).await?;
     }
 
-    let literal_key = literal(key);
-    take_rows(transaction, parts, sources, &literal_key).await?;
+    let list = matching(keys);
+    take_rows(transaction, parts, sources, &list).await?;
     let tables = dependency_order(transaction, parts, to).await?;
-    place_rows(transaction, parts, &tables, &literal_key, to).await?;
-    remove_rows(transaction, parts, &tables, &literal_key, to).await?;
+    place_rows(transaction, parts, &tables, &list, to).await?;
+    remove_rows(transaction, parts, &tables, &list, to).await?;
 
     // The directory, in every region, in the same transaction.
     let values: Vec<String> = parts
         .iter()
-        .map(|part| {
-            format!(
-                "({}, {}, {})",
-                literal(&part.name),
-                literal(key),
-                literal(to)
-            )
+        .flat_map(|part| {
+            keys.iter().map(move |key| {
+                format!(
+                    "({}, {}, {})",
+                    literal(&part.name),
+                    literal(key),
+                    literal(to)
+                )
+            })
         })
         .collect();
     let record = format!(
@@ -939,7 +1131,7 @@ async fn take_rows(
             .filter(|part| part.source.as_deref() == Some(source.as_str()))
         {
             let read = format!(
-                "SELECT coalesce(json_agg(t), '[]'::json)::text FROM {} AS t WHERE t.{} = \
+                "SELECT coalesce(json_agg(t), '[]'::json)::text FROM {} AS t WHERE t.{} \
                  {literal_key}",
                 part.qualified, part.column
             );
@@ -954,6 +1146,15 @@ async fn take_rows(
                     ),
                 ));
             };
+            for row in &rows {
+                let key = match row.get(&part.field) {
+                    Some(serde_json::Value::String(text)) => text.clone(),
+                    Some(other) => other.to_string(),
+                    None => String::new(),
+                };
+                let count = part.per_key.entry(key).or_insert(0);
+                *count = count.saturating_add(1);
+            }
             part.rows = Some((json, u64::try_from(rows.len()).unwrap_or(u64::MAX)));
         }
     }
@@ -974,7 +1175,7 @@ async fn place_rows(
             continue;
         };
         let there = format!(
-            "SELECT count(*) FROM {} WHERE {} = {literal_key}",
+            "SELECT count(*) FROM {} WHERE {} {literal_key}",
             part.qualified, part.column
         );
         let existing = first_value(&run(transaction, to, &there).await?)
@@ -984,7 +1185,7 @@ async fn place_rows(
             return Err(hinted(
                 "55000",
                 format!(
-                    "\"{}\" already has {existing} rows for the key in {to}, and moving the \
+                    "\"{}\" already has {existing} rows for the keys in {to}, and moving the \
                      rows from {source} would put both sets there",
                     part.name
                 ),
@@ -1027,7 +1228,7 @@ async fn remove_rows(
         };
         let count = part.rows.as_ref().map_or(0, |(_, count)| *count);
         let delete = format!(
-            "DELETE FROM {} WHERE {} = {literal_key}",
+            "DELETE FROM {} WHERE {} {literal_key}",
             part.qualified, part.column
         );
         let deleted = affected(&run(transaction, source, &delete).await?);
@@ -1481,11 +1682,11 @@ mod tests {
     fn the_command_is_read_with_quoted_keys() {
         assert_eq!(
             parse("RELOCATE alice TO us-east;"),
-            Some(Ok(("alice".to_owned(), "us-east".to_owned())))
+            Some(Ok((vec!["alice".to_owned()], "us-east".to_owned())))
         );
         assert_eq!(
             parse("relocate 'o''brien & co' to 'us-east'"),
-            Some(Ok(("o'brien & co".to_owned(), "us-east".to_owned())))
+            Some(Ok((vec!["o'brien & co".to_owned()], "us-east".to_owned())))
         );
         assert_eq!(parse("SELECT 1"), None);
         assert!(matches!(parse("RELOCATE alice"), Some(Err(_))));
@@ -1493,36 +1694,58 @@ mod tests {
             parse("RELOCATE 'unterminated TO us"),
             Some(Err(_))
         ));
-        assert!(matches!(parse("RELOCATE a b TO c"), Some(Err(_))));
     }
 
     #[test]
-    fn rebalance_is_read_with_an_optional_limit() {
+    fn rebalance_is_read_with_an_optional_limit_and_batch() {
+        let read = |from: &str, to: &str, limit: u64, batch: u64| {
+            Some(Ok(Rebalance {
+                from: from.to_owned(),
+                to: to.to_owned(),
+                limit,
+                batch,
+            }))
+        };
         assert_eq!(
             parse_rebalance("REBALANCE eu-west-1 TO eu-west-2;"),
-            Some(Ok(Rebalance {
-                from: "eu-west-1".to_owned(),
-                to: "eu-west-2".to_owned(),
-                limit: REBALANCE_DEFAULT,
-            }))
+            read("eu-west-1", "eu-west-2", REBALANCE_DEFAULT, BATCH_DEFAULT)
         );
         assert_eq!(
             parse_rebalance("rebalance 'eu 1' to eu-2 limit 7"),
-            Some(Ok(Rebalance {
-                from: "eu 1".to_owned(),
-                to: "eu-2".to_owned(),
-                limit: 7,
-            }))
+            read("eu 1", "eu-2", 7, BATCH_DEFAULT)
+        );
+        assert_eq!(
+            parse_rebalance("REBALANCE a TO b BATCH 1 LIMIT 3"),
+            read("a", "b", 3, 1)
         );
         assert_eq!(parse_rebalance("RELOCATE alice TO us"), None);
         for wrong in [
             "REBALANCE a",
             "REBALANCE a TO b LIMIT 0",
             "REBALANCE a TO b LIMIT many",
+            "REBALANCE a TO b LIMIT 1 LIMIT 2",
+            "REBALANCE a TO b BATCH",
+            "REBALANCE a TO b SIZE 3",
             "REBALANCE a b c",
         ] {
             assert!(matches!(parse_rebalance(wrong), Some(Err(_))), "{wrong}");
         }
+    }
+
+    #[test]
+    fn several_keys_can_be_moved_together() {
+        assert_eq!(
+            parse("RELOCATE alice, bob 'o''brien, co' TO us-east"),
+            Some(Ok((
+                vec![
+                    "alice".to_owned(),
+                    "bob".to_owned(),
+                    "o'brien, co".to_owned()
+                ],
+                "us-east".to_owned()
+            )))
+        );
+        assert!(matches!(parse("RELOCATE TO us-east"), Some(Err(_))));
     }
 
     #[test]
