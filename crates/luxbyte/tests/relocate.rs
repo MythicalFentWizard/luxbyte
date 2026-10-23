@@ -979,7 +979,7 @@ async fn several_keys_move_together_in_one_transaction() {
             "{}",
             backend.name()
         );
-        assert!(backend.saw("(E'users', E'dave', E'us-east')"));
+        assert!(backend.saw("(E'users', E'dave', E'us-east', 1)"));
     }
     for key in ["alice", "dave"] {
         assert_eq!(region_of(&proxy, "users", key), resident("us-east"));

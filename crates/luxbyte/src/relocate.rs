@@ -829,7 +829,7 @@ async fn run_move(shared: &Arc<Shared>, keys: &[String], to: &str) -> Result<Rep
         .collect();
     let mut transaction = shared.coordinator.begin();
     let gid = transaction.gid().to_owned();
-    if let Err(refusal) = copy(
+    let enlisted = match copy(
         shared,
         &mut transaction,
         &mut parts,
@@ -840,9 +840,12 @@ async fn run_move(shared: &Arc<Shared>, keys: &[String], to: &str) -> Result<Rep
     )
     .await
     {
-        let _ = transaction.rollback().await;
-        return Err(refusal);
-    }
+        Ok(enlisted) => enlisted,
+        Err(refusal) => {
+            let _ = transaction.rollback().await;
+            return Err(refusal);
+        }
+    };
 
     // 3. Commit. Reads wait too while the regions commit one by one.
     for key in &moving {
@@ -883,11 +886,24 @@ async fn run_move(shared: &Arc<Shared>, keys: &[String], to: &str) -> Result<Rep
         settle(shared, &parts, &moving);
     }
     // The other proxies read where the keys went from the authority region,
-    // so they are let go once it has committed.
+    // or from a majority, so they are let go once enough have committed. A
+    // region the move left out has not, and never will.
+    let behind: Vec<String> = pending
+        .iter()
+        .cloned()
+        .chain(
+            shared
+                .router
+                .topology()
+                .region_ids()
+                .filter(|region| !enlisted.iter().any(|taken| taken == region))
+                .map(ToOwned::to_owned),
+        )
+        .collect();
     let authority_pending = shared
         .peers
         .as_ref()
-        .is_some_and(|peers| pending.iter().any(|region| region == peers.authority()));
+        .is_some_and(|peers| peers.must_wait_for(&behind));
     let tables: Vec<String> = parts.iter().map(|part| part.name.clone()).collect();
     let announcements = if !holding && !authority_pending {
         for announcement in announcements {
@@ -1033,7 +1049,8 @@ async fn find_rows(
 }
 
 /// Copies the rows, deletes them from the source and records the new
-/// region, all inside `transaction`. Nothing is committed here.
+/// region, all inside `transaction`, and says which regions took part.
+/// Nothing is committed here.
 async fn copy(
     shared: &Shared,
     transaction: &mut Transaction,
@@ -1042,7 +1059,7 @@ async fn copy(
     keys: &[String],
     to: &str,
     store: &DirectoryStore,
-) -> Result<(), Refusal> {
+) -> Result<Vec<String>, Refusal> {
     // The destination is enlisted first so that it commits first: a scan
     // of the whole table that lands between two commits sees the key's rows
     // twice rather than not at all.
@@ -1062,16 +1079,49 @@ async fn copy(
         "SET LOCAL lock_timeout = '{}ms'; SET LOCAL {MOVING} = 'on'",
         store.lock_timeout_ms
     );
+    // Across a majority, a region that holds none of the keys and cannot
+    // be reached is left out: its directory entries keep an older version,
+    // which the regions that took part outvote.
+    let majority = shared.peers.as_ref().filter(|peers| peers.majority());
+    let mut enlisted: Vec<String> = Vec::with_capacity(order.len());
     for region in &order {
         let pool = shared
             .pool_for(region, Access::ReadWrite, 0)
             .ok_or_else(|| fail("08000", format!("region {region} is not configured")))?;
-        transaction
-            .enlist(region, &pool)
-            .await
-            .map_err(|error| txn_error(region, &error))?;
+        match transaction.enlist(region, &pool).await {
+            Ok(()) => {}
+            Err(error) if majority.is_some() && region != to && !sources.contains(region) => {
+                tracing::warn!(
+                    %region, %error,
+                    "a region holding none of the keys cannot be reached; moving without it"
+                );
+                continue;
+            }
+            Err(error) => return Err(txn_error(region, &error)),
+        }
         run(transaction, region, &set_timeout).await?;
+        enlisted.push(region.clone());
     }
+    let version = match majority {
+        Some(peers) => {
+            if !peers.is_majority(enlisted.len()) {
+                return Err(hinted(
+                    "57P03",
+                    format!(
+                        "only {} of the {} regions can be reached, too few to record the move",
+                        enlisted.join(", "),
+                        order.len()
+                    ),
+                    "a move needs the regions holding the keys and a majority of all regions",
+                ));
+            }
+            peers
+                .next_version(shared, keys)
+                .await
+                .map_err(|error| fail("57P03", error))?
+        }
+        None => 1,
+    };
 
     let list = matching(keys);
     take_rows(transaction, parts, sources, &list).await?;
@@ -1085,7 +1135,7 @@ async fn copy(
         .flat_map(|part| {
             keys.iter().map(move |key| {
                 format!(
-                    "({}, {}, {})",
+                    "({}, {}, {}, {version})",
                     literal(&part.name),
                     literal(key),
                     literal(to)
@@ -1093,17 +1143,21 @@ async fn copy(
             })
         })
         .collect();
+    // Every move raises the entry's version in every region it reaches, so
+    // where regions disagree, because a commit is still in doubt or a
+    // region was left out, the newest wins. A region without the entry has
+    // only ever had it from a claim, at version 0.
     let record = format!(
-        "INSERT INTO {} (table_name, shard_key, region) VALUES {} \
+        "INSERT INTO {} AS d (table_name, shard_key, region, version) VALUES {} \
          ON CONFLICT (table_name, shard_key) DO UPDATE SET region = EXCLUDED.region, \
-         moved_at = now()",
+         moved_at = now(), version = GREATEST(d.version + 1, EXCLUDED.version)",
         store_table(store),
         values.join(", ")
     );
-    for region in &order {
+    for region in &enlisted {
         run(transaction, region, &record).await?;
     }
-    Ok(())
+    Ok(enlisted)
 }
 
 /// Reads the key's rows in each source, under a lock that keeps every other
@@ -1620,7 +1674,9 @@ pub async fn load(shared: &Shared) -> Result<usize, String> {
          shard_key text NOT NULL, \
          region text NOT NULL, \
          moved_at timestamptz NOT NULL DEFAULT now(), \
-         PRIMARY KEY (table_name, shard_key))"
+         version bigint NOT NULL DEFAULT 0, \
+         PRIMARY KEY (table_name, shard_key)); \
+         ALTER TABLE {table} ADD COLUMN IF NOT EXISTS version bigint NOT NULL DEFAULT 0"
     );
     let topology = shared.router.topology();
     let home = topology.home_region.clone();
@@ -1628,7 +1684,18 @@ pub async fn load(shared: &Shared) -> Result<usize, String> {
         let Some(pool) = shared.pool_for(region, Access::ReadWrite, 0) else {
             continue;
         };
-        if let Err(error) = pool.simple_query(&create).await {
+        // Two proxies starting together can race to create the same table,
+        // and PostgreSQL's IF NOT EXISTS does not cover that race; the
+        // loser's error is gone on the next try.
+        let mut outcome = pool.simple_query(&create).await;
+        for _ in 0..3 {
+            if outcome.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            outcome = pool.simple_query(&create).await;
+        }
+        if let Err(error) = outcome {
             // The home region's copy is the one read here; another region's
             // is only written by a move, which then fails and says why.
             if region == home {

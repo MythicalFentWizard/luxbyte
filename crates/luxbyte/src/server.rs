@@ -326,7 +326,7 @@ impl Server {
                 .map_err(ServerError::Directory)?;
             tracing::info!(
                 keys = self.shared.directory.len(),
-                authority = peers.authority(),
+                meeting = %peers.meeting(),
                 "joined the shared directory"
             );
         } else {

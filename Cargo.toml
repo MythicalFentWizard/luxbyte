@@ -24,7 +24,7 @@ luxbyte-testkit = { path = "crates/luxbyte-testkit", version = "0.1.0" }
 base64 = "0.23.1"
 criterion = { version = "0.7.0", features = ["html_reports"] }
 bytes = "1.12.1"
-futures-util = "0.3.34"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 hmac = "0.13.0"
 md-5 = "0.11.0"
 parking_lot = "0.13.0"

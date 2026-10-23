@@ -88,10 +88,12 @@ listen = "127.0.0.1:9187"
 # stops routing on the directory. Every proxy needs its own server.node.
 # shared = false
 # Where the proxies meet; the home region when unset. All must agree.
+# "majority" spreads it over every region, so losing any minority of them
+# stops nothing; lease_ms must then be at least three times poll_ms.
 # authority = "eu-west"
-# How often each proxy visits the authority region.
+# How often each proxy visits.
 # poll_ms = 200
-# How long a proxy routes after its last visit before refusing.
+# How long a proxy routes after its lease was last renewed before refusing.
 # lease_ms = 2000
 
 [topology]

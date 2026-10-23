@@ -312,11 +312,13 @@ reads that fan out — treats a shard as the region it is.
 ### Several proxies
 
 With `shared = true` under `[directory_store]`, several proxies — one per
-region, say — share the directory. They meet in one region, the
-`authority`, and agree there without a consensus protocol of their own:
+region, say — share the directory. They agree either in one region, the
+`authority`, or, with `authority = "majority"`, across a majority of all the
+regions:
 
 - **Leases.** Each proxy records a heartbeat every `poll_ms` and routes on its
-  directory only while its last visit is under `lease_ms` old. Past that it
+  directory only while its lease, renewed by visits that got through, is
+  under `lease_ms` old. Past that it
   refuses statements on geo-partitioned tables with `57P03` rather than route
   on a directory that may be out of date (other tables carry on), and when it
   gets through again it reads the directory whole before routing.
@@ -327,17 +329,45 @@ region, say — share the directory. They meet in one region, the
   than half again `lease_ms` old, by when it has stopped routing by itself.
   If the mover dies, the others keep holding the key until it restarts,
   finishes what it left in doubt and withdraws the announcement.
-- **New keys.** A first write to a key nobody has placed claims it there, so
-  two proxies homed in different regions cannot each create it at home.
+- **New keys.** A first write to a key nobody has placed claims it, so two
+  proxies homed in different regions cannot each create it at home.
+
+With `authority = "majority"` there is no region whose loss stops the
+others. Every region keeps the shared tables and each step counts once a
+majority has it: any two majorities share a region, so a proxy reading a
+majority sees every move announced to one, and a withdrawn move leaves a
+marker so that a region which missed the withdrawal cannot bring it back.
+New keys are decided by single-decree Paxos with each region's database as
+an acceptor, two round trips to a majority. Directory entries carry a
+version every move raises, so the newest answer wins. A lease needs one
+more step: a heartbeat grants only when the proxy's previous visit reached a
+majority, and the proxy routes on a grant only after a later visit reached
+one too, so a proxy cut off with a single region cannot keep a mover
+waiting by heartbeating there. `lease_ms` must be at least three times
+`poll_ms` for that.
+
+Losing a minority of regions then stops nothing that does not need them:
+every proxy keeps its lease, claims carry on, and a move goes on without a
+region that holds none of its keys (the regions that took part outvote it).
+When a region answers again, the proxies copy it the entries it missed; a
+proxy starting up does the same, which also carries entries an authority
+recorded alone over to the other regions. Against PostgreSQL 16 with two
+proxies and three regions, stopping one region's database left both proxies
+routing: a key moved between the other two in 0.49 s, a new key was claimed,
+and 43,515 transactions through both proxies across the outage and the
+restart had no failures. The same outage with the authority in that region
+refused every statement on a geo-partitioned table. Three regions survive
+losing one; two regions need both.
 
 `SHOW PEERS` lists the proxies and the moves this one is holding keys for,
 and `SHOW ALERTS` reports `directory_unreachable` and `move_stalled`. Each
 proxy needs its own `server.node`; a second process with a name in use is
 refused at startup.
 
-What it costs: a small query to the authority every `poll_ms` from each
-proxy, a round trip there on the first write of each new key, and holds up
-to two polls longer while a key moves. What leases alone do not cover: a
+What it costs: a small query to the authority, or to every region at once,
+every `poll_ms` from each proxy; on the first write of each new key a round
+trip to the authority, or two to a majority; and holds up to two polls
+longer while a key moves. What leases alone do not cover: a
 write a proxy sent before its lease ran out that reaches its region more than
 `lease_ms / 2` later can land after a move it never heard of. Consensus
 between proxies does not close that either, since the write is already on

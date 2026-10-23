@@ -357,8 +357,13 @@ impl Connection {
     /// a connection left part-way through a response is unusable by anyone
     /// else — and returning it to the pool in that state is how one failed
     /// query corrupts the next unrelated one.
+    ///
+    /// Safe to abandon: a caller that stops waiting, on a timeout say,
+    /// leaves the connection marked as owing an answer, so it is retired
+    /// rather than handed to someone who would read that answer as theirs.
     pub async fn simple_query(&mut self, sql: &str) -> Result<QueryResult, PoolError> {
         self.framed.queue_raw(&frontend::query(sql)?);
+        self.awaiting_sync = true;
         self.framed.flush().await?;
         self.collect_response().await
     }
@@ -472,6 +477,7 @@ impl Connection {
                 }
                 Backend::ReadyForQuery { status } => {
                     self.status = status;
+                    self.awaiting_sync = false;
                     result.status = status;
                     return match failure {
                         Some(error) => Err(PoolError::from(error)),

@@ -89,7 +89,7 @@ pub fn current(shared: &Shared) -> Vec<Alert> {
         if peers.fenced() {
             alerts.push(Alert {
                 name: "directory_unreachable",
-                subject: peers.authority().to_owned(),
+                subject: peers.meeting(),
                 detail: peers.fence_refusal().message,
             });
         }
