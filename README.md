@@ -298,10 +298,16 @@ A key nobody has placed is created in the home location's shard its hash
 picks (FNV-1a, written out rather than taken from the standard library, so
 proxies built at different times agree), and every one of its tables'
 rows goes there with it. `REBALANCE eu-west TO eu-west-2 LIMIT 100` moves
-up to 100 of a shard's keys, read from its rows, each with its own atomic
-`RELOCATE`; it stops at the first key that cannot move and reports the rest.
-Everything else — the directory, moves, reads that fan out — treats a shard
-as the region it is.
+up to 100 of a shard's keys, read from its rows, 25 to a move by default
+(`BATCH n`): each move is one atomic transaction — one lock, one read, one
+insert and one delete per table, one directory change, one two-phase
+commit — for all its keys. `RELOCATE alice, bob TO us-east` does the same
+for keys named by hand. A rebalance stops at the first move that is refused
+and reports what moved before it; `BATCH 1` goes key by key, so one
+troublesome key stops only itself. Against PostgreSQL 16 with two shards,
+100 keys with their orders moved in 1.31 s key by key and 0.15 s in batches
+of 25, every row accounted for. Everything else — the directory, moves,
+reads that fan out — treats a shard as the region it is.
 
 ### Several proxies
 

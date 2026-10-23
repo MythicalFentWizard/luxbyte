@@ -941,16 +941,17 @@ impl Session {
     /// Runs `RELOCATE`, for an operator.
     async fn relocate(
         &mut self,
-        command: Result<(String, String), String>,
+        command: Result<(Vec<String>, String), String>,
     ) -> Result<QueryResult, Refusal> {
-        let (key, to) = command.map_err(|usage| Refusal::new("42601", usage))?;
+        let (keys, to) = command.map_err(|usage| Refusal::new("42601", usage))?;
         self.may_move("RELOCATE")?;
+        let named = keys.join(", ");
         let outcome =
-            crate::relocate::relocate(Arc::clone(&self.shared), key.clone(), to.clone()).await;
+            crate::relocate::relocate_many(Arc::clone(&self.shared), keys, to.clone()).await;
         match &outcome {
-            Ok(_) => tracing::info!(user = %self.user, %key, %to, "RELOCATE"),
+            Ok(_) => tracing::info!(user = %self.user, keys = %named, %to, "RELOCATE"),
             Err(refusal) => {
-                tracing::warn!(user = %self.user, %key, %to, error = %refusal.message, "RELOCATE refused");
+                tracing::warn!(user = %self.user, keys = %named, %to, error = %refusal.message, "RELOCATE refused");
             }
         }
         outcome.map(|report| report.result())
