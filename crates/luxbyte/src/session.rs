@@ -1561,9 +1561,15 @@ impl Session {
         sql: &str,
         regions: &[String],
     ) -> Result<Result<QueryResult, Refusal>, SessionError> {
-        // An INSERT has to be split: broadcasting it would write every row
-        // in every region.
-        let per_region = if analysis.kind == luxbyte_sql::StatementKind::Insert {
+        // An INSERT of values has to be split: broadcasting it would write
+        // every row in every region. One that copies rows key for key, which
+        // the router has checked, writes in each region the rows it reads
+        // there, and runs as it is.
+        let copies = analysis
+            .links
+            .iter()
+            .any(|link| link.left == 0 || link.right == 0);
+        let per_region = if analysis.kind == luxbyte_sql::StatementKind::Insert && !copies {
             match self.split_for_regions(analysis, sql) {
                 Ok(parts) => parts,
                 Err(refusal) => return Ok(Err(refusal)),
@@ -1582,8 +1588,14 @@ impl Session {
 
         let mut combined = QueryResult::default();
         let mut affected = 0_usize;
+        // What the regions called the command, so that a MERGE reports
+        // itself as one rather than as what the proxy took it for.
+        let mut verb: Option<String> = None;
         let mut gather = |result: QueryResult| {
             affected = affected.saturating_add(rows_affected(&result));
+            if verb.is_none() {
+                verb = tag_verb(&result);
+            }
             if combined.columns.is_empty() && !result.columns.is_empty() {
                 combined.columns = result.columns;
                 combined.type_oids = result.type_oids;
@@ -1602,7 +1614,7 @@ impl Session {
                     Err(error) => return Ok(Err(to_refusal(&error))),
                 }
             }
-            combined.tags = vec![command_tag(analysis, affected)];
+            combined.tags = vec![command_tag(analysis, verb.as_deref(), affected)];
             return Ok(Ok(combined));
         }
 
@@ -1637,7 +1649,7 @@ impl Session {
 
         match self.commit(transaction).await {
             Ok(_) => {
-                combined.tags = vec![command_tag(analysis, affected)];
+                combined.tags = vec![command_tag(analysis, verb.as_deref(), affected)];
                 Ok(Ok(combined))
             }
             Err(error) => Ok(Err(txn_refusal(&error))),
@@ -1993,8 +2005,19 @@ fn rows_affected(result: &QueryResult) -> usize {
         .unwrap_or(0)
 }
 
-fn command_tag(analysis: &StatementAnalysis, affected: usize) -> String {
+/// A command tag without its row count: `MERGE` of `MERGE 2`, `INSERT 0` of
+/// `INSERT 0 3`.
+fn tag_verb(result: &QueryResult) -> Option<String> {
+    let (verb, count) = result.tags.last()?.rsplit_once(' ')?;
+    count.parse::<u64>().ok()?;
+    Some(verb.to_owned())
+}
+
+fn command_tag(analysis: &StatementAnalysis, verb: Option<&str>, affected: usize) -> String {
     use luxbyte_sql::StatementKind;
+    if let Some(verb) = verb {
+        return format!("{verb} {affected}");
+    }
     match analysis.kind {
         StatementKind::Insert => format!("INSERT 0 {affected}"),
         StatementKind::Update => format!("UPDATE {affected}"),
@@ -2012,6 +2035,16 @@ mod tests {
             tags: tags.iter().map(|t| (*t).to_owned()).collect(),
             ..QueryResult::default()
         }
+    }
+
+    #[test]
+    fn a_command_keeps_the_name_its_regions_gave_it() {
+        assert_eq!(tag_verb(&result(&["MERGE 2"])).as_deref(), Some("MERGE"));
+        assert_eq!(
+            tag_verb(&result(&["INSERT 0 3"])).as_deref(),
+            Some("INSERT 0")
+        );
+        assert_eq!(tag_verb(&result(&["BEGIN"])), None);
     }
 
     #[test]

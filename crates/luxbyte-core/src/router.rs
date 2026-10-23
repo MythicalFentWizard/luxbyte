@@ -640,6 +640,25 @@ impl Router {
         })
     }
 
+    /// Whether an `INSERT ... SELECT` takes the key of the table it writes,
+    /// key for key, from the rows of a geo-partitioned table it reads: each
+    /// region then writes the rows it read, in the region they belong to.
+    fn copies_keys(&self, analysis: &StatementAnalysis, key: &str) -> bool {
+        analysis.links.iter().any(|link| {
+            let (other, other_column) = match (link.left, link.right) {
+                (0, other) if link.left_column == key => (other, &link.right_column),
+                (other, 0) if link.right_column == key => (other, &link.left_column),
+                _ => return false,
+            };
+            analysis.tables.get(other).is_some_and(|read| {
+                matches!(
+                    self.topology.placement(read.schema.as_deref(), &read.name),
+                    Some(Placement::GeoPartitioned { key }) if key == other_column
+                )
+            })
+        })
+    }
+
     /// A write to a replicated table that reads rows only some regions
     /// hold: each copy would be changed from different rows, and the copies
     /// would no longer agree. Fine only when one region writes, for a writer
@@ -842,7 +861,12 @@ impl Router {
             // cannot name its rows is a cross-region write, which is slow
             // but well defined — except for an INSERT, which would have to
             // invent a region for a row it is creating.
-            if analysis.kind == StatementKind::Insert {
+            let written = analysis
+                .tables
+                .first()
+                .is_some_and(|first| std::ptr::eq(first, table));
+            if analysis.kind == StatementKind::Insert && written && !self.copies_keys(analysis, key)
+            {
                 return KeyResolution::Refused(
                     Refusal::new(
                         "23502",

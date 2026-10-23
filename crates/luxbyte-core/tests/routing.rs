@@ -591,6 +591,47 @@ fn copies_of_a_replicated_table_are_never_written_from_partial_rows() {
     ));
 }
 
+#[test]
+fn an_insert_select_copying_keys_writes_where_it_reads() {
+    // Pinned by the rows it reads.
+    assert_eq!(
+        single(
+            "INSERT INTO orders (tenant_id, id) SELECT tenant_id, id + 1 FROM orders \
+             WHERE tenant_id = 'bob'"
+        ),
+        "us-east"
+    );
+    // Every key: each region copies its own rows.
+    let copied = plan("INSERT INTO orders (tenant_id, id) SELECT tenant_id, id + 1 FROM orders");
+    let Plan::Distributed { regions } = copied else {
+        panic!("expected a distributed write, got {copied:?}");
+    };
+    assert_eq!(regions.len(), 3);
+    // A key not taken from a key could land anywhere.
+    assert!(matches!(
+        plan("INSERT INTO orders (tenant_id, id) SELECT name, id FROM users"),
+        Plan::Refuse(_)
+    ));
+}
+
+#[test]
+fn a_merge_runs_where_its_rows_are_unless_it_may_insert() {
+    assert!(matches!(
+        plan(
+            "MERGE INTO users u USING orders o ON u.tenant_id = o.tenant_id \
+             WHEN MATCHED THEN UPDATE SET name = 'x'"
+        ),
+        Plan::Distributed { .. }
+    ));
+    assert!(matches!(
+        plan(
+            "MERGE INTO users u USING orders o ON u.tenant_id = o.tenant_id \
+             WHEN NOT MATCHED THEN INSERT (tenant_id) VALUES (o.tenant_id)"
+        ),
+        Plan::Refuse(_)
+    ));
+}
+
 // ------------------------------------------------------------------ local work
 
 #[test]

@@ -392,6 +392,12 @@ impl Walker {
     }
 
     fn select(&mut self, select: &Select) {
+        let _ = self.select_projecting(select);
+    }
+
+    /// Walks a `SELECT` block, and says which table column each item of its
+    /// select list is, where it is a plain column.
+    fn select_projecting(&mut self, select: &Select) -> Vec<Option<(usize, String)>> {
         self.stack.push(Scope {
             anchoring: std::mem::take(&mut self.next_anchoring),
             ..Scope::default()
@@ -415,7 +421,22 @@ impl Walker {
         if let Some(qualify) = &select.qualify {
             self.nested(qualify);
         }
+        let projected = select
+            .projection
+            .iter()
+            .map(|item| {
+                let (sqlparser::ast::SelectItem::UnnamedExpr(expr)
+                | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. }) = item
+                else {
+                    return None;
+                };
+                let column = column_of(expr)?;
+                let instance = self.owner(&column)?;
+                Some((instance, column.column))
+            })
+            .collect();
         self.stack.pop();
+        projected
     }
 
     // ----------------------------------------------------------- tables
@@ -671,13 +692,69 @@ impl Walker {
             Statement::Insert(insert) => self.insert(insert),
             Statement::Update(update) => self.update(update),
             Statement::Delete(delete) => self.delete(delete),
+            Statement::Merge(merge) => self.merge(merge),
             Statement::Query(query) => self.query(query),
             other => self.nested(other),
         }
     }
 
+    /// `MERGE`: its table and its source, joined by its `ON`. One that may
+    /// insert is not linked: run region by region it would insert a row in
+    /// every region without a match, so it has to name its key.
+    fn merge(&mut self, merge: &sqlparser::ast::Merge) {
+        let inserts = merge
+            .clauses
+            .iter()
+            .any(|clause| matches!(clause.action, sqlparser::ast::MergeAction::Insert(_)));
+        self.stack.push(Scope {
+            anchoring: true,
+            ..Scope::default()
+        });
+        self.factor(&merge.table);
+        if let Some(scope) = self.stack.last_mut() {
+            scope.anchoring = false;
+        }
+        let left: Vec<usize> = self
+            .stack
+            .last()
+            .map(|scope| scope.own.clone())
+            .unwrap_or_default();
+        self.factor(&merge.source);
+        let right: Vec<usize> = self
+            .stack
+            .last()
+            .map(|scope| {
+                scope
+                    .own
+                    .iter()
+                    .copied()
+                    .filter(|own| !left.contains(own))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if inserts {
+            self.nested(merge.on.as_ref());
+        } else {
+            // Only rows that match are changed, as in an inner join.
+            self.join(
+                Join::Inner,
+                &JoinConstraint::On(merge.on.as_ref().clone()),
+                &left,
+                &right,
+            );
+        }
+        for clause in &merge.clauses {
+            self.nested(clause);
+        }
+        self.stack.pop();
+    }
+
     fn insert(&mut self, insert: &Insert) {
-        self.stack.push(Scope::default());
+        self.stack.push(Scope {
+            anchoring: true,
+            ..Scope::default()
+        });
+        let mut target = None;
         if let TableObject::TableName(name) = &insert.table {
             let alias = insert.table_alias.as_ref().map(|alias| fold(&alias.alias));
             let table = table_from_name(name, alias.clone());
@@ -686,9 +763,30 @@ impl Walker {
             if let Some(slot) = self.pins.get_mut(index) {
                 *slot = pins.unqualified();
             }
+            target = Some(index);
+        }
+        if let Some(scope) = self.stack.last_mut() {
+            scope.anchoring = false;
         }
         if let Some(source) = &insert.source {
-            self.query(source);
+            match (source.body.as_ref(), target) {
+                // `INSERT ... SELECT`: each column inserted is the column
+                // selected, so a key read is the key written.
+                (SetExpr::Select(select), Some(target)) if !insert.columns.is_empty() => {
+                    self.name_ctes(source);
+                    self.walk_ctes(source);
+                    let projected = self.select_projecting(select);
+                    self.ordering(source);
+                    for (column, selected) in insert.columns.iter().zip(projected) {
+                        let written = column.0.last().and_then(|part| part.as_ident()).map(fold);
+                        if let (Some(written), Some((read, read_column))) = (written, selected) {
+                            self.flow((read, &read_column), (target, &written));
+                            self.link((target, &written), (read, &read_column));
+                        }
+                    }
+                }
+                _ => self.query(source),
+            }
         }
         if let Some(OnInsert::OnConflict(conflict)) = &insert.on {
             if let OnConflictAction::DoUpdate(update) = &conflict.action {
