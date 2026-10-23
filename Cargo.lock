@@ -454,6 +454,7 @@ dependencies = [
  "luxbyte-testkit",
  "luxbyte-txn",
  "parking_lot 0.13.0",
+ "rand",
  "serde",
  "serde_json",
  "sqlparser",

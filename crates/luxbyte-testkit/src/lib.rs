@@ -125,6 +125,9 @@ pub struct BackendConfig {
     pub delay: Option<std::time::Duration>,
     /// Refuse to authenticate.
     pub refuse_auth: bool,
+    /// Roles that must authenticate with SCRAM, and their verifiers. When
+    /// any are listed, every other role is refused.
+    pub scram_users: Vec<(String, luxbyte_proto::auth::ScramVerifier)>,
 }
 
 impl BackendConfig {
@@ -138,6 +141,7 @@ impl BackendConfig {
             disconnect_on: None,
             delay: None,
             refuse_auth: false,
+            scram_users: Vec::new(),
         }
     }
 
@@ -170,6 +174,18 @@ impl BackendConfig {
         self
     }
 
+    /// Requires SCRAM-SHA-256 from `user`, checked against `verifier`, the
+    /// way a real server checks `pg_authid`.
+    #[must_use]
+    pub fn requiring_scram(
+        mut self,
+        user: &str,
+        verifier: luxbyte_proto::auth::ScramVerifier,
+    ) -> Self {
+        self.scram_users.push((user.to_owned(), verifier));
+        self
+    }
+
     /// Rejects authentication, so the pool has to report it rather than
     /// retry forever.
     #[must_use]
@@ -189,6 +205,8 @@ struct Observed {
     /// before its `Sync`, which PostgreSQL rolls back.
     abandoned: Mutex<Vec<String>>,
     parses: AtomicU64,
+    /// The role each accepted connection authenticated as.
+    users: Mutex<Vec<String>>,
     prepared: Mutex<BTreeMap<String, PreparedOutcome>>,
     connections: AtomicU64,
     live: AtomicU64,
@@ -206,6 +224,7 @@ impl Default for Observed {
             bound: Mutex::new(Vec::new()),
             abandoned: Mutex::new(Vec::new()),
             parses: AtomicU64::new(0),
+            users: Mutex::new(Vec::new()),
             prepared: Mutex::new(BTreeMap::new()),
             connections: AtomicU64::new(0),
             live: AtomicU64::new(0),
@@ -335,6 +354,12 @@ impl Backend {
         self.observed.abandoned.lock().clone()
     }
 
+    /// The role every accepted connection logged in as, in order.
+    #[must_use]
+    pub fn users(&self) -> Vec<String> {
+        self.observed.users.lock().clone()
+    }
+
     /// How many `Parse` messages have arrived.
     #[must_use]
     pub fn parses(&self) -> u64 {
@@ -401,7 +426,7 @@ async fn session(
 ) -> Result<(), ProtocolError> {
     stream.set_nodelay(true)?;
     let mut framed = Framed::new(stream, Peer::Frontend);
-    if !startup(&mut framed, config).await? {
+    if !startup(&mut framed, config, observed).await? {
         return Ok(());
     }
 
@@ -506,6 +531,7 @@ async fn session(
 async fn startup(
     framed: &mut Framed<TcpStream>,
     config: &BackendConfig,
+    observed: &Observed,
 ) -> Result<bool, ProtocolError> {
     // The startup phase, including a possible TLS request first.
     let mut startup = framed.read_untagged().await?;
@@ -528,8 +554,32 @@ async fn startup(
         return Ok(false);
     }
 
-    // Trust authentication: enough to exercise the pool's handshake without
-    // making every test carry a password.
+    let user = parameters.get("user").unwrap_or("").to_owned();
+    if !config.scram_users.is_empty() {
+        let verifier = config
+            .scram_users
+            .iter()
+            .find(|(name, _)| *name == user)
+            .map(|(_, verifier)| verifier.clone());
+        let accepted = match verifier {
+            Some(verifier) => scram(framed, verifier).await?,
+            None => false,
+        };
+        if !accepted {
+            let error = build::ErrorBuilder::fatal(
+                "28P01",
+                format!("password authentication failed for user \"{user}\""),
+            )
+            .build()?;
+            framed.queue_raw(&error);
+            framed.flush().await?;
+            return Ok(false);
+        }
+    }
+    observed.users.lock().push(user);
+
+    // Otherwise trust authentication: enough to exercise the pool's
+    // handshake without making every test carry a password.
     framed.queue_raw(&build::authentication_ok()?);
     for (name, value) in [
         ("server_version", "18.0 (luxbyte-testkit)"),
@@ -548,6 +598,42 @@ async fn startup(
     framed.queue_raw(&build::ready_for_query(TransactionStatus::Idle)?);
     framed.flush().await?;
     Ok(true)
+}
+
+/// Runs the server side of a SCRAM-SHA-256 exchange. Returns whether the
+/// client proved it holds the password.
+async fn scram(
+    framed: &mut Framed<TcpStream>,
+    verifier: luxbyte_proto::auth::ScramVerifier,
+) -> Result<bool, ProtocolError> {
+    use luxbyte_proto::auth::{SCRAM_SHA_256, ScramServer};
+
+    framed.queue_raw(&build::authentication_sasl(SCRAM_SHA_256)?);
+    framed.flush().await?;
+    let initial = framed.read_message().await?;
+    let mut reader = initial.reader();
+    let _mechanism = reader.cstr()?;
+    let _length = reader.i32()?;
+    let client_first = String::from_utf8_lossy(reader.take_rest()).into_owned();
+
+    let mut server = ScramServer::new(verifier);
+    let Ok(server_first) = server.server_first(&client_first) else {
+        return Ok(false);
+    };
+    framed.queue_raw(&build::authentication_sasl_continue(
+        server_first.as_bytes(),
+    )?);
+    framed.flush().await?;
+
+    let response = framed.read_message().await?;
+    let client_final = String::from_utf8_lossy(&response.body).into_owned();
+    match server.server_final(&client_final) {
+        Ok(server_final) => {
+            framed.queue_raw(&build::authentication_sasl_final(server_final.as_bytes())?);
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
 }
 
 /// Applies the configured delay, then says whether this statement is the

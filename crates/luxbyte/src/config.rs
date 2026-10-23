@@ -19,6 +19,9 @@ pub struct Config {
     /// How connections are pooled.
     #[serde(default)]
     pub pool: PoolSettings,
+    /// How clients authenticate.
+    #[serde(default)]
+    pub auth: crate::auth::AuthConfig,
     /// Regions and table placement.
     pub topology: Topology,
     /// Keys to seed the directory with, for a deployment that does not yet
@@ -206,6 +209,14 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shipped_example_loads_and_its_auth_is_valid() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/luxbyte.toml");
+        let config = Config::load(path).expect("the example should load");
+        let auth = crate::auth::Authenticator::new(&config.auth).expect("auth should validate");
+        assert_eq!(auth.method(), crate::auth::Method::Scram);
+    }
 
     const SAMPLE: &str = r#"
 [server]

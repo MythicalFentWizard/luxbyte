@@ -38,19 +38,34 @@ pub struct Shared {
     pub backend_user: String,
     /// Database to connect to.
     pub backend_database: String,
+    /// How clients authenticate.
+    pub auth: crate::auth::Authenticator,
 }
 
 impl Shared {
-    /// The pool for a region, choosing a replica for reads where one exists.
+    /// The pool for a region, as the proxy's own backend role, choosing a
+    /// replica for reads where one exists.
     pub fn pool_for(&self, region: &str, access: Access, nth: usize) -> Option<Pool> {
+        self.pool_as(region, access, nth, &self.backend_user, &self.credentials)
+    }
+
+    /// The pool for a region, as a given role.
+    pub fn pool_as(
+        &self,
+        region: &str,
+        access: Access,
+        nth: usize,
+        user: &str,
+        credentials: &Credentials,
+    ) -> Option<Pool> {
         let region = self.router.topology().region(region)?;
         let endpoint: &Endpoint = if access.needs_primary() {
             &region.primary
         } else {
             region.read_endpoint(nth)
         };
-        let target = ConnectionTarget::new(endpoint, &self.backend_database, &self.backend_user);
-        Some(self.pools.pool(&target, &self.credentials))
+        let target = ConnectionTarget::new(endpoint, &self.backend_database, user);
+        Some(self.pools.pool(&target, credentials))
     }
 }
 
@@ -78,6 +93,10 @@ pub struct Session {
     reads: usize,
     /// Prepared statements, portals and the batch in progress.
     extended: extended::State,
+    /// The role this session's backend work runs as: the client's own, with
+    /// passthrough, or the proxy's.
+    backend_user: String,
+    credentials: Credentials,
 }
 
 impl Session {
@@ -85,13 +104,15 @@ impl Session {
     pub async fn run(shared: Arc<Shared>, stream: TcpStream) -> Result<(), SessionError> {
         stream.set_nodelay(true)?;
         let mut session = Self {
-            shared,
             client: Framed::new(stream, Peer::Frontend),
             status: TransactionStatus::Idle,
             settings: Vec::new(),
             transaction: None,
             reads: 0,
             extended: extended::State::default(),
+            backend_user: shared.backend_user.clone(),
+            credentials: shared.credentials.clone(),
+            shared,
         };
         if session.startup().await? {
             session.serve().await?;
@@ -113,9 +134,17 @@ impl Session {
 
         match StartupRequest::decode(&first)? {
             StartupRequest::Startup(parameters) => {
-                // Client authentication is not implemented. Saying so here,
-                // once, is better than pretending: the listener must not be
-                // reachable from anywhere the backends are not.
+                let Some(user) = parameters.get("user").map(ToOwned::to_owned) else {
+                    self.fatal(
+                        "28000",
+                        "no PostgreSQL user name specified in startup packet",
+                    )
+                    .await?;
+                    return Ok(false);
+                };
+                if !self.authenticate(&user).await? {
+                    return Ok(false);
+                }
                 self.client.queue_raw(&build::authentication_ok()?);
                 for (name, value) in [
                     ("server_version", "18.0 (luxbyte)"),
@@ -149,6 +178,79 @@ impl Session {
                 Ok(false)
             }
         }
+    }
+
+    /// Runs the client's authentication exchange. Returns whether it
+    /// succeeded; on failure the client has already been told.
+    async fn authenticate(&mut self, user: &str) -> Result<bool, SessionError> {
+        use luxbyte_proto::auth::{SCRAM_SHA_256, ScramServer};
+
+        if self.shared.auth.method() == crate::auth::Method::Trust {
+            return Ok(true);
+        }
+        let verifier = match self.shared.auth.verifier(&self.shared, user).await {
+            Ok(verifier) => verifier,
+            Err(error) => {
+                // Not the client's fault, and not a reason to tell it which
+                // roles exist: an unavailable lookup is a connection failure.
+                tracing::warn!(%error, "could not read a verifier");
+                self.fatal("08006", "the proxy could not check credentials right now")
+                    .await?;
+                return Ok(false);
+            }
+        };
+        let failed = format!("password authentication failed for user \"{user}\"");
+
+        self.client
+            .queue_raw(&build::authentication_sasl(SCRAM_SHA_256)?);
+        self.client.flush().await?;
+        let initial = self.client.read_message().await?;
+        let Some((mechanism, client_first)) = crate::auth::sasl_initial(&initial.body) else {
+            self.fatal("08P01", "malformed SASL initial response")
+                .await?;
+            return Ok(false);
+        };
+        if mechanism != SCRAM_SHA_256 {
+            self.fatal(
+                "28000",
+                "the client chose a SASL mechanism this proxy does not offer",
+            )
+            .await?;
+            return Ok(false);
+        }
+
+        let mut server = ScramServer::new(verifier);
+        let Ok(server_first) = server.server_first(&client_first) else {
+            self.fatal("28P01", &failed).await?;
+            return Ok(false);
+        };
+        self.client.queue_raw(&build::authentication_sasl_continue(
+            server_first.as_bytes(),
+        )?);
+        self.client.flush().await?;
+
+        let response = self.client.read_message().await?;
+        let client_final = String::from_utf8_lossy(&response.body).into_owned();
+        let Ok(server_final) = server.server_final(&client_final) else {
+            self.fatal("28P01", &failed).await?;
+            return Ok(false);
+        };
+        self.client
+            .queue_raw(&build::authentication_sasl_final(server_final.as_bytes())?);
+
+        if self.shared.auth.passthrough() {
+            if let Some(keys) = server.keys() {
+                user.clone_into(&mut self.backend_user);
+                self.credentials = Credentials::Scram(keys);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The pool for a region, as this session's backend role.
+    fn pool_for(&self, region: &str, access: Access, nth: usize) -> Option<Pool> {
+        self.shared
+            .pool_as(region, access, nth, &self.backend_user, &self.credentials)
     }
 
     async fn serve(&mut self) -> Result<(), SessionError> {
@@ -421,7 +523,6 @@ impl Session {
             access
         };
         let pool = self
-            .shared
             .pool_for(region, access, self.reads)
             .ok_or_else(|| PoolError::Auth(format!("region {region} is not configured")))?;
 
@@ -462,8 +563,7 @@ impl Session {
 
         for (index, region) in regions.iter().enumerate() {
             let Some(pool) =
-                self.shared
-                    .pool_for(region, Access::ReadOnly, self.reads.wrapping_add(index))
+                self.pool_for(region, Access::ReadOnly, self.reads.wrapping_add(index))
             else {
                 continue;
             };
@@ -549,7 +649,7 @@ impl Session {
         let mut transaction = self.shared.coordinator.begin();
         let mut affected = 0_usize;
         for part in &per_region {
-            let Some(pool) = self.shared.pool_for(&part.region, Access::ReadWrite, 0) else {
+            let Some(pool) = self.pool_for(&part.region, Access::ReadWrite, 0) else {
                 continue;
             };
             let statement = self.with_settings(&part.sql);

@@ -5,6 +5,7 @@
 //! It is a library so the proxy can be driven from an integration test
 //! without a process boundary.
 
+pub mod auth;
 pub mod config;
 pub mod console;
 pub mod merge;

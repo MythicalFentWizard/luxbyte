@@ -622,7 +622,7 @@ impl Session {
         region: &str,
     ) -> Result<(), SessionError> {
         self.reads = self.reads.wrapping_add(1);
-        let Some(pool) = self.shared.pool_for(region, Access::ReadOnly, self.reads) else {
+        let Some(pool) = self.pool_for(region, Access::ReadOnly, self.reads) else {
             return self.refuse(
                 sequence,
                 &plain("08000", format!("region {region} is not configured")),
@@ -965,7 +965,7 @@ impl Session {
         if self.transaction.is_some() {
             // Inside a transaction every statement goes to the primary: a
             // participant opened on a replica would refuse the first write.
-            let Some(pool) = self.shared.pool_for(region, Access::ReadWrite, 0) else {
+            let Some(pool) = self.pool_for(region, Access::ReadWrite, 0) else {
                 return Ok(Err(unconfigured(region)));
             };
             if let Some(transaction) = self.transaction.as_mut() {
@@ -1016,7 +1016,7 @@ impl Session {
         }
 
         self.reads = self.reads.wrapping_add(1);
-        let Some(pool) = self.shared.pool_for(region, access, self.reads) else {
+        let Some(pool) = self.pool_for(region, access, self.reads) else {
             return Ok(Err(unconfigured(region)));
         };
         let connection = match pool.acquire().await {

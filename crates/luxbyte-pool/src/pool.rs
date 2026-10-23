@@ -341,13 +341,22 @@ impl PoolSet {
     }
 
     /// The pool for a target, created on first use.
+    ///
+    /// A pool whose credentials no longer match is replaced. That happens
+    /// when a role's password changes and its clients pass their keys
+    /// through: the old pool's connections stay valid until they are
+    /// retired, but it could never open another one.
     #[must_use]
     pub fn pool(&self, target: &ConnectionTarget, credentials: &Credentials) -> Pool {
         let mut pools = self.pools.lock();
-        pools
-            .entry(target.clone())
-            .or_insert_with(|| Pool::new(target.clone(), credentials.clone(), self.config.clone()))
-            .clone()
+        if let Some(existing) = pools.get(target) {
+            if &existing.shared.credentials == credentials {
+                return existing.clone();
+            }
+        }
+        let pool = Pool::new(target.clone(), credentials.clone(), self.config.clone());
+        pools.insert(target.clone(), pool.clone());
+        pool
     }
 
     /// How many distinct pools exist.
