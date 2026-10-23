@@ -857,3 +857,41 @@ fn hints_leave_alone_what_the_proxy_answers_itself() {
         Routing::Ready(Plan::Local(_))
     ));
 }
+
+#[test]
+fn a_replicated_table_with_a_writer_is_written_there_alone_and_read_nearby() {
+    let topology = Topology::from_toml(&TOPOLOGY.replace(
+        "table = \"currencies\"\nplacement = \"global_replicated\"",
+        "table = \"currencies\"\nplacement = \"global_replicated\"\nwriter = \"us-east\"",
+    ))
+    .expect("topology should parse");
+    let router = Router::new(topology, Arc::new(MemoryDirectory::new()));
+    let Plan::Single { region, .. } = plan_with(
+        &router,
+        "UPDATE currencies SET rate = 1.1 WHERE code = 'EUR'",
+        None,
+    ) else {
+        panic!("expected the writer alone");
+    };
+    assert_eq!(region, "us-east");
+    let Plan::Single { region, .. } = plan_with(&router, "SELECT * FROM currencies", None) else {
+        panic!("expected one region");
+    };
+    assert_eq!(region, "eu-west", "read from the nearest copy");
+
+    // Without a writer, every copy changes together.
+    assert!(matches!(
+        plan("UPDATE currencies SET rate = 1.1 WHERE code = 'EUR'"),
+        Plan::Distributed { .. }
+    ));
+}
+
+#[test]
+fn a_writer_must_be_a_region() {
+    let error = Topology::from_toml(&TOPOLOGY.replace(
+        "table = \"currencies\"\nplacement = \"global_replicated\"",
+        "table = \"currencies\"\nplacement = \"global_replicated\"\nwriter = \"mars\"",
+    ))
+    .expect_err("unknown writer");
+    assert!(error.to_string().contains("mars"), "{error}");
+}

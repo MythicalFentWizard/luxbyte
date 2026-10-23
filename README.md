@@ -169,10 +169,23 @@ table = "currencies"
 placement = "global_replicated" # a full copy in every region
 
 [[tables]]
+table = "fx_rates"
+placement = "global_replicated"
+writer = "us-east"              # written there; replication copies it on
+
+[[tables]]
 table = "eu_audit"
 placement = "pinned"            # one region, and only that one
 region = "eu-west"
 ```
+
+A replicated table without a `writer` is written in every region in one
+two-phase commit: every copy is current the moment it commits. With a
+`writer`, a write goes there alone and PostgreSQL's own replication carries
+it to the other copies, which costs one round trip instead of one to every
+region. Reads use the nearest copy — except for a session that has written
+one: from then on it reads those tables from the writer, so it never misses
+its own write while replication catches up.
 
 A table with no policy is refused by default, naming itself in the error. The
 alternative — quietly sending it somewhere — is how half your data ends up

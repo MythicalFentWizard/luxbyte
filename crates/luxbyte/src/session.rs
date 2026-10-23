@@ -269,6 +269,9 @@ pub struct Session {
     /// Regions the open transaction has written in, which count as written
     /// once it commits.
     txn_wrote: parking_lot::Mutex<std::collections::BTreeSet<String>>,
+    /// The writer regions of replicated tables this session has written,
+    /// whose copies elsewhere may not have its writes yet.
+    replicated_writers: parking_lot::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl Drop for Session {
@@ -302,6 +305,7 @@ impl Session {
             user: String::new(),
             wrote: parking_lot::Mutex::default(),
             txn_wrote: parking_lot::Mutex::default(),
+            replicated_writers: parking_lot::Mutex::default(),
             shared,
         };
         if session.startup(&first).await? {
@@ -707,7 +711,7 @@ impl Session {
                     .router
                     .route_hinted(analysis, Some(parameters), hint)
                 {
-                    Routing::Ready(plan) => return (plan, ticket),
+                    Routing::Ready(plan) => return (self.follow_writers(analysis, plan), ticket),
                     Routing::Held(refusal) => refusal,
                     Routing::Claim(keys) => {
                         // Not held while claiming: a move waiting for this
@@ -746,6 +750,77 @@ impl Session {
             if tokio::time::timeout(remaining, changed).await.is_err() {
                 return (Plan::Refuse(refusal), None);
             }
+        }
+    }
+
+    /// Keeps a session reading its own writes to replicated tables that
+    /// have a writer.
+    ///
+    /// Such a write goes to the writer alone and reaches the other copies
+    /// when PostgreSQL's replication gets there, which the proxy cannot see
+    /// happen. So once a session has written one, its reads of replicated
+    /// tables from that writer go to the writer too, from then on: never
+    /// stale, at the price of a longer trip for a session that writes
+    /// reference data. A read that joins them with rows living elsewhere
+    /// still has to run where those rows are, and reads the copy there.
+    fn follow_writers(&self, analysis: &StatementAnalysis, plan: Plan) -> Plan {
+        let topology = self.shared.router.topology();
+        let user_tables: Vec<&luxbyte_sql::TableRef> = analysis
+            .tables
+            .iter()
+            .filter(|table| {
+                !table.name.starts_with("pg_")
+                    && !matches!(
+                        table.schema.as_deref(),
+                        Some("pg_catalog" | "information_schema")
+                    )
+            })
+            .collect();
+        let writers: std::collections::BTreeSet<String> = user_tables
+            .iter()
+            .filter_map(
+                |table| match topology.placement(table.schema.as_deref(), &table.name) {
+                    Some(luxbyte_core::topology::Placement::GlobalReplicated {
+                        writer: Some(writer),
+                    }) => Some(writer.clone()),
+                    _ => None,
+                },
+            )
+            .collect();
+        if writers.is_empty() {
+            return plan;
+        }
+        if analysis.access.needs_primary() {
+            if !matches!(plan, Plan::Refuse(_)) {
+                self.replicated_writers.lock().extend(writers);
+            }
+            return plan;
+        }
+        let Plan::Single { region, access } = &plan else {
+            return plan;
+        };
+        let written: Vec<String> = {
+            let sticky = self.replicated_writers.lock();
+            writers
+                .into_iter()
+                .filter(|writer| sticky.contains(writer))
+                .collect()
+        };
+        let [writer] = written.as_slice() else {
+            return plan;
+        };
+        let only_replicated = user_tables.iter().all(|table| {
+            matches!(
+                topology.placement(table.schema.as_deref(), &table.name),
+                Some(luxbyte_core::topology::Placement::GlobalReplicated { .. })
+            )
+        });
+        if writer == region || !only_replicated {
+            return plan;
+        }
+        Plan::Single {
+            region: writer.clone(),
+            access: *access,
         }
     }
 
