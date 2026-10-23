@@ -220,9 +220,12 @@ aggregates across regions that it used to refuse.
   directory through leases and confirmations in one authority region (see
   the README): a move waits for every live proxy, and a proxy that loses the
   authority stops routing on the directory. That makes the authority region
-  a dependency Raft does not have, and leaves a window — a write delayed past
-  half a lease — that consensus closes. In exchange there is no quorum to
-  keep: one proxy per region is enough.
+  a dependency Raft does not have. The window a write delayed past half a
+  lease leaves open is closed by the database instead: with `guard = true`
+  PostgreSQL refuses a write for a key in a region it has left, which no
+  agreement between proxies can do for a write already in flight (it costs
+  24–34% on single-row writes, so it is opt-in). In exchange there is no
+  quorum to keep: one proxy per region is enough.
 - **Sharding within a region.** shahrah hashes keys onto logical shards and
   moves whole ranges of them with `REBALANCE`. Luxbyte's shards are regions
   sharing a `location`: new keys spread across the home location's shards by

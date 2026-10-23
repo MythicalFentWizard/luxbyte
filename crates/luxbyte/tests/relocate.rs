@@ -902,3 +902,46 @@ async fn recording_can_be_turned_off_for_rows_the_directory_does_not_list_yet() 
     assert_eq!(eu.count_of(READ_NEW), 1);
     assert_eq!(us.count_of(READ_NEW), 1, "unrecorded, so read everywhere");
 }
+
+// ------------------------------------------------------------ move guards
+
+#[tokio::test]
+async fn with_guards_every_region_refuses_writes_for_keys_it_does_not_hold() {
+    let (eu, us, proxy) = start(
+        europe(),
+        america(),
+        &format!("{}\n{STORE}guard = true\n", auth()),
+    )
+    .await;
+    // Each region's trigger knows which region it is in.
+    for (backend, here) in [(&eu, "E'eu-west'"), (&us, "E'us-east'")] {
+        for table in ["users", "orders"] {
+            assert!(backend.saw(&format!(
+                "CREATE OR REPLACE TRIGGER luxbyte_guard BEFORE INSERT OR UPDATE OR DELETE ON \
+                 \"public\".\"{table}\""
+            )));
+        }
+        assert!(
+            backend.saw(&format!("placed <> {here}")),
+            "{}",
+            backend.name()
+        );
+    }
+    // A move tells the guards it is the one writing.
+    let mut ops = connect(&proxy, "ops").await;
+    ops.simple_query("RELOCATE alice TO us-east").await.unwrap();
+    for backend in [&eu, &us] {
+        assert!(
+            backend.saw("SET LOCAL luxbyte.moving = 'on'"),
+            "{}",
+            backend.name()
+        );
+    }
+}
+
+#[tokio::test]
+async fn without_guards_no_trigger_is_installed() {
+    let (eu, us, _proxy) = start(europe(), america(), &sections()).await;
+    assert!(!eu.saw("luxbyte_guard"));
+    assert!(!us.saw("luxbyte_guard"));
+}

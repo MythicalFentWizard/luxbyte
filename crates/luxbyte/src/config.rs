@@ -61,6 +61,12 @@ pub struct DirectoryStore {
     /// Milliseconds a move waits for the writes already under way and for
     /// each lock it takes, before giving up and leaving everything as it was.
     pub lock_timeout_ms: u64,
+    /// Install a trigger on every geo-partitioned table in every region that
+    /// refuses a write for a key the region's directory places elsewhere, so
+    /// that a write delayed past a move, or sent by anything that does not
+    /// know of the move, cannot land in the region the key has left. Needs
+    /// the backend role to own the tables.
+    pub guard: bool,
     /// Record a key the first time a statement writes it, so that its reads
     /// go to one region rather than asking every region. Off only for a
     /// deployment whose existing rows the directory does not list yet, and
@@ -89,6 +95,7 @@ impl Default for DirectoryStore {
             table: "luxbyte_directory".to_owned(),
             hold_ms: 10_000,
             lock_timeout_ms: 5_000,
+            guard: false,
             record_new_keys: true,
             shared: false,
             authority: None,
