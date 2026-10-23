@@ -368,6 +368,28 @@ async fn a_multi_region_insert_is_split_so_each_row_lands_once() {
 }
 
 #[tokio::test]
+async fn rows_returned_by_a_write_across_regions_reach_the_client() {
+    let returning = |id: &str| {
+        BackendConfig::new("region").reply_to(
+            "RETURNING",
+            Reply::Rows {
+                columns: vec!["tenant_id".to_owned()],
+                rows: vec![vec![Some(id.to_owned())]],
+            },
+        )
+    };
+    let f = fixture_with(returning("alice"), returning("bob"), returning("carol"), &placed()).await;
+    let mut client = client(&f.proxy).await;
+    let result = client
+        .simple_query("UPDATE users SET name = 'x' RETURNING tenant_id")
+        .await
+        .expect("should succeed");
+    let mut returned = values(&result, 0);
+    returned.sort();
+    assert_eq!(returned, ["alice", "bob", "carol"]);
+}
+
+#[tokio::test]
 async fn a_multi_region_write_commits_in_two_phases() {
     let f = fixture(&placed()).await;
     let mut client = client(&f.proxy).await;

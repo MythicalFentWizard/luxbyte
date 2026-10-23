@@ -14,19 +14,65 @@
 /// The statements in `sql`, trimmed, without empty ones.
 #[must_use]
 pub fn split(sql: &str) -> Vec<&str> {
+    let mut statements = Vec::new();
+    let mut start = 0_usize;
+    for (at, end, mark) in scan(sql) {
+        if mark == Mark::Separator {
+            push(&mut statements, sql.get(start..at));
+            start = end;
+        }
+    }
+    push(&mut statements, sql.get(start..));
+    statements
+}
+
+/// Replaces each placeholder `$n` with `values[n - 1]`, leaving alone
+/// anything that only looks like one: inside a string, a quoted identifier,
+/// a dollar-quoted body or a comment, or part of an identifier.
+///
+/// Returns the number of a placeholder with no value, if there is one.
+pub fn substitute(sql: &str, values: &[String]) -> Result<String, usize> {
+    let mut out = String::with_capacity(sql.len());
+    let mut copied = 0_usize;
+    for (at, end, mark) in scan(sql) {
+        let Mark::Placeholder(number) = mark else {
+            continue;
+        };
+        let value = number
+            .checked_sub(1)
+            .and_then(|index| values.get(index))
+            .ok_or(number)?;
+        out.push_str(sql.get(copied..at).unwrap_or_default());
+        out.push_str(value);
+        copied = end;
+    }
+    out.push_str(sql.get(copied..).unwrap_or_default());
+    Ok(out)
+}
+
+/// Something the lexer found that callers act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    /// A `;` between statements.
+    Separator,
+    /// A placeholder, by number.
+    Placeholder(usize),
+}
+
+/// Where the separators and placeholders are, as byte ranges, skipping
+/// every place PostgreSQL's lexer would not see one.
+fn scan(sql: &str) -> Vec<(usize, usize, Mark)> {
     let bytes = sql.as_bytes();
     let at = |position: usize| bytes.get(position).copied();
     let next = |position: usize| position.saturating_add(1);
 
-    let mut statements = Vec::new();
-    let mut start = 0_usize;
+    let mut marks = Vec::new();
     let mut index = 0_usize;
     while index < bytes.len() {
         match at(index) {
             Some(b';') => {
-                push(&mut statements, sql.get(start..index));
-                start = next(index);
-                index = start;
+                marks.push((index, next(index), Mark::Separator));
+                index = next(index);
             }
             Some(b'\'') => {
                 // `E'...'` takes backslash escapes; a plain string does not,
@@ -82,12 +128,46 @@ pub fn split(sql: &str) -> Vec<&str> {
                     }
                 }
             }
-            Some(b'$') => index = skip_dollar(sql, index),
+            Some(b'$') => {
+                let end = placeholder_end(bytes, index);
+                if end > next(index) {
+                    let number = sql
+                        .get(next(index)..end)
+                        .and_then(|digits| digits.parse().ok())
+                        .unwrap_or(0);
+                    marks.push((index, end, Mark::Placeholder(number)));
+                    index = end;
+                } else {
+                    index = skip_dollar(sql, index);
+                }
+            }
             _ => index = next(index),
         }
     }
-    push(&mut statements, sql.get(start..));
-    statements
+    marks
+}
+
+/// Where a placeholder starting at `index` ends, or `index + 1` if the `$`
+/// there does not start one.
+fn placeholder_end(bytes: &[u8], index: usize) -> usize {
+    let after = index.saturating_add(1);
+    if follows_identifier(bytes, index) {
+        return after;
+    }
+    let mut end = after;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end = end.saturating_add(1);
+    }
+    end
+}
+
+/// Whether the byte before `index` is part of an identifier, which makes a
+/// `$` there part of it too.
+fn follows_identifier(bytes: &[u8], index: usize) -> bool {
+    index > 0
+        && bytes
+            .get(index.saturating_sub(1))
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'$')
 }
 
 fn push<'a>(statements: &mut Vec<&'a str>, piece: Option<&'a str>) {
@@ -103,11 +183,7 @@ fn skip_dollar(sql: &str, index: usize) -> usize {
     let after = index.saturating_add(1);
     // `$1` is a placeholder; a `$` after an identifier character belongs to
     // the identifier. Neither opens a quote.
-    let follows_identifier = index > 0
-        && bytes
-            .get(index.saturating_sub(1))
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
-    if follows_identifier || bytes.get(after).is_some_and(u8::is_ascii_digit) {
+    if follows_identifier(bytes, index) || bytes.get(after).is_some_and(u8::is_ascii_digit) {
         return after;
     }
     let mut tag_end = after;
@@ -134,6 +210,33 @@ fn skip_dollar(sql: &str, index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn values(list: &[&str]) -> Vec<String> {
+        list.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn placeholders_are_replaced_and_lookalikes_left_alone() {
+        assert_eq!(
+            substitute(
+                "SELECT $1, '$1', \"$1\", $$ $1 $$, a$1, -- $1\n $2 /* $1 */",
+                &values(&["'x'", "2"])
+            ),
+            Ok("SELECT 'x', '$1', \"$1\", $$ $1 $$, a$1, -- $1\n 2 /* $1 */".to_owned())
+        );
+        assert_eq!(
+            substitute(
+                "SELECT $10 + $1",
+                &values(&["1", "", "", "", "", "", "", "", "", "10"])
+            ),
+            Ok("SELECT 10 + 1".to_owned())
+        );
+        assert_eq!(substitute("SELECT $2", &values(&["1"])), Err(2));
+        assert_eq!(
+            substitute("SELECT $tag$ $1 $tag$", &[]),
+            Ok("SELECT $tag$ $1 $tag$".to_owned())
+        );
+    }
 
     #[test]
     fn statements_are_separated_and_trimmed() {
