@@ -308,10 +308,46 @@ filtered by rows spread across regions), and shahrah refuses them too.
   operator verbs (`DRAIN`, `REBALANCE`; Luxbyte also `ROUTE` and `RELOCATE`),
   warm connections, alerts, and routing hints. shahrah's dashboard shows
   more about each other proxy than the summary Luxbyte's heartbeat carries.
-- **Measured across regions.** shahrah reports end-to-end numbers from a
-  three-region bed with real latencies, against pgbouncer, pgcat and PgDog.
-  Luxbyte's figures against PostgreSQL below are from one machine, over
-  loopback, against shahrah only.
+- **Measured across regions.** Closer. shahrah reports end-to-end numbers
+  from a three-region bed on real networks, against pgbouncer, pgcat and
+  PgDog. Luxbyte's are from one machine with the regions' round trips
+  simulated (see *Across three regions* below), against shahrah only.
+
+## Across three regions
+
+[`compare/geo`](../compare/geo) puts three PostgreSQL 16 databases a round
+trip apart (eu-west to us-east 75 ms, to ap-south 110 ms, us-east to
+ap-south 42 ms) with a relay that delays every chunk, and one Luxbyte and one
+shahrah proxy in each region with the same placement. pgbench runs beside
+the eu-west proxies, four clients, each workload through each proxy in turn,
+twice, 12 seconds a time. Milliseconds, p50 / p95, and transactions per
+second:
+
+| Workload | Luxbyte | shahrah | |
+|---|---|---|---|
+| point read, home region | **0.20 / 0.39**, 17,217/s | 0.25 / 0.48, 14,008/s | 1.23x the rate |
+| prepared point read, home region | **0.16 / 0.28**, 22,609/s | 0.17 / 0.31, 20,863/s | 1.08x |
+| point write, home region | **0.27 / 0.55**, 13,037/s | 0.33 / 0.65, 10,825/s | 1.20x |
+| replicated read | **0.17 / 0.33**, 20,419/s | 0.20 / 0.39, 17,296/s | 1.18x |
+| point read, 75 ms away | 77.90 / 78.92 | 78.04 / 79.16 | even |
+| point read, 110 ms away | 112.23 / 114.02 | 112.27 / 113.96 | even |
+| point write, 75 ms away | 77.97 / 78.91 | 78.06 / 79.16 | even |
+| `count(*)` over every region | **113.19 / 114.72** | 190.05 / 191.98 | **1.68x faster** |
+| insert of a new key | **0.17 / 0.34**, 20,165/s | refused | |
+
+At home Luxbyte is ahead by the margin it has in front of PostgreSQL on one
+machine. Across a region the network is the whole answer and the two are
+level. Over every region Luxbyte asks all three at once and waits for the
+farthest, 110 ms; shahrah's 190 ms is 75 + 110 plus its own time, the shards
+asked one after another. shahrah will not place a key its directory does not
+list when there is more than one region; Luxbyte places it in the proxy's
+home region (or home shard).
+
+What this is not: a wide-area network. The delay is constant, without jitter
+or loss, and both proxies, the relay and all three databases share one
+4-vCPU machine. Each proxy runs on its own, shahrah without its Raft group
+and Luxbyte without a shared directory, and each keeps one warm connection to
+every region.
 
 ## A note on cache correctness
 
