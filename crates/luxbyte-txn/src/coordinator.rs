@@ -213,6 +213,27 @@ impl Coordinator {
         Ok(report)
     }
 
+    /// Finishes one transaction that was decided to commit, on the
+    /// participants that have not yet acknowledged it. Returns whether all
+    /// of them now have, in which case its record is gone.
+    ///
+    /// Safe while other transactions run, unlike [`Coordinator::recover`]:
+    /// that also rolls back every prepared transaction it has no record of,
+    /// which while sessions are live includes ones another session has
+    /// prepared and is about to record.
+    pub async fn finish(&self, gid: &str, pools: &[Pool]) -> Result<bool, TxnError> {
+        let mut finished = true;
+        for pool in pools {
+            if commit_prepared(pool, gid).await.is_err() {
+                finished = false;
+            }
+        }
+        if finished {
+            self.forget(gid).await?;
+        }
+        Ok(finished)
+    }
+
     async fn pending(&self) -> Result<Vec<CommitRecord>, TxnError> {
         let log = Arc::clone(&self.log);
         tokio::task::spawn_blocking(move || log.pending())
@@ -431,9 +452,17 @@ impl Transaction {
         let record = CommitRecord::new(&self.gid, &regions);
         let log = Arc::clone(&self.log);
         let to_write = record.clone();
-        tokio::task::spawn_blocking(move || log.record(&to_write))
+        let recorded = tokio::task::spawn_blocking(move || log.record(&to_write))
             .await
-            .map_err(|_| TxnError::LogTaskFailed)??;
+            .map_err(|_| TxnError::LogTaskFailed)
+            .and_then(|recorded| recorded);
+        if let Err(error) = recorded {
+            // No decision, so nothing may commit. Left prepared, the
+            // participants would hold their locks until the next recovery.
+            self.abort_all().await;
+            self.finished = Some("rolled back");
+            return Err(error);
+        }
 
         // Phase two. Failures here delay the transaction; they cannot undo
         // it, because the decision is already durable. That includes a
@@ -461,9 +490,16 @@ impl Transaction {
         if unresolved.is_empty() {
             let log = Arc::clone(&self.log);
             let gid = self.gid.clone();
-            tokio::task::spawn_blocking(move || log.forget(&gid))
+            // The transaction has committed everywhere, and saying otherwise
+            // would have a caller act as if it had not. A record left behind
+            // costs recovery one `COMMIT PREPARED` that finds nothing.
+            let forgotten = tokio::task::spawn_blocking(move || log.forget(&gid))
                 .await
-                .map_err(|_| TxnError::LogTaskFailed)??;
+                .map_err(|_| TxnError::LogTaskFailed)
+                .and_then(|forgotten| forgotten);
+            if let Err(error) = forgotten {
+                tracing::warn!(gid = %self.gid, %error, "a committed transaction's record was not removed");
+            }
             return Ok(CommitOutcome::Committed { regions });
         }
         // The record stays so recovery finishes the job.

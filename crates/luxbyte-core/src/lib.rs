@@ -11,9 +11,9 @@ pub mod router;
 pub mod topology;
 
 pub use directory::{
-    Directory, KeyState, Location, MemoryDirectory, RelocationError, RelocationPhase,
+    Directory, KeyState, Location, MemoryDirectory, Reads, RelocationError, RelocationPhase,
 };
-pub use router::{LocalIntent, ParameterValues, Plan, Refusal, Router};
+pub use router::{LocalIntent, ParameterValues, Plan, Refusal, Router, Routing};
 pub use topology::{
     Endpoint, Placement, Region, TablePolicy, Topology, TopologyError, UnconfiguredTables,
 };

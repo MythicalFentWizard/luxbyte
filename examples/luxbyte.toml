@@ -58,6 +58,18 @@ listen = "127.0.0.1:9187"
 # Serve HTTPS with the [tls] certificate.
 # tls = true
 
+# Keep the directory in a table in every region, and allow RELOCATE. A move
+# changes the directory in the same transaction as the rows it moves. Takes
+# the place of the [[directory]] entries at the end of this file.
+# [directory_store]
+# table = "luxbyte_directory"
+# Roles allowed to run RELOCATE; they must authenticate.
+# operators = ["ops"]
+# How long a statement waits for a moving key before 40001.
+# hold_ms = 10000
+# How long a move waits for writes under way and for its locks.
+# lock_timeout_ms = 5000
+
 [topology]
 home_region = "eu-west"
 
@@ -83,8 +95,8 @@ key = "tenant_id"
 table = "currencies"
 placement = "global_replicated"
 
-# Keys already placed. In a real deployment the directory is populated as
-# rows are created; these are only a starting point.
+# Keys already placed, for a proxy without a [directory_store]. A key with no
+# entry is written in the home region and read from every region.
 [[directory]]
 table = "users"
 key = "alice"

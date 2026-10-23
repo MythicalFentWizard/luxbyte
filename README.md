@@ -189,18 +189,51 @@ rows.
 
 **The directory** maps each key to a region, and is the reason this is not just
 hash sharding. A key with no entry is created in the proxy's home region: new
-rows land where the person who made them is. Keys move with an explicit
-two-phase relocation:
+rows land where the person who made them is.
 
-| Phase | Reads | Writes |
+With a `[directory_store]` section the directory lives in a table in every
+region, loaded at startup, and keys move with `RELOCATE`:
+
+```
+=> RELOCATE alice TO 'us-east';
+ table  |  from   |   to    | rows | state
+--------+---------+---------+------+-------
+ orders | eu-west | us-east |   14 | moved
+ users  | eu-west | us-east |    1 | moved
+```
+
+The key moves in every geo-partitioned table at once, since rows that share a
+key are joined on it. The rows are inserted in the destination, deleted from
+the source and the directory changed in every region, all in **one two-phase
+commit**: either all of it happens or none of it does, so there is no
+half-moved key to repair afterwards and no moment, once it commits, when the
+rows are in two regions or none. Each count is checked against the last
+(rows read, rows inserted, rows deleted), and a mismatch abandons the move.
+
+| Phase | Reads of the key | Writes to the key |
 |---|---|---|
-| `Copying` — rows streaming to the destination | source | source |
-| `Cutover` — destination caught up, mapping about to flip | source | paused, SQLSTATE `40001` |
-| settled | destination | destination |
+| cutover: writes already under way finish; rows copied under a lock | source | wait |
+| commit: regions commit one after another | wait | wait |
+| done | destination | destination |
 
-`40001` is `serialization_failure`, which every PostgreSQL client library
-already retries. A relocation therefore costs a correctly written application
-nothing, and no code change at all.
+Statements *wait* rather than fail, so a move costs an application a pause,
+not an error. One that waits longer than `hold_ms`, or one inside a
+transaction that has already done work (it may hold locks the move needs),
+is refused with `40001`, which client libraries already retry. In the source
+the tables are locked against writers, not readers, for the length of the
+copy, which also waits for any open transaction that wrote to them; a move
+that cannot get its locks within `lock_timeout_ms` gives up and leaves
+everything as it was.
+
+Only roles listed in `operators` may run it, and only after authenticating:
+with `trust` authentication nobody can. A key with no entry is looked for in
+every region, and a key with rows in two regions is refused rather than
+guessed. A table outside the move with a foreign key onto one inside it is
+refused too, since the move would break it; foreign keys between the moved
+tables are followed, parents inserted first and deleted last.
+
+Not covered yet: several proxies sharing one directory. Each proxy reads the
+table at startup and learns of its own moves only.
 
 ## Speed
 

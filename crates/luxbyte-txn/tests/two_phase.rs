@@ -514,3 +514,75 @@ async fn a_clean_start_finds_nothing_to_do() {
         .expect("recover");
     assert!(report.is_clean());
 }
+
+/// A log that records decisions but cannot remove them.
+#[derive(Debug, Default)]
+struct StickyLog {
+    inner: MemoryLog,
+}
+
+impl CommitLog for StickyLog {
+    fn record(&self, record: &CommitRecord) -> Result<(), TxnError> {
+        self.inner.record(record)
+    }
+
+    fn forget(&self, _gid: &str) -> Result<(), TxnError> {
+        Err(TxnError::LogTaskFailed)
+    }
+
+    fn pending(&self) -> Result<Vec<CommitRecord>, TxnError> {
+        self.inner.pending()
+    }
+}
+
+#[tokio::test]
+async fn a_record_that_cannot_be_removed_does_not_unmake_a_commit() {
+    // Every participant committed. Reporting failure because the log could
+    // not tidy up would have the caller act as if nothing had happened.
+    let eu = backend("eu-west").await;
+    let us = backend("us-east").await;
+    let log = Arc::new(StickyLog::default());
+    let coordinator = coordinator(log.clone());
+    let mut transaction = coordinator.begin();
+    transaction.enlist("eu-west", &pool_for(&eu)).await.unwrap();
+    transaction.enlist("us-east", &pool_for(&us)).await.unwrap();
+    let outcome = transaction.commit().await.expect("committed");
+    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+    assert_eq!(log.pending().unwrap().len(), 1);
+}
+
+/// A log that cannot record anything.
+#[derive(Debug, Default)]
+struct BrokenLog;
+
+impl CommitLog for BrokenLog {
+    fn record(&self, _record: &CommitRecord) -> Result<(), TxnError> {
+        Err(TxnError::LogTaskFailed)
+    }
+
+    fn forget(&self, _gid: &str) -> Result<(), TxnError> {
+        Ok(())
+    }
+
+    fn pending(&self) -> Result<Vec<CommitRecord>, TxnError> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn a_decision_that_cannot_be_recorded_rolls_the_prepared_participants_back() {
+    // Nothing was decided, so nothing may commit; and prepared transactions
+    // left behind would hold their locks until the next recovery.
+    let eu = backend("eu-west").await;
+    let us = backend("us-east").await;
+    let coordinator = coordinator(Arc::new(BrokenLog));
+    let mut transaction = coordinator.begin();
+    transaction.enlist("eu-west", &pool_for(&eu)).await.unwrap();
+    transaction.enlist("us-east", &pool_for(&us)).await.unwrap();
+    transaction.commit().await.expect_err("no decision");
+    for backend in [&eu, &us] {
+        let prepared = backend.prepared_transactions();
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].1, PreparedOutcome::RolledBack);
+    }
+}

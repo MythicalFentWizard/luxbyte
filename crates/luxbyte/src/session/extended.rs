@@ -236,6 +236,10 @@ pub(super) struct State {
     batch_failed: bool,
     /// Parameter types reported by `Describe`, for decoding binary keys.
     learned: HashMap<StatementKey, Vec<i32>>,
+    /// Writes bound and not yet answered, which a move has to wait for.
+    /// A portal can run in a later batch of the same transaction, so inside
+    /// one they last until it ends.
+    writes: Vec<crate::relocate::Ticket>,
 }
 
 impl State {
@@ -259,6 +263,7 @@ impl State {
     /// Clears what only lasts until a transaction ends.
     pub(super) fn end_transaction(&mut self) {
         self.portals.clear();
+        self.writes.clear();
         self.lanes
             .retain(|lane| !matches!(lane.id, LaneId::Participant(_)));
     }
@@ -322,6 +327,14 @@ impl Session {
             Body::Empty
         } else if crate::console::handle(&self.shared, parse.sql).is_some() {
             Body::Console
+        } else if crate::relocate::parse(parse.sql).is_some() {
+            return self.refuse(
+                sequence,
+                &plain(
+                    "0A000",
+                    "RELOCATE runs only as a simple query, as psql sends it",
+                ),
+            );
         } else if is_copy(parse.sql) {
             // A COPY switches the connection into a sub-protocol of its own,
             // which this relay does not speak; refusing here is better than
@@ -445,7 +458,9 @@ impl Session {
 
         let values = self.bound_values(statement, bind);
         let parameters = ParameterValues::from_prepared(prepared, &values);
-        let (region, access) = match self.shared.router.plan(analysis, Some(&parameters)) {
+        let (plan, write) = self.route(analysis, &parameters).await;
+        self.extended.writes.extend(write);
+        let (region, access) = match plan {
             Plan::Single { region, access } => (region, access),
             // SHOW is answered by a backend like any read.
             Plan::Local(LocalIntent::Show) => (
@@ -943,6 +958,7 @@ impl Session {
 
         if self.transaction.is_none() {
             self.extended.portals.clear();
+            self.extended.writes.clear();
             self.status = TransactionStatus::Idle;
         }
         self.extended.skipping = false;

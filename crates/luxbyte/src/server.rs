@@ -64,6 +64,9 @@ pub enum ServerError {
         /// The listen address.
         address: String,
     },
+    /// The durable directory could not be read or is inconsistent.
+    #[error("directory: {0}")]
+    Directory(String),
 }
 
 /// Whether only this machine can reach `address`.
@@ -100,6 +103,13 @@ impl Server {
             });
         }
 
+        if config.directory_store.is_some() && !config.directory.is_empty() {
+            return Err(ServerError::Directory(
+                "[[directory]] entries and [directory_store] cannot both be set; with a store, \
+                 the directory is the table"
+                    .to_owned(),
+            ));
+        }
         let directory = Arc::new(MemoryDirectory::new());
         for entry in &config.directory {
             directory.place(&entry.table, &entry.key, &entry.region);
@@ -134,6 +144,7 @@ impl Server {
             tls_required: config.tls.required,
             aggregates: parking_lot::Mutex::new(None),
             metrics: crate::metrics::Metrics::default(),
+            moves: crate::relocate::Moves::new(config.directory_store.clone()),
         });
 
         let listener = TcpListener::bind(&config.server.listen)
@@ -175,11 +186,36 @@ impl Server {
             }
         };
 
-        Ok(Self {
+        let server = Self {
             shared,
             listener,
             admin,
-        })
+        };
+        server.open_directory().await?;
+        Ok(server)
+    }
+
+    /// Loads the durable directory, when one is configured.
+    async fn open_directory(&self) -> Result<(), ServerError> {
+        if self.shared.moves.store().is_none() {
+            return Ok(());
+        }
+        // A move commits the rows and the directory together; one a crash
+        // left in doubt has to be finished before the directory is read, or
+        // what is read may not be what was decided.
+        match self.recover().await {
+            Ok(report) if !report.still_in_doubt.is_empty() => tracing::warn!(
+                still_in_doubt = report.still_in_doubt.len(),
+                "transactions are still in doubt; the directory may be read before they resolve"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "recovery failed before loading the directory"),
+        }
+        let keys = crate::relocate::load(&self.shared)
+            .await
+            .map_err(ServerError::Directory)?;
+        tracing::info!(keys, "loaded the directory");
+        Ok(())
     }
 
     /// Where the admin port is listening, if it is.

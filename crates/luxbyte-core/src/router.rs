@@ -27,7 +27,7 @@ use luxbyte_sql::{
     TransactionOp,
 };
 
-use crate::directory::{Directory, Location};
+use crate::directory::{Directory, Location, Reads, RelocationPhase};
 use crate::topology::{Placement, Topology, UnconfiguredTables};
 
 /// Values bound to a statement's placeholders.
@@ -189,6 +189,17 @@ impl Plan {
     }
 }
 
+/// A plan, or the reason a statement has to wait before it can have one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Routing {
+    /// Run it.
+    Ready(Plan),
+    /// It touches a key that is moving between regions. Planned again once
+    /// the move is over it routes normally; the refusal is what to say if
+    /// it cannot wait.
+    Held(Refusal),
+}
+
 /// Decides where statements go.
 pub struct Router {
     topology: Topology,
@@ -251,18 +262,36 @@ impl Router {
     /// `parameters` is `None` before a `Bind` has arrived. A statement whose
     /// routing depends on a placeholder then yields
     /// [`Plan::NeedsParameters`] rather than a guess.
+    ///
+    /// A statement that would have to wait for a move is refused with
+    /// `40001`; [`Router::route`] tells the two apart, for a caller that can
+    /// wait.
     #[must_use]
     pub fn plan(&self, analysis: &StatementAnalysis, parameters: Option<&ParameterValues>) -> Plan {
+        match self.route(analysis, parameters) {
+            Routing::Ready(plan) => plan,
+            Routing::Held(refusal) => Plan::Refuse(refusal),
+        }
+    }
+
+    /// Plans a statement, or says that it touches a moving key and has to
+    /// wait.
+    #[must_use]
+    pub fn route(
+        &self,
+        analysis: &StatementAnalysis,
+        parameters: Option<&ParameterValues>,
+    ) -> Routing {
         match analysis.kind {
             StatementKind::TransactionControl(op) => {
-                Plan::Local(LocalIntent::TransactionControl(op))
+                Routing::Ready(Plan::Local(LocalIntent::TransactionControl(op)))
             }
-            StatementKind::SessionState => Plan::Local(LocalIntent::SessionState),
-            StatementKind::Show => Plan::Local(LocalIntent::Show),
+            StatementKind::SessionState => Routing::Ready(Plan::Local(LocalIntent::SessionState)),
+            StatementKind::Show => Routing::Ready(Plan::Local(LocalIntent::Show)),
             // Schema has to be the same everywhere or a relocated key lands
             // in a region whose table does not match. So DDL goes to every
             // region, atomically.
-            StatementKind::Ddl => self.distributed_over_all_regions(),
+            StatementKind::Ddl => Routing::Ready(self.distributed_over_all_regions()),
             _ => self.plan_data_statement(analysis, parameters),
         }
     }
@@ -283,7 +312,7 @@ impl Router {
         &self,
         analysis: &StatementAnalysis,
         parameters: Option<&ParameterValues>,
-    ) -> Plan {
+    ) -> Routing {
         let user_tables: Vec<&TableRef> = analysis
             .tables
             .iter()
@@ -293,10 +322,10 @@ impl Router {
         // `SELECT 1`, `SELECT now()`, or a pure catalog query: the home
         // region answers, and the answer is the same everywhere.
         if user_tables.is_empty() {
-            return Plan::Single {
+            return Routing::Ready(Plan::Single {
                 region: self.topology.home_region.clone(),
                 access: analysis.access,
-            };
+            });
         }
 
         let mut regions: BTreeSet<String> = BTreeSet::new();
@@ -309,7 +338,7 @@ impl Router {
             else {
                 match self.topology.unconfigured_tables {
                     UnconfiguredTables::Refuse => {
-                        return Plan::Refuse(
+                        return Routing::Ready(Plan::Refuse(
                             Refusal::new(
                                 "0A000",
                                 format!("table \"{table}\" has no placement policy"),
@@ -318,7 +347,7 @@ impl Router {
                                 "add a [[tables]] entry for \"{table}\" to the topology, or set \
                                  unconfigured_tables = \"home\""
                             )),
-                        );
+                        ));
                     }
                     UnconfiguredTables::Home => {
                         regions.insert(self.topology.home_region.clone());
@@ -346,7 +375,7 @@ impl Router {
                     // region the directory no longer points at, so it is a
                     // relocation, not an update.
                     if analysis.kind == StatementKind::Update && analysis.assigns_to(key) {
-                        return Plan::Refuse(
+                        return Routing::Ready(Plan::Refuse(
                             Refusal::new(
                                 "0A000",
                                 format!("cannot assign to \"{key}\", the shard key of \"{table}\""),
@@ -356,26 +385,29 @@ impl Router {
                                  the remaining columns"
                                     .to_owned(),
                             ),
-                        );
+                        ));
                     }
 
                     match self.resolve_key(analysis, table, key, parameters, &mut pending) {
                         KeyResolution::Regions(found) => regions.extend(found),
                         KeyResolution::Deferred => {}
-                        KeyResolution::Refused(refusal) => return Plan::Refuse(refusal),
+                        KeyResolution::Refused(refusal) => {
+                            return Routing::Ready(Plan::Refuse(refusal));
+                        }
+                        KeyResolution::Held(refusal) => return Routing::Held(refusal),
                     }
                 }
             }
         }
 
         if !pending.is_empty() {
-            return Plan::NeedsParameters {
+            return Routing::Ready(Plan::NeedsParameters {
                 parameters: pending.into_iter().collect(),
-            };
+            });
         }
 
         let regions: Vec<String> = regions.into_iter().collect();
-        match regions.len() {
+        Routing::Ready(match regions.len() {
             0 => Plan::Single {
                 region: self.topology.home_region.clone(),
                 access: analysis.access,
@@ -385,7 +417,7 @@ impl Router {
                 access: analysis.access,
             },
             _ => Self::plan_multi_region(analysis, &user_tables, regions),
-        }
+        })
     }
 
     fn plan_multi_region(
@@ -449,6 +481,24 @@ impl Router {
         pending: &mut BTreeSet<u16>,
     ) -> KeyResolution {
         let Some(values) = analysis.shard_key_values(&table.name, key) else {
+            // A statement over every key touches the moving ones too: a write
+            // could reach a moving key's rows in neither region, and a read
+            // while a move commits could see them in both.
+            match self.directory.moving_in(&table.name) {
+                Some(_) if analysis.access.needs_primary() => {
+                    return KeyResolution::Held(moving(
+                        &format!("a key of \"{table}\" is moving between regions"),
+                        "writes to every key of a table wait",
+                    ));
+                }
+                Some(RelocationPhase::Committing) => {
+                    return KeyResolution::Held(moving(
+                        &format!("a key of \"{table}\" is moving between regions"),
+                        "reads of every key of a table wait while the move commits",
+                    ));
+                }
+                _ => {}
+            }
             // No usable predicate on the key. A read fans out; a write that
             // cannot name its rows is a cross-region write, which is slow
             // but well defined — except for an INSERT, which would have to
@@ -499,21 +549,23 @@ impl Router {
                 Location::Known(state) => {
                     if analysis.access.needs_primary() {
                         let Some(region) = state.write_region() else {
-                            return KeyResolution::Refused(
-                                Refusal::new(
-                                    "40001",
-                                    format!(
-                                        "\"{key}\" = {text} is being relocated; writes are paused \
-                                         for the cutover"
-                                    ),
-                                )
-                                .with_hint("retry the transaction".to_owned())
-                                .retryable(),
-                            );
+                            return KeyResolution::Held(moving(
+                                &format!("\"{key}\" = {text} is moving between regions"),
+                                "writes to it wait",
+                            ));
                         };
                         found.push(region.to_owned());
                     } else {
-                        found.push(state.read_region().to_owned());
+                        match state.reads() {
+                            Reads::Region(region) => found.push(region.to_owned()),
+                            Reads::Everywhere => return KeyResolution::Regions(self.all_regions()),
+                            Reads::Wait => {
+                                return KeyResolution::Held(moving(
+                                    &format!("\"{key}\" = {text} is moving between regions"),
+                                    "reads of it wait while the move commits",
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -530,4 +582,16 @@ enum KeyResolution {
     Regions(Vec<String>),
     Deferred,
     Refused(Refusal),
+    Held(Refusal),
+}
+
+/// What a statement that waited too long for a move is told.
+///
+/// `40001` is `serialization_failure`, which client libraries already
+/// retry, so even a statement that cannot wait costs a correct application
+/// nothing but the retry.
+fn moving(what: &str, why: &str) -> Refusal {
+    Refusal::new("40001", format!("{what}; {why} until the move is over"))
+        .with_hint("retry the transaction".to_owned())
+        .retryable()
 }
