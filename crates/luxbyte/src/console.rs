@@ -54,6 +54,18 @@ pub fn handle(shared: &Shared, sql: &str) -> Option<QueryResult> {
         "SHOW DIRECTORY" => Some(show_directory(shared)),
         "SHOW IN DOUBT" => Some(show_in_doubt(shared)),
         "SHOW HEALTH" => Some(show_health(shared)),
+        "SHOW ALERTS" => Some(table(
+            &["alert", "subject", "detail"],
+            crate::alerts::current(shared)
+                .into_iter()
+                .map(|alert| vec![alert.name.to_owned(), alert.subject, alert.detail])
+                .collect(),
+        )),
+        _ if command.starts_with("ROUTE ") => {
+            let original = sql.trim();
+            let statement = original.get("ROUTE".len()..).unwrap_or_default();
+            Some(route(shared, statement))
+        }
         _ => {
             // `WHERE IS <table> <key>` takes arguments, so it cannot be
             // matched as a whole string.
@@ -68,6 +80,29 @@ pub fn handle(shared: &Shared, sql: &str) -> Option<QueryResult> {
             }
         }
     }
+}
+
+/// Where a statement would run, with the live directory, without running
+/// it.
+fn route(shared: &Shared, sql: &str) -> QueryResult {
+    let analyses = match luxbyte_sql::analyze(sql) {
+        Ok(analyses) => analyses,
+        Err(error) => return table_error(&error.to_string()),
+    };
+    let texts = luxbyte_sql::statements::split(sql);
+    let mut rows = Vec::new();
+    for (position, analysis) in analyses.iter().enumerate() {
+        let plan = shared.router.plan(analysis, None);
+        let text = texts.get(position).copied().unwrap_or(sql);
+        for (step, detail) in crate::explain::lines(text, analysis, &plan) {
+            rows.push(vec![
+                position.saturating_add(1).to_string(),
+                step.to_owned(),
+                detail,
+            ]);
+        }
+    }
+    table(&["statement", "step", "detail"], rows)
 }
 
 fn table_error(message: &str) -> QueryResult {
@@ -209,7 +244,11 @@ fn show_health(shared: &Shared) -> QueryResult {
                 status.region.clone(),
                 status.endpoint.clone(),
                 role.to_owned(),
-                status.state.name().to_owned(),
+                if status.drained {
+                    format!("{}, drained", status.state.name())
+                } else {
+                    status.state.name().to_owned()
+                },
                 lag,
                 status
                     .probe_time

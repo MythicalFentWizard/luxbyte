@@ -55,9 +55,6 @@ pub struct DirectoryStore {
     /// The table, created in every region if it is missing. May be
     /// qualified with a schema.
     pub table: String,
-    /// Roles allowed to run `RELOCATE`. They have to authenticate, so with
-    /// `auth.method = "trust"` nobody can.
-    pub operators: Vec<String>,
     /// Milliseconds a statement waits for a moving key before it is refused
     /// with `40001`.
     pub hold_ms: u64,
@@ -70,7 +67,6 @@ impl Default for DirectoryStore {
     fn default() -> Self {
         Self {
             table: "luxbyte_directory".to_owned(),
-            operators: Vec::new(),
             hold_ms: 10_000,
             lock_timeout_ms: 5_000,
         }
@@ -234,6 +230,9 @@ pub struct PoolSettings {
     pub reset: Reset,
     /// The statement that resets one.
     pub reset_query: String,
+    /// Connections to open to every backend at startup, so the first
+    /// clients do not each pay for a connection across the world.
+    pub warm: usize,
 }
 
 /// When a returned connection is reset, as the configuration spells it.
@@ -258,6 +257,7 @@ impl Default for PoolSettings {
             max_lifetime_s: 1_800,
             reset: Reset::WhenChanged,
             reset_query: "DISCARD ALL".to_owned(),
+            warm: 0,
         }
     }
 }

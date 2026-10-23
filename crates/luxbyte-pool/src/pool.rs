@@ -498,6 +498,18 @@ impl PoolSet {
         self.len() == 0
     }
 
+    /// Every pool that connects to `host:port`, whatever its database and
+    /// role.
+    #[must_use]
+    pub fn to_endpoint(&self, host: &str, port: u16) -> Vec<Pool> {
+        self.pools
+            .lock()
+            .iter()
+            .filter(|(target, _)| target.host == host && target.port == port)
+            .map(|(_, pool)| pool.clone())
+            .collect()
+    }
+
     /// Statistics for every pool.
     #[must_use]
     pub fn stats(&self) -> Vec<(ConnectionTarget, PoolStats)> {
