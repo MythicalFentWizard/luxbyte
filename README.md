@@ -191,6 +191,34 @@ runs 12. Method, variance, and the places shahrah is better:
 cargo bench   # no database, no Docker, no testbed
 ```
 
+## Committing across regions
+
+A write that touches one region is an ordinary `COMMIT`. One that touches
+several is two-phase commit, and the order of three steps is the entire
+protocol:
+
+1. `PREPARE TRANSACTION` on every participant. Any refusal and everything
+   rolls back. Nothing committed, so nothing is lost, and the client gets a
+   retryable error.
+2. **Write the decision to the commit log, durably.** The point of no return.
+3. `COMMIT PREPARED` on every participant. Failures here delay the
+   transaction; they cannot undo it.
+
+A coordinator that dies between 2 and 3 restarts, reads the log and finishes.
+One that dies between 1 and 2 restarts, finds no record, and rolls back. Both
+are correct, and which happens is decided entirely by whether that one write
+completed. There is a test that asserts the ordering directly: at the moment
+the record is written, every participant has prepared and none has been told
+to commit.
+
+Recovery also does the job that is easy to forget. A prepared transaction
+nobody resolves is worse than a slow one — PostgreSQL holds its locks and
+pins the transaction horizon, so `VACUUM` stops reclaiming across the whole
+database. So recovery scans each participant's `pg_prepared_xacts` for
+identifiers this coordinator issued, and rolls back any the log never decided
+on. It is scoped to its own identifier prefix, because rolling back another
+system's prepared transaction would destroy data it knows nothing about.
+
 ## Engineering rules
 
 The workspace denies, not warns:
@@ -253,13 +281,8 @@ Done, tested, and working:
 
 Not written yet:
 
-- **`luxbyte-pool`** — per-endpoint connection pooling.
-- **`luxbyte-txn`** — the two-phase commit driver. `Plan::Distributed` already
-  identifies the statements that need it.
-- **`luxbyte-testkit`** — an in-process PostgreSQL backend speaking the real
-  wire protocol, so the proxy can be tested end to end with no database.
 - The proxy server itself: listener, session, scatter-gather execution, the
-  operator console, metrics.
+  operator console, metrics. Everything it needs is in place.
 
 Alongside, not part of the proxy:
 

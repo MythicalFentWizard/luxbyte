@@ -45,6 +45,7 @@ use luxbyte_proto::{Framed, Peer, ProtocolError};
 use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::broadcast;
 
 /// What a backend does with a statement it is asked to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,21 +180,50 @@ impl BackendConfig {
 }
 
 /// Everything the backend observed, shared with the test.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Observed {
     statements: Mutex<Vec<String>>,
     prepared: Mutex<BTreeMap<String, PreparedOutcome>>,
     connections: AtomicU64,
     live: AtomicU64,
     stopped: AtomicBool,
+    /// Broadcast to every live session to make it hang up at once, which is
+    /// how a server restart looks to a pool holding idle connections.
+    kill: broadcast::Sender<()>,
+}
+
+impl Default for Observed {
+    fn default() -> Self {
+        let (kill, _) = broadcast::channel(16);
+        Self {
+            statements: Mutex::new(Vec::new()),
+            prepared: Mutex::new(BTreeMap::new()),
+            connections: AtomicU64::new(0),
+            live: AtomicU64::new(0),
+            stopped: AtomicBool::new(false),
+            kill,
+        }
+    }
 }
 
 /// A running backend.
+///
+/// Dropping it stops the listener and hangs up on every open connection, so
+/// a test cannot leak a server into the next one.
 #[derive(Debug)]
 pub struct Backend {
     addr: SocketAddr,
     observed: Arc<Observed>,
     config: Arc<BackendConfig>,
+    accept: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        self.observed.stopped.store(true, Ordering::SeqCst);
+        let _ = self.observed.kill.send(());
+        self.accept.abort();
+    }
 }
 
 impl Backend {
@@ -206,7 +236,7 @@ impl Backend {
 
         let accept_observed = Arc::clone(&observed);
         let accept_config = Arc::clone(&config);
-        tokio::spawn(async move {
+        let accept = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
@@ -229,6 +259,7 @@ impl Backend {
             addr,
             observed,
             config,
+            accept,
         })
     }
 
@@ -318,6 +349,15 @@ impl Backend {
     pub fn stop(&self) {
         self.observed.stopped.store(true, Ordering::SeqCst);
     }
+
+    /// Hangs up on every open connection, without warning.
+    ///
+    /// What a pool sees when the server restarts, or when a firewall drops
+    /// an idle connection: the sockets it holds are dead and it has no way
+    /// to know until it uses one.
+    pub fn close_connections(&self) {
+        let _ = self.observed.kill.send(());
+    }
 }
 
 /// Serves one connection.
@@ -371,8 +411,15 @@ async fn session(
     framed.flush().await?;
 
     let mut status = TransactionStatus::Idle;
+    let mut kill = observed.kill.subscribe();
     loop {
-        let message = match framed.read_message().await {
+        let read = tokio::select! {
+            result = framed.read_message() => result,
+            // Hang up mid-wait. Cancelling the read is safe because the
+            // connection is being abandoned either way.
+            _ = kill.recv() => return Ok(()),
+        };
+        let message = match read {
             Ok(message) => message,
             // The client hung up, which is how a pooled connection is
             // normally retired.
@@ -432,10 +479,15 @@ fn answer(
     observed: &Observed,
     status: &mut TransactionStatus,
 ) -> Result<Vec<Bytes>, ProtocolError> {
-    let upper = sql.trim().to_uppercase();
+    let trimmed = sql.trim();
+    // `to_ascii_uppercase` keeps byte offsets aligned with the original, so
+    // the verb can be matched case-insensitively while the identifier is
+    // still sliced out of the text as the client wrote it. Uppercasing the
+    // identifier too would make every gid fail to match on the way back.
+    let upper = trimmed.to_ascii_uppercase();
 
     // Two-phase commit verbs, which the coordinator's tests assert on.
-    if let Some(gid) = gid_after(&upper, "PREPARE TRANSACTION") {
+    if let Some(gid) = gid_after(&upper, trimmed, "PREPARE TRANSACTION") {
         if config.refuse_prepare {
             *status = TransactionStatus::Failed;
             return Ok(vec![
@@ -449,7 +501,7 @@ fn answer(
         *status = TransactionStatus::Idle;
         return Ok(vec![build::command_complete("PREPARE TRANSACTION")?]);
     }
-    if let Some(gid) = gid_after(&upper, "COMMIT PREPARED") {
+    if let Some(gid) = gid_after(&upper, trimmed, "COMMIT PREPARED") {
         let known = observed
             .prepared
             .lock()
@@ -469,7 +521,7 @@ fn answer(
         }
         return Ok(vec![build::command_complete("COMMIT PREPARED")?]);
     }
-    if let Some(gid) = gid_after(&upper, "ROLLBACK PREPARED") {
+    if let Some(gid) = gid_after(&upper, trimmed, "ROLLBACK PREPARED") {
         let known = observed
             .prepared
             .lock()
@@ -549,12 +601,20 @@ fn scripted_reply(
 }
 
 /// Extracts the identifier from `PREPARE TRANSACTION 'gid'` and friends.
-fn gid_after(upper: &str, verb: &str) -> Option<String> {
-    let rest = upper.strip_prefix(verb)?;
-    let start = rest.find('\'')?;
-    let tail = rest.get(start.saturating_add(1)..)?;
-    let end = tail.find('\'')?;
-    tail.get(..end).map(ToOwned::to_owned)
+///
+/// `upper` is matched against the verb; the identifier is sliced out of
+/// `original` at the same offsets, so its case survives. Uppercasing the
+/// identifier along with the verb is an easy mistake and makes every
+/// `COMMIT PREPARED` fail to find what it prepared.
+fn gid_after(upper: &str, original: &str, verb: &str) -> Option<String> {
+    if !upper.starts_with(verb) {
+        return None;
+    }
+    let open = upper.find('\'')?;
+    let start = open.checked_add(1)?;
+    let close = upper.get(start..)?.find('\'')?;
+    let end = start.checked_add(close)?;
+    original.get(start..end).map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
@@ -563,17 +623,33 @@ mod tests {
 
     #[test]
     fn extracts_a_gid_from_each_two_phase_verb() {
+        let statement = "PREPARE TRANSACTION 'luxbyte-eu-1-0'";
         assert_eq!(
-            gid_after("PREPARE TRANSACTION 'LUXBYTE_1'", "PREPARE TRANSACTION"),
-            Some("LUXBYTE_1".to_owned())
+            gid_after(
+                &statement.to_ascii_uppercase(),
+                statement,
+                "PREPARE TRANSACTION"
+            ),
+            Some("luxbyte-eu-1-0".to_owned()),
+            "the identifier keeps the case the client sent"
         );
+
+        let statement = "COMMIT PREPARED 'MixedCase'";
         assert_eq!(
-            gid_after("COMMIT PREPARED 'X'", "COMMIT PREPARED"),
-            Some("X".to_owned())
+            gid_after(
+                &statement.to_ascii_uppercase(),
+                statement,
+                "COMMIT PREPARED"
+            ),
+            Some("MixedCase".to_owned())
         );
-        assert_eq!(gid_after("COMMIT", "COMMIT PREPARED"), None);
+        assert_eq!(gid_after("COMMIT", "COMMIT", "COMMIT PREPARED"), None);
         assert_eq!(
-            gid_after("PREPARE TRANSACTION", "PREPARE TRANSACTION"),
+            gid_after(
+                "PREPARE TRANSACTION",
+                "PREPARE TRANSACTION",
+                "PREPARE TRANSACTION"
+            ),
             None
         );
     }

@@ -532,7 +532,6 @@ dependencies = [
 name = "luxbyte-txn"
 version = "0.1.0"
 dependencies = [
- "luxbyte-core",
  "luxbyte-pool",
  "luxbyte-proto",
  "luxbyte-testkit",

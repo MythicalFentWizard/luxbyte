@@ -16,9 +16,10 @@ use crate::raw::{RawMessage, tag};
 /// returned to the pool. Handing a connection back mid-transaction leaks the
 /// transaction onto whoever borrows it next, and a failed transaction that is
 /// never rolled back holds locks indefinitely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TransactionStatus {
     /// Not in a transaction block.
+    #[default]
     Idle,
     /// Inside a transaction block.
     InTransaction,
