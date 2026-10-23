@@ -173,14 +173,56 @@ impl ScramVerifier {
     }
 }
 
+/// The keys a successful SCRAM exchange proves a client holds.
+///
+/// `ClientKey` is what a password is *for*: with it, and the salt and
+/// iteration count it was derived under, a SCRAM client can authenticate
+/// without the password ever being known. A server recovers it from the
+/// client's proof, which is what lets the proxy log in to a backend as the
+/// client's own role rather than as one shared superuser.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ScramKeys {
+    /// `HMAC(SaltedPassword, "Client Key")`.
+    pub client_key: [u8; KEY_LEN],
+    /// `HMAC(SaltedPassword, "Server Key")`, to check the backend's answer.
+    pub server_key: [u8; KEY_LEN],
+    /// The salt both keys were derived under.
+    pub salt: Vec<u8>,
+    /// The iteration count both keys were derived under.
+    pub iterations: u32,
+}
+
+// Written by hand so that a log line formatting credentials can never print
+// a key that authenticates as somebody.
+impl std::fmt::Debug for ScramKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScramKeys")
+            .field("iterations", &self.iterations)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a [`ScramClient`] authenticates with.
+#[derive(Clone)]
+enum Secret {
+    Password(String),
+    Keys(ScramKeys),
+}
+
 /// The client half of SCRAM-SHA-256: what the proxy sends to a backend.
-#[derive(Debug)]
 pub struct ScramClient {
-    password: String,
+    secret: Secret,
     client_nonce: String,
     client_first_bare: String,
     auth_message: String,
     server_signature: Option<[u8; KEY_LEN]>,
+}
+
+// Hand-written so the secret never reaches a log.
+impl std::fmt::Debug for ScramClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScramClient").finish_non_exhaustive()
+    }
 }
 
 impl ScramClient {
@@ -188,7 +230,7 @@ impl ScramClient {
     #[must_use]
     pub fn new(password: &str) -> Self {
         Self {
-            password: password.to_owned(),
+            secret: Secret::Password(password.to_owned()),
             client_nonce: nonce(),
             client_first_bare: String::new(),
             auth_message: String::new(),
@@ -200,8 +242,26 @@ impl ScramClient {
     #[must_use]
     pub fn with_nonce(password: &str, client_nonce: &str) -> Self {
         Self {
-            password: password.to_owned(),
+            secret: Secret::Password(password.to_owned()),
             client_nonce: client_nonce.to_owned(),
+            client_first_bare: String::new(),
+            auth_message: String::new(),
+            server_signature: None,
+        }
+    }
+
+    /// Starts an exchange that proves possession of keys recovered from
+    /// another SCRAM exchange, without the password.
+    ///
+    /// Works only against a server holding the same verifier — the same salt
+    /// and iteration count — because the keys were derived under those. A
+    /// server with a different one is refused at its first message, with a
+    /// reason that names the fix, rather than failing as a wrong password.
+    #[must_use]
+    pub fn with_keys(keys: ScramKeys) -> Self {
+        Self {
+            secret: Secret::Keys(keys),
+            client_nonce: nonce(),
             client_first_bare: String::new(),
             auth_message: String::new(),
             server_signature: None,
@@ -238,8 +298,26 @@ impl ScramClient {
             .parse()
             .map_err(|_| ProtocolError::Auth("iteration count is not a number".to_owned()))?;
 
-        let salted = hi(self.password.as_bytes(), &salt, iterations)?;
-        let client_key = hmac_sha256(&salted, b"Client Key")?;
+        let (client_key, server_key) = match &self.secret {
+            Secret::Password(password) => {
+                let salted = hi(password.as_bytes(), &salt, iterations)?;
+                (
+                    hmac_sha256(&salted, b"Client Key")?,
+                    hmac_sha256(&salted, b"Server Key")?,
+                )
+            }
+            Secret::Keys(keys) => {
+                if keys.salt != salt || keys.iterations != iterations {
+                    return Err(ProtocolError::Auth(
+                        "the server holds a different SCRAM verifier for this role than the one \
+                         the client authenticated against; give the role the same verifier \
+                         everywhere"
+                            .to_owned(),
+                    ));
+                }
+                (keys.client_key, keys.server_key)
+            }
+        };
         let stored_key = sha256(&client_key);
 
         // `biws` is base64 of the `n,,` header we sent.
@@ -252,7 +330,6 @@ impl ScramClient {
         let client_signature = hmac_sha256(&stored_key, self.auth_message.as_bytes())?;
         let proof = xor(&client_key, &client_signature);
 
-        let server_key = hmac_sha256(&salted, b"Server Key")?;
         self.server_signature = Some(hmac_sha256(&server_key, self.auth_message.as_bytes())?);
 
         Ok(format!("{without_proof},p={}", b64_encode(&proof)))
@@ -289,8 +366,10 @@ impl ScramClient {
 pub struct ScramServer {
     verifier: ScramVerifier,
     server_nonce: String,
+    client_nonce: String,
     client_first_bare: String,
     server_first: String,
+    proven: Option<[u8; KEY_LEN]>,
 }
 
 impl ScramServer {
@@ -300,8 +379,10 @@ impl ScramServer {
         Self {
             verifier,
             server_nonce: nonce(),
+            client_nonce: String::new(),
             client_first_bare: String::new(),
             server_first: String::new(),
+            proven: None,
         }
     }
 
@@ -311,8 +392,10 @@ impl ScramServer {
         Self {
             verifier,
             server_nonce: server_nonce.to_owned(),
+            client_nonce: String::new(),
             client_first_bare: String::new(),
             server_first: String::new(),
+            proven: None,
         }
     }
 
@@ -335,6 +418,7 @@ impl ScramServer {
             .ok_or_else(|| ProtocolError::Auth("client-first has no nonce".to_owned()))?;
 
         bare.clone_into(&mut self.client_first_bare);
+        client_nonce.clone_into(&mut self.client_nonce);
         let combined = format!("{client_nonce}{}", self.server_nonce);
         self.server_first = format!(
             "r={combined},s={},i={}",
@@ -345,7 +429,16 @@ impl ScramServer {
     }
 
     /// Verifies the client-final message and produces the server-final one.
-    pub fn server_final(&self, client_final: &str) -> Result<String, ProtocolError> {
+    pub fn server_final(&mut self, client_final: &str) -> Result<String, ProtocolError> {
+        // The nonce has to be the one this exchange agreed on. The proof
+        // would not verify otherwise either, but saying so here keeps the
+        // reason honest and does not lean on that.
+        let expected_nonce = format!("{}{}", self.client_nonce, self.server_nonce);
+        if attribute(client_final, 'r') != Some(expected_nonce.as_str()) {
+            return Err(ProtocolError::Auth(
+                "client-final does not carry this exchange's nonce".to_owned(),
+            ));
+        }
         let proof = attribute(client_final, 'p')
             .ok_or_else(|| ProtocolError::Auth("client-final has no proof".to_owned()))?;
         let proof = <[u8; KEY_LEN]>::try_from(b64_decode(proof)?.as_slice())
@@ -373,8 +466,42 @@ impl ScramServer {
         }
 
         let server_signature = hmac_sha256(&self.verifier.server_key, auth_message.as_bytes())?;
+        self.proven = Some(client_key);
         Ok(format!("v={}", b64_encode(&server_signature)))
     }
+
+    /// The keys the client proved it holds, once [`ScramServer::server_final`]
+    /// has succeeded.
+    #[must_use]
+    pub fn keys(&self) -> Option<ScramKeys> {
+        self.proven.map(|client_key| ScramKeys {
+            client_key,
+            server_key: self.verifier.server_key,
+            salt: self.verifier.salt.clone(),
+            iterations: self.verifier.iterations,
+        })
+    }
+}
+
+/// A verifier for a role that does not exist, derived from its name.
+///
+/// Answering an unknown name with an immediate refusal would tell anyone who
+/// asks which roles exist. Running a full exchange against a stand-in instead
+/// makes the two cases take the same steps and fail with the same error, as
+/// PostgreSQL does. The salt depends only on the name and `secret`, so asking
+/// twice gets the same salt, as it would for a real role.
+pub fn stand_in_verifier(user: &str, secret: &[u8]) -> Result<ScramVerifier, ProtocolError> {
+    let salt = hmac_sha256(secret, user.as_bytes())?;
+    let mut password = [0_u8; KEY_LEN];
+    {
+        use rand::Rng as _;
+        rand::rng().fill_bytes(&mut password);
+    }
+    ScramVerifier::derive(
+        &b64_encode(&password),
+        salt.get(..16).unwrap_or(&salt),
+        4_096,
+    )
 }
 
 /// `md5(md5(password + user) + salt)`, prefixed with `md5` as the wire expects.
@@ -426,6 +553,75 @@ mod tests {
         let server_final = server.server_final(&client_final).unwrap();
 
         assert!(client.verify_server_final(&server_final).is_ok());
+    }
+
+    #[test]
+    fn keys_recovered_by_a_server_authenticate_to_another_holding_the_same_verifier() {
+        // The proxy authenticates the client, then logs in to a backend as
+        // that client using only what the exchange proved.
+        let mut client = ScramClient::new("hunter2");
+        let mut proxy = ScramServer::new(verifier());
+        let client_first = client.client_first();
+        let server_first = proxy.server_first(&client_first).unwrap();
+        let client_final = client.client_final(&server_first).unwrap();
+        proxy.server_final(&client_final).unwrap();
+        let keys = proxy.keys().expect("keys after success");
+
+        let mut onward = ScramClient::with_keys(keys);
+        let mut backend = ScramServer::new(verifier());
+        let first = onward.client_first();
+        let server_first = backend.server_first(&first).unwrap();
+        let client_final = onward.client_final(&server_first).unwrap();
+        let server_final = backend.server_final(&client_final).unwrap();
+        assert!(onward.verify_server_final(&server_final).is_ok());
+    }
+
+    #[test]
+    fn recovered_keys_are_refused_by_a_server_with_another_salt() {
+        let mut client = ScramClient::new("hunter2");
+        let mut proxy = ScramServer::new(verifier());
+        let client_first = client.client_first();
+        let server_first = proxy.server_first(&client_first).unwrap();
+        let client_final = client.client_final(&server_first).unwrap();
+        proxy.server_final(&client_final).unwrap();
+
+        let other = ScramVerifier::derive("hunter2", b"othersalt", 4096).unwrap();
+        let mut onward = ScramClient::with_keys(proxy.keys().unwrap());
+        let mut backend = ScramServer::new(other);
+        let first = onward.client_first();
+        let server_first = backend.server_first(&first).unwrap();
+        let error = onward.client_final(&server_first).unwrap_err();
+        assert!(error.to_string().contains("same verifier"));
+    }
+
+    #[test]
+    fn no_keys_are_released_before_the_proof_checks_out() {
+        let mut client = ScramClient::new("wrong");
+        let mut server = ScramServer::new(verifier());
+        let client_first = client.client_first();
+        let server_first = server.server_first(&client_first).unwrap();
+        let client_final = client.client_final(&server_first).unwrap();
+        assert!(server.server_final(&client_final).is_err());
+        assert!(server.keys().is_none());
+    }
+
+    #[test]
+    fn a_stand_in_verifier_has_a_stable_salt_and_an_unguessable_password() {
+        let first = stand_in_verifier("nobody", b"secret").unwrap();
+        let second = stand_in_verifier("nobody", b"secret").unwrap();
+        assert_eq!(first.salt, second.salt);
+        assert_ne!(first.stored_key, second.stored_key);
+    }
+
+    #[test]
+    fn keys_never_print() {
+        let keys = ScramKeys {
+            client_key: [7; KEY_LEN],
+            server_key: [9; KEY_LEN],
+            salt: vec![1],
+            iterations: 4096,
+        };
+        assert!(!format!("{keys:?}").contains('7'));
     }
 
     #[test]

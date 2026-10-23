@@ -18,6 +18,23 @@ database = "shop"
 [pool]
 max_size = 16
 
+# Clients authenticate with SCRAM-SHA-256 against PostgreSQL's own stored
+# verifiers. With nothing here the proxy trusts every client, and refuses to
+# listen anywhere but loopback unless method = "trust" says so on purpose.
+[auth]
+# Read a role's verifier from the home region's primary. A SECURITY DEFINER
+# function over pg_authid lets the backend role do this without superuser.
+query = "SELECT rolpassword FROM pg_authid WHERE rolname = $1"
+# Log in to backends as the client's own role, with the keys its login
+# proved, so GRANTs and row-level security still apply. The role needs the
+# same verifier in every region.
+passthrough = true
+
+# Or keep verifiers here, copied from pg_authid.rolpassword:
+# [[auth.users]]
+# name = "app"
+# verifier = "SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>"
+
 [topology]
 home_region = "eu-west"
 

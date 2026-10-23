@@ -10,9 +10,9 @@ move. A read in your home region is a local round trip. The same read against a
 single distant cluster is the speed of light and back.
 
 **Status: it runs.** `luxbyte serve` accepts PostgreSQL clients over both the
-simple and the extended query protocol, routes their statements, merges
-scattered reads and commits across regions in two phases. Client
-authentication is the notable gap — see [Where it stands](#where-it-stands).
+simple and the extended query protocol, authenticates them with SCRAM, routes
+their statements, merges scattered reads and commits across regions in two
+phases. See [Where it stands](#where-it-stands) for what is still missing.
 
 ---
 
@@ -359,11 +359,17 @@ refuses, it refuses with a reason:
   commit atomically — inside `BEGIN`/`COMMIT` it commits in two phases;
 - `COPY`.
 
+Clients authenticate with SCRAM-SHA-256 against PostgreSQL's own stored
+verifiers, from the configuration or read from the home region with a bound
+parameter. With `passthrough`, the keys a client's login proved are used to
+log in to every backend *as that client*: privileges and row-level security
+on the backends see the real role, and no shared superuser is needed. Unknown
+roles fail exactly as a wrong password does, so a login attempt does not
+reveal which roles exist. Left unconfigured, the proxy trusts every client
+and refuses to listen beyond loopback until told that is intended.
+
 Not written yet:
 
-- **Client authentication.** The proxy authenticates *to* backends with SCRAM
-  or MD5, but accepts any client. Do not expose the listener anywhere the
-  backends are not already reachable from.
 - **Query cancellation.** A `CancelRequest` arrives on its own connection and
   needs a key registry to route; it is accepted and dropped.
 - Metrics, and TLS to the client.

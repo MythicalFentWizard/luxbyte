@@ -11,6 +11,7 @@ use luxbyte_sql::AnalysisCache;
 use luxbyte_txn::{CommitLog, Coordinator, FileLog, MemoryLog, Recovery};
 use tokio::net::TcpListener;
 
+use crate::auth::{Authenticator, Method};
 use crate::config::Config;
 use crate::session::{Session, Shared};
 
@@ -29,6 +30,29 @@ pub enum ServerError {
     /// The commit log could not be opened.
     #[error("could not open the commit log: {0}")]
     CommitLog(#[from] luxbyte_txn::TxnError),
+    /// The `[auth]` section is invalid.
+    #[error("{0}")]
+    Auth(#[from] crate::auth::AuthError),
+    /// The proxy would accept anyone, on an address other machines reach.
+    #[error(
+        "{address} is reachable from other machines and no client authentication is \
+         configured; add [[auth.users]] or auth.query, or set auth.method = \"trust\" to \
+         accept anyone on purpose"
+    )]
+    Unprotected {
+        /// The listen address.
+        address: String,
+    },
+}
+
+/// Whether only this machine can reach `address`.
+fn is_loopback(address: &str) -> bool {
+    if let Ok(socket) = address.parse::<SocketAddr>() {
+        return socket.ip().is_loopback();
+    }
+    address
+        .rsplit_once(':')
+        .is_some_and(|(host, _)| host.eq_ignore_ascii_case("localhost"))
 }
 
 /// A bound, not yet running, proxy.
@@ -41,6 +65,18 @@ pub struct Server {
 impl Server {
     /// Binds the listener and prepares everything the sessions share.
     pub async fn bind(config: &Config) -> Result<Self, ServerError> {
+        let auth = Authenticator::new(&config.auth)?;
+        // Accepting anyone is a choice to be made out loud. Left as the
+        // default, it is allowed only where nobody else can connect.
+        if auth.method() == Method::Trust
+            && config.auth.method.is_none()
+            && !is_loopback(&config.server.listen)
+        {
+            return Err(ServerError::Unprotected {
+                address: config.server.listen.clone(),
+            });
+        }
+
         let directory = Arc::new(MemoryDirectory::new());
         for entry in &config.directory {
             directory.place(&entry.table, &entry.key, &entry.region);
@@ -65,6 +101,7 @@ impl Server {
             credentials: config.backend.credentials(),
             backend_user: config.backend.user.clone(),
             backend_database: config.backend.database.clone(),
+            auth,
         });
 
         let listener = TcpListener::bind(&config.server.listen)
@@ -174,5 +211,20 @@ impl ServerHandle {
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_loopback_addresses_count_as_private() {
+        assert!(is_loopback("127.0.0.1:6432"));
+        assert!(is_loopback("[::1]:6432"));
+        assert!(is_loopback("localhost:6432"));
+        assert!(!is_loopback("0.0.0.0:6432"));
+        assert!(!is_loopback("10.0.0.5:6432"));
+        assert!(!is_loopback("proxy.internal:6432"));
     }
 }

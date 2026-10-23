@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use luxbyte_core::topology::Endpoint;
-use luxbyte_proto::auth::{ScramClient, md5_password};
+use luxbyte_proto::auth::{ScramClient, ScramKeys, md5_password};
 use luxbyte_proto::backend::{Authentication, Backend, TransactionStatus};
 use luxbyte_proto::startup::StartupParameters;
 use luxbyte_proto::tag;
@@ -14,18 +14,34 @@ use crate::error::PoolError;
 use crate::pipeline::{Step, StepKind, StepReply};
 
 /// How a connection authenticates.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Credentials {
     /// The server is expected not to ask for a password.
     Trust,
     /// A password, used for whichever method the server asks for.
     Password(String),
+    /// Keys a client proved it holds when it authenticated to the proxy,
+    /// used to log in as that client. SCRAM only: no other method can be
+    /// answered without the password itself.
+    Scram(ScramKeys),
+}
+
+// Hand-written so that formatting a pool or a target into a log line can
+// never print something that logs in as somebody.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Trust => "Trust",
+            Self::Password(_) => "Password(..)",
+            Self::Scram(_) => "Scram(..)",
+        })
+    }
 }
 
 impl Credentials {
     fn password(&self) -> Option<&str> {
         match self {
-            Self::Trust => None,
+            Self::Trust | Self::Scram(_) => None,
             Self::Password(password) => Some(password),
         }
     }
@@ -195,8 +211,10 @@ impl Connection {
                             mechanisms.join(", "),
                         )));
                     }
-                    let password = self.require_password(credentials)?;
-                    let mut client = ScramClient::new(password);
+                    let mut client = match credentials {
+                        Credentials::Scram(keys) => ScramClient::with_keys(keys.clone()),
+                        _ => ScramClient::new(self.require_password(credentials)?),
+                    };
                     let first = client.client_first();
                     let mut payload = Vec::new();
                     payload.extend_from_slice(luxbyte_proto::auth::SCRAM_SHA_256.as_bytes());
@@ -254,10 +272,17 @@ impl Connection {
 
     fn require_password<'a>(&self, credentials: &'a Credentials) -> Result<&'a str, PoolError> {
         credentials.password().ok_or_else(|| {
-            PoolError::Auth(format!(
-                "{} asked for a password and none was configured",
-                self.target
-            ))
+            PoolError::Auth(match credentials {
+                Credentials::Scram(_) => format!(
+                    "{} asked for a password rather than SCRAM, and a client's password is \
+                     never known to the proxy; set password_encryption = scram-sha-256 there",
+                    self.target
+                ),
+                _ => format!(
+                    "{} asked for a password and none was configured",
+                    self.target
+                ),
+            })
         })
     }
 
