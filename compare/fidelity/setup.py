@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lays out the fidelity dataset: twelve tenants over three regions.
 
-Usage: setup.py EU_PORT US_PORT AP_PORT
+Usage: setup.py EU_PORT US_PORT AP_PORT [--csv PLACEMENT_CSV]
 
 Creates database `fid` in each region and `fid_truth` (every row, in one
 place) in the first. Tenants t01-t04 live in eu-west, t05-t08 in us-east,
@@ -9,8 +9,9 @@ t09-t12 in ap-south. Each has two users and three orders; the third order of
 each tenant was bought by a user of the next tenant, so joins that are not on
 the shard key cross regions. `currencies` is the same everywhere.
 
-The placement is written for both proxies: Luxbyte's directory entries are
-printed for its config, and shahrah's directory table is filled in eu-west.
+Luxbyte's directory entries for this placement are printed, for its config.
+With --csv, the same placement is also written as `table,key,region` lines,
+for giving any other proxy the same layout in its own format.
 """
 
 import subprocess
@@ -79,18 +80,19 @@ def main():
         sql += f"INSERT INTO users VALUES {values(mine_users)};\n"
         sql += f"INSERT INTO orders VALUES {values(mine_orders)};\n"
         sql += f"INSERT INTO currencies VALUES {values(CURRENCIES)};\n"
-        if index == 0:
-            # shahrah reads its directory in its own region.
-            sql += "CREATE TABLE shahrah_directory (shard_key bytea PRIMARY KEY, " \
-                   "home_region text NOT NULL, moving_to text);\n"
-            sql += "INSERT INTO shahrah_directory VALUES " + ", ".join(
-                f"(convert_to('t{n:02d}', 'UTF8'), '{tenant_region(n)}')" for n in range(1, 13)) + ";\n"
+        sql += "GRANT ALL ON ALL TABLES IN SCHEMA public TO app;\n"
         psql(port, "fid", sql)
     psql(ports[0], "postgres", "DROP DATABASE IF EXISTS fid_truth; CREATE DATABASE fid_truth;")
     psql(ports[0], "fid_truth", SCHEMA
          + f"INSERT INTO users VALUES {values(users)};\n"
          + f"INSERT INTO orders VALUES {values(orders)};\n"
          + f"INSERT INTO currencies VALUES {values(CURRENCIES)};\n")
+    if "--csv" in sys.argv:
+        path = sys.argv[sys.argv.index("--csv") + 1]
+        with open(path, "w", encoding="utf-8") as placement:
+            for n in range(1, 13):
+                for table in ("users", "orders"):
+                    placement.write(f"{table},t{n:02d},{tenant_region(n)}\n")
     # Luxbyte's directory entries, for its config.
     for n in range(1, 13):
         for table in ("users", "orders"):

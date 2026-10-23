@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["postgresql", "sql", "parser", "sharding", "query-routing"]
+categories = ["database", "parser-implementations"]
 
 [features]
 # PostgreSQL's own parser, for statements sqlparser cannot read and to

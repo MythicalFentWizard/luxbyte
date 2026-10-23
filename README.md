@@ -1,8 +1,17 @@
-# Luxbyte
+# Luxbyte — a geo-distributed PostgreSQL proxy for multi-region Postgres
 
-A geo-distributed PostgreSQL proxy. Applications speak the ordinary PostgreSQL
-wire protocol to it; Luxbyte works out which region holds the rows a statement
-touches and sends it there.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-wire%20protocol%20v3-336791.svg)](https://www.postgresql.org/docs/current/protocol.html)
+
+**Luxbyte is an open-source PostgreSQL proxy, written in Rust, that keeps each
+user's data in their own region and routes every query to the region that
+holds its rows.** Applications speak the ordinary PostgreSQL wire protocol to
+it, with any driver or ORM; Luxbyte works out which region holds the rows a
+statement touches and sends it there. It does geo-partitioning, sharding by
+tenant or user key, data residency, connection pooling, read/write splitting
+and cross-region transactions in front of plain PostgreSQL, with no extension
+and no change to the database.
 
 Sharding by a hash puts a user's data wherever the hash lands. Luxbyte puts it
 where the user is, and keeps a directory so it can be moved later when they
@@ -13,6 +22,21 @@ single distant cluster is the speed of light and back.
 simple and the extended query protocol, authenticates them with SCRAM, routes
 their statements, merges scattered reads and commits across regions in two
 phases. See [Where it stands](#where-it-stands) for what is still missing.
+
+Use it for:
+
+- **Multi-region PostgreSQL** without a new database: plain PostgreSQL in
+  each region, one proxy endpoint for the application.
+- **Data residency and sovereignty** (GDPR and similar): a European user's
+  rows stay in the European region, and a key can be moved to another
+  region online with `RELOCATE`.
+- **Sharding PostgreSQL by tenant or user**, with a directory of where each
+  key lives instead of a fixed hash, and shards within a region.
+- **Low-latency reads and writes near the user**, scatter-gather queries
+  across regions with exact aggregates, `ORDER BY ... LIMIT` and joins on the
+  shard key, and two-phase commit when a write spans regions.
+- **Connection pooling, read replicas and failover-aware routing**, with
+  SCRAM authentication, TLS, Prometheus metrics and a live dashboard.
 
 ---
 
@@ -38,7 +62,8 @@ Luxbyte handles the hard half.
 | `users JOIN orders ON o.buyer = u.id` across regions | refuse | **refuse** — and say exactly why |
 
 See [docs/NUMBERS.md](docs/NUMBERS.md) for a measured head-to-head against
-shahrah on the same machine with the same statements.
+another geo-aware PostgreSQL proxy on the same machine with the same
+statements.
 
 The last two rows matter as much as the others. A `count(DISTINCT country)`
 cannot be rebuilt from per-region answers: the same country in two regions
@@ -451,20 +476,23 @@ every miss it analyses both the original and the normalised statement and
 caches the shape only if they agree. A bug in the normaliser costs a cache
 miss, never a wrong answer.
 
-Against shahrah, compiled into one process and run on one machine rather than
-compared across published figures: **3.3-4.3x faster cached**, and faster on
-all 23 statements cold even with PostgreSQL's parser checking each new one.
-It runs all 23 of those statements; shahrah runs 12, or 18 with its opt-in
-broadcast reads. On 51 statements over real data in three regions, Luxbyte
-gives PostgreSQL's answer 46 times and shahrah 22; neither gives a wrong one. In front of real PostgreSQL
-16 under pgbench, on one machine, Luxbyte ran **1.15x to 1.23x** shahrah's
-transactions per second, simple and prepared, one client and sixteen. Through
-the proxy end to end, a point read costs 21 µs over a direct connection on
-loopback. With three regions 75 and 110 ms apart, Luxbyte reads and writes at
-home 1.08–1.23x as fast as shahrah, matches it across a region, counts over
-every region in 113 ms to its 190, and inserts new keys it refuses. Method, variance, and the places shahrah is better:
-[docs/NUMBERS.md](docs/NUMBERS.md), reproducible via [`compare/`](compare)
-and `cargo bench`.
+Against the closest of the other alternatives, another open-source
+geo-aware PostgreSQL proxy, with both analysers compiled into one process on
+one machine rather than compared across published figures: **3.3-4.3x faster
+cached**, and faster on all 23 statements cold even with PostgreSQL's parser
+checking each new one. Luxbyte runs all 23 of those statements; the
+alternative runs 12, or 18 with its opt-in broadcast reads. On 51 statements
+over real data in three regions, Luxbyte gives PostgreSQL's answer 46 times
+and the alternative 22; neither gives a wrong one. In front of real
+PostgreSQL 16 under pgbench, on one machine, Luxbyte ran **1.15x to 1.23x**
+its transactions per second, simple and prepared, one client and sixteen.
+Through the proxy end to end, a point read costs 21 µs over a direct
+connection on loopback. With three regions 75 and 110 ms apart, Luxbyte reads
+and writes at home 1.08–1.23x as fast, matches it across a region, counts
+over every region in 113 ms to its 190, and inserts new keys it refuses.
+Method, variance, and the places other alternatives are better:
+[docs/NUMBERS.md](docs/NUMBERS.md), reproducible with `cargo bench` and the
+kits in [`compare/`](compare).
 
 ```bash
 cargo bench   # no database, no Docker, no testbed
@@ -573,6 +601,30 @@ cutover, an `OR` with one unconstrained branch, an aggregate hidden inside a
 `CASE` arm, a SCRAM server that does not hold the verifier, a `$9` inside a
 dollar-quoted string. None of them needs a running PostgreSQL, because a
 benchmark harness nobody can stand up is a benchmark nobody checks.
+
+## Similar tools, and how Luxbyte differs
+
+If you are looking for a PostgreSQL proxy, pooler or sharding layer, these
+are the usual alternatives, and where Luxbyte sits among them:
+
+- **Connection poolers** such as PgBouncer pool connections to one
+  PostgreSQL server. Luxbyte pools too, but its job is deciding *which*
+  server, in which region, a statement belongs to.
+- **Sharding proxies** such as pgcat and PgDog spread data over shards by a
+  hash of the key. Luxbyte keeps a directory of where each key lives, so a
+  key is placed in its user's region and can be moved later, and it hashes
+  only within a region's shards.
+- **Distributed PostgreSQL extensions** such as Citus spread tables across
+  the nodes of one cluster. Luxbyte needs no extension and treats each region
+  as its own ordinary PostgreSQL, which keeps every PostgreSQL feature and
+  tool working in each region.
+- **Distributed SQL databases** such as CockroachDB and YugabyteDB offer
+  multi-region placement as a different database that speaks the PostgreSQL
+  protocol. Luxbyte keeps PostgreSQL itself.
+- **Other geo-aware PostgreSQL proxies** keep a directory of home regions as
+  Luxbyte does; [docs/NUMBERS.md](docs/NUMBERS.md) compares Luxbyte with the
+  closest of them, statement by statement and under load, including where
+  it is still behind.
 
 ## Where it stands
 
@@ -706,13 +758,9 @@ plain request unanswered rather than reply in the clear.
 
 Alongside, not part of the proxy:
 
-- **[`compare/`](compare)** — both Luxbyte's and shahrah's routing analysis
-  compiled into one process, for a head-to-head with no cross-machine
-  arithmetic in it. Kept out of the workspace so that a plain `cargo test`
-  never has to fetch and build shahrah.
 - **[`compare/geo`](compare/geo)** — three regions a real round trip apart
-  on one machine, a Luxbyte and a shahrah proxy in each, pgbench latency
-  percentiles per workload.
+  on one machine, a proxy per region, pgbench latency percentiles per
+  workload, for Luxbyte and any other proxy.
 - **[`compare/fidelity`](compare/fidelity)** — 51 statements run through
   proxies on real data split across three PostgreSQL databases, each answer
   graded against one database holding every row.

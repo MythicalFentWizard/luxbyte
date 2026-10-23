@@ -1,16 +1,14 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-# Built on demand, not as part of the workspace: it depends on shahrah,
-# which needs libclang to build. See compare/README.md.
-exclude = ["compare"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-# repository = "https://github.com/YOUR-USERNAME/luxbyte"
+repository = "https://github.com/MythicalFentWizard/luxbyte"
+homepage = "https://github.com/MythicalFentWizard/luxbyte"
 authors = ["Luxbyte contributors"]
 
 [workspace.dependencies]
