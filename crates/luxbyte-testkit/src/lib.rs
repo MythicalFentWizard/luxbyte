@@ -32,14 +32,14 @@
 //! # }
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use luxbyte_proto::backend::{TransactionStatus, build};
-use luxbyte_proto::frontend::Frontend;
+use luxbyte_proto::frontend::{Format, Frontend, Target};
 use luxbyte_proto::startup::{SSL_REQUEST_CODE, StartupRequest};
 use luxbyte_proto::{Framed, Peer, ProtocolError};
 use parking_lot::Mutex;
@@ -183,6 +183,12 @@ impl BackendConfig {
 #[derive(Debug)]
 struct Observed {
     statements: Mutex<Vec<String>>,
+    /// Parameters bound to each statement run over the extended protocol.
+    bound: Mutex<Vec<(String, Vec<Option<String>>)>>,
+    /// Statements run inside an implicit transaction whose connection closed
+    /// before its `Sync`, which PostgreSQL rolls back.
+    abandoned: Mutex<Vec<String>>,
+    parses: AtomicU64,
     prepared: Mutex<BTreeMap<String, PreparedOutcome>>,
     connections: AtomicU64,
     live: AtomicU64,
@@ -197,6 +203,9 @@ impl Default for Observed {
         let (kill, _) = broadcast::channel(16);
         Self {
             statements: Mutex::new(Vec::new()),
+            bound: Mutex::new(Vec::new()),
+            abandoned: Mutex::new(Vec::new()),
+            parses: AtomicU64::new(0),
             prepared: Mutex::new(BTreeMap::new()),
             connections: AtomicU64::new(0),
             live: AtomicU64::new(0),
@@ -308,6 +317,30 @@ impl Backend {
             .count()
     }
 
+    /// The parameters each extended-protocol statement was run with, in
+    /// order. Binary values are rendered as hex, prefixed `\x` the way
+    /// PostgreSQL prints a `bytea`.
+    #[must_use]
+    pub fn bound(&self) -> Vec<(String, Vec<Option<String>>)> {
+        self.observed.bound.lock().clone()
+    }
+
+    /// Statements that ran inside an implicit transaction whose connection
+    /// closed before the `Sync` that would have committed it.
+    ///
+    /// PostgreSQL rolls these back, so they are how a test observes that
+    /// the proxy abandoned work rather than committing it.
+    #[must_use]
+    pub fn abandoned(&self) -> Vec<String> {
+        self.observed.abandoned.lock().clone()
+    }
+
+    /// How many `Parse` messages have arrived.
+    #[must_use]
+    pub fn parses(&self) -> u64 {
+        self.observed.parses.load(Ordering::SeqCst)
+    }
+
     /// Forgets the statement log.
     pub fn clear(&self) {
         self.observed.statements.lock().clear();
@@ -368,7 +401,112 @@ async fn session(
 ) -> Result<(), ProtocolError> {
     stream.set_nodelay(true)?;
     let mut framed = Framed::new(stream, Peer::Frontend);
+    if !startup(&mut framed, config).await? {
+        return Ok(());
+    }
 
+    let mut status = TransactionStatus::Idle;
+    let mut extended = Extended::default();
+    let mut kill = observed.kill.subscribe();
+    loop {
+        let read = tokio::select! {
+            result = framed.read_message() => result,
+            // Hang up mid-wait. Cancelling the read is safe because the
+            // connection is being abandoned either way.
+            _ = kill.recv() => {
+                extended.abandon(observed);
+                return Ok(());
+            }
+        };
+        let message = match read {
+            Ok(message) => message,
+            // The client hung up, which is how a pooled connection is
+            // normally retired.
+            Err(ProtocolError::Closed(_)) => {
+                extended.abandon(observed);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+
+        match Frontend::decode(&message)? {
+            Frontend::Query { sql } => {
+                observed.statements.lock().push(sql.to_owned());
+                if delay_or_vanish(sql, config).await {
+                    // Vanish mid-statement, with no reply at all.
+                    let mut stream = framed.into_inner();
+                    let _ = stream.shutdown().await;
+                    return Ok(());
+                }
+
+                let replies = answer(sql, config, observed, &mut status)?;
+                for reply in replies {
+                    framed.queue_raw(&reply);
+                }
+                framed.queue_raw(&build::ready_for_query(status)?);
+                framed.flush().await?;
+            }
+            Frontend::Terminate => {
+                extended.abandon(observed);
+                return Ok(());
+            }
+            Frontend::Sync => {
+                extended.sync(status);
+                framed.queue_raw(&build::ready_for_query(status)?);
+                framed.flush().await?;
+            }
+            Frontend::Flush => framed.flush().await?,
+            // After an error the server discards everything up to `Sync`.
+            Frontend::Parse(_)
+            | Frontend::Bind(_)
+            | Frontend::Describe { .. }
+            | Frontend::Execute { .. }
+            | Frontend::Close { .. }
+                if extended.skipping => {}
+            Frontend::Execute { portal, max_rows } => {
+                let Some(sql) = extended.portals.get(portal).map(|p| p.sql.clone()) else {
+                    extended.fail(
+                        &mut framed,
+                        "34000",
+                        &format!("portal \"{portal}\" does not exist"),
+                    )?;
+                    continue;
+                };
+                if delay_or_vanish(&sql, config).await {
+                    observed.statements.lock().push(sql);
+                    extended.abandon(observed);
+                    let mut stream = framed.into_inner();
+                    let _ = stream.shutdown().await;
+                    return Ok(());
+                }
+                for reply in extended.execute(portal, max_rows, config, observed, &mut status)? {
+                    framed.queue_raw(&reply);
+                }
+            }
+            Frontend::Parse(_)
+            | Frontend::Bind(_)
+            | Frontend::Describe { .. }
+            | Frontend::Close { .. } => {
+                observed_parse(&message, observed);
+                for reply in extended.prepare(&message, config)? {
+                    framed.queue_raw(&reply);
+                }
+            }
+            // Everything else the pool or the commit driver might send is
+            // acknowledged, so that a stray message cannot wedge a test.
+            _ => {
+                framed.queue_raw(&build::ready_for_query(status)?);
+                framed.flush().await?;
+            }
+        }
+    }
+}
+
+/// Runs the startup phase. Returns whether the client went on to a session.
+async fn startup(
+    framed: &mut Framed<TcpStream>,
+    config: &BackendConfig,
+) -> Result<bool, ProtocolError> {
     // The startup phase, including a possible TLS request first.
     let mut startup = framed.read_untagged().await?;
     if is_ssl_request(&startup) {
@@ -379,7 +517,7 @@ async fn session(
         startup = framed.read_untagged().await?;
     }
     let StartupRequest::Startup(parameters) = StartupRequest::decode(&startup)? else {
-        return Ok(());
+        return Ok(false);
     };
 
     if config.refuse_auth {
@@ -387,7 +525,7 @@ async fn session(
             build::ErrorBuilder::fatal("28P01", "password authentication failed").build()?;
         framed.queue_raw(&error);
         framed.flush().await?;
-        return Ok(());
+        return Ok(false);
     }
 
     // Trust authentication: enough to exercise the pool's handshake without
@@ -409,59 +547,243 @@ async fn session(
     framed.queue_raw(&build::backend_key_data(4_242, 2_424)?);
     framed.queue_raw(&build::ready_for_query(TransactionStatus::Idle)?);
     framed.flush().await?;
+    Ok(true)
+}
 
-    let mut status = TransactionStatus::Idle;
-    let mut kill = observed.kill.subscribe();
-    loop {
-        let read = tokio::select! {
-            result = framed.read_message() => result,
-            // Hang up mid-wait. Cancelling the read is safe because the
-            // connection is being abandoned either way.
-            _ = kill.recv() => return Ok(()),
-        };
-        let message = match read {
-            Ok(message) => message,
-            // The client hung up, which is how a pooled connection is
-            // normally retired.
-            Err(ProtocolError::Closed(_)) => return Ok(()),
-            Err(error) => return Err(error),
-        };
+/// Applies the configured delay, then says whether this statement is the
+/// one to hang up on.
+async fn delay_or_vanish(sql: &str, config: &BackendConfig) -> bool {
+    if let Some(delay) = config.delay {
+        tokio::time::sleep(delay).await;
+    }
+    config
+        .disconnect_on
+        .as_ref()
+        .is_some_and(|pattern| sql.contains(pattern))
+}
 
-        match Frontend::decode(&message)? {
-            Frontend::Query { sql } => {
-                observed.statements.lock().push(sql.to_owned());
+fn observed_parse(message: &luxbyte_proto::RawMessage, observed: &Observed) {
+    if matches!(Frontend::decode(message), Ok(Frontend::Parse(_))) {
+        observed.parses.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
-                if let Some(delay) = config.delay {
-                    tokio::time::sleep(delay).await;
-                }
-                if config
-                    .disconnect_on
-                    .as_ref()
-                    .is_some_and(|pattern| sql.contains(pattern))
-                {
-                    // Vanish mid-statement, with no reply at all.
-                    let mut stream = framed.into_inner();
-                    let _ = stream.shutdown().await;
-                    return Ok(());
-                }
+/// A bound portal.
+#[derive(Debug)]
+struct Portal {
+    sql: String,
+    parameters: Vec<Option<String>>,
+    /// Replies not yet sent, for an `Execute` with a row limit: the rows
+    /// still to come, then whatever ends the result.
+    cursor: Option<(VecDeque<Bytes>, Vec<Bytes>)>,
+}
 
-                let replies = answer(sql, config, observed, &mut status)?;
-                for reply in replies {
-                    framed.queue_raw(&reply);
-                }
-                framed.queue_raw(&build::ready_for_query(status)?);
-                framed.flush().await?;
-            }
-            Frontend::Terminate => return Ok(()),
-            // `Sync` ends an extended-query batch, and everything else the
-            // pool or the commit driver might send is acknowledged the same
-            // way, so that a stray message cannot wedge a test.
-            _ => {
-                framed.queue_raw(&build::ready_for_query(status)?);
-                framed.flush().await?;
-            }
+/// The extended-query state of one connection.
+#[derive(Debug, Default)]
+struct Extended {
+    statements: HashMap<String, String>,
+    portals: HashMap<String, Portal>,
+    /// Set after an error, until the next `Sync`.
+    skipping: bool,
+    /// Statements run since the last `Sync` outside an explicit
+    /// transaction: PostgreSQL's implicit transaction, which commits at the
+    /// `Sync` and is rolled back if the connection goes first.
+    implicit: Vec<String>,
+}
+
+impl Extended {
+    fn sync(&mut self, status: TransactionStatus) {
+        self.skipping = false;
+        self.implicit.clear();
+        // Portals end with their transaction.
+        if status == TransactionStatus::Idle {
+            self.portals.clear();
         }
     }
+
+    fn abandon(&mut self, observed: &Observed) {
+        observed
+            .abandoned
+            .lock()
+            .extend(std::mem::take(&mut self.implicit));
+    }
+
+    fn fail(
+        &mut self,
+        framed: &mut Framed<TcpStream>,
+        sqlstate: &str,
+        message: &str,
+    ) -> Result<(), ProtocolError> {
+        self.skipping = true;
+        framed.queue_raw(&build::ErrorBuilder::error(sqlstate, message).build()?);
+        Ok(())
+    }
+
+    /// Answers `Parse`, `Bind`, `Describe` and `Close`.
+    fn prepare(
+        &mut self,
+        message: &luxbyte_proto::RawMessage,
+        config: &BackendConfig,
+    ) -> Result<Vec<Bytes>, ProtocolError> {
+        let error = |this: &mut Self, sqlstate: &str, text: String| {
+            this.skipping = true;
+            Ok(vec![build::ErrorBuilder::error(sqlstate, text).build()?])
+        };
+        match Frontend::decode(message)? {
+            Frontend::Parse(parse) => {
+                if !parse.name.is_empty() && self.statements.contains_key(parse.name) {
+                    return error(
+                        self,
+                        "42P05",
+                        format!("prepared statement \"{}\" already exists", parse.name),
+                    );
+                }
+                self.statements
+                    .insert(parse.name.to_owned(), parse.sql.to_owned());
+                Ok(vec![build::parse_complete()?])
+            }
+            Frontend::Bind(bind) => {
+                let Some(sql) = self.statements.get(bind.statement).cloned() else {
+                    return error(
+                        self,
+                        "26000",
+                        format!("prepared statement \"{}\" does not exist", bind.statement),
+                    );
+                };
+                let parameters = render_parameters(&bind);
+                self.portals.insert(
+                    bind.portal.to_owned(),
+                    Portal {
+                        sql,
+                        parameters,
+                        cursor: None,
+                    },
+                );
+                Ok(vec![build::bind_complete()?])
+            }
+            Frontend::Describe { target, name } => {
+                let sql = match target {
+                    Target::Statement => self.statements.get(name).cloned(),
+                    Target::Portal => self.portals.get(name).map(|p| p.sql.clone()),
+                };
+                let Some(sql) = sql else {
+                    return error(self, "26000", format!("\"{name}\" does not exist"));
+                };
+                let mut out = Vec::new();
+                if target == Target::Statement {
+                    // Every placeholder is reported as `text`; a test that
+                    // needs another type declares it in the `Parse`.
+                    out.push(build::parameter_description(&vec![25; placeholders(&sql)])?);
+                }
+                out.push(describe_rows(&sql, config)?);
+                Ok(out)
+            }
+            Frontend::Close { target, name } => {
+                match target {
+                    Target::Statement => self.statements.remove(name),
+                    Target::Portal => self.portals.remove(name).map(|p| p.sql),
+                };
+                Ok(vec![build::close_complete()?])
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Answers an `Execute`.
+    fn execute(
+        &mut self,
+        portal_name: &str,
+        max_rows: i32,
+        config: &BackendConfig,
+        observed: &Observed,
+        status: &mut TransactionStatus,
+    ) -> Result<Vec<Bytes>, ProtocolError> {
+        let Some(portal) = self.portals.get_mut(portal_name) else {
+            return Ok(Vec::new());
+        };
+        if portal.cursor.is_none() {
+            observed.statements.lock().push(portal.sql.clone());
+            observed
+                .bound
+                .lock()
+                .push((portal.sql.clone(), portal.parameters.clone()));
+            if *status == TransactionStatus::Idle {
+                self.implicit.push(portal.sql.clone());
+            }
+            let replies = answer(&portal.sql, config, observed, status)?;
+            // An `Execute` never repeats the `RowDescription`; that is what
+            // `Describe` is for.
+            let (rows, tail): (Vec<Bytes>, Vec<Bytes>) = replies
+                .into_iter()
+                .filter(|reply| reply.first() != Some(&b'T'))
+                .partition(|reply| reply.first() == Some(&b'D'));
+            portal.cursor = Some((rows.into(), tail));
+        }
+        let Some((rows, tail)) = portal.cursor.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let limit = usize::try_from(max_rows).unwrap_or(0);
+        let mut out = Vec::new();
+        if limit > 0 && rows.len() > limit {
+            out.extend(rows.drain(..limit));
+            out.push(build::portal_suspended()?);
+            return Ok(out);
+        }
+        out.extend(rows.drain(..));
+        out.extend(tail.iter().cloned());
+        if tail.iter().any(|reply| reply.first() == Some(&b'E')) {
+            self.skipping = true;
+        }
+        Ok(out)
+    }
+}
+
+/// How many placeholders a statement uses, taken as the highest `$n`.
+fn placeholders(sql: &str) -> usize {
+    let mut highest = 0;
+    let mut rest = sql;
+    while let Some(at) = rest.find('$') {
+        let after = rest.get(at.saturating_add(1)..).unwrap_or("");
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        if let Ok(number) = digits.parse::<usize>() {
+            highest = highest.max(number);
+        }
+        rest = after;
+    }
+    highest
+}
+
+/// What a `Describe` reports about a statement's result columns.
+fn describe_rows(sql: &str, config: &BackendConfig) -> Result<Bytes, ProtocolError> {
+    let scripted = config
+        .scripted
+        .iter()
+        .find(|(pattern, _)| sql.contains(pattern.as_str()));
+    match scripted {
+        Some((_, Reply::Rows { columns, .. })) => {
+            let names: Vec<&str> = columns.iter().map(String::as_str).collect();
+            build::row_description(&names, 25)
+        }
+        _ => build::no_data(),
+    }
+}
+
+/// Renders bound parameters for the log: text as itself, binary as hex.
+fn render_parameters(bind: &luxbyte_proto::frontend::Bind<'_>) -> Vec<Option<String>> {
+    bind.parameters
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value.map(|bytes| match bind.parameter_format(index) {
+                Format::Text => String::from_utf8_lossy(bytes).into_owned(),
+                Format::Binary => bytes.iter().fold(String::from("\\x"), |mut out, byte| {
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "{byte:02x}");
+                    out
+                }),
+            })
+        })
+        .collect()
 }
 
 fn is_ssl_request(message: &luxbyte_proto::RawMessage) -> bool {

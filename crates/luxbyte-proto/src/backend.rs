@@ -214,6 +214,11 @@ pub enum Backend<'a> {
     EmptyQueryResponse,
     /// A `NoData`.
     NoData,
+    /// A `ParameterDescription`, answering a `Describe` of a statement.
+    ParameterDescription {
+        /// The datatype OID the server inferred for each placeholder.
+        types: Vec<i32>,
+    },
     /// Anything else, left opaque.
     Other {
         /// The tag byte.
@@ -273,6 +278,14 @@ impl<'a> Backend<'a> {
             }
             tag::EMPTY_QUERY_RESPONSE => Ok(Self::EmptyQueryResponse),
             tag::NO_DATA => Ok(Self::NoData),
+            tag::PARAMETER_DESCRIPTION => {
+                let count = count(r.i16()?)?;
+                let mut types = Vec::with_capacity(count.min(256));
+                for _ in 0..count {
+                    types.push(r.i32()?);
+                }
+                Ok(Self::ParameterDescription { types })
+            }
             other => Ok(Self::Other { tag: other }),
         }
     }
@@ -406,6 +419,41 @@ pub mod build {
     /// An `EmptyQueryResponse`.
     pub fn empty_query_response() -> Result<Bytes, ProtocolError> {
         Writer::tagged(tag::EMPTY_QUERY_RESPONSE).finish()
+    }
+
+    /// A `ParseComplete`.
+    pub fn parse_complete() -> Result<Bytes, ProtocolError> {
+        Writer::tagged(tag::PARSE_COMPLETE).finish()
+    }
+
+    /// A `BindComplete`.
+    pub fn bind_complete() -> Result<Bytes, ProtocolError> {
+        Writer::tagged(tag::BIND_COMPLETE).finish()
+    }
+
+    /// A `CloseComplete`.
+    pub fn close_complete() -> Result<Bytes, ProtocolError> {
+        Writer::tagged(tag::CLOSE_COMPLETE).finish()
+    }
+
+    /// A `NoData`, describing a statement that returns no rows.
+    pub fn no_data() -> Result<Bytes, ProtocolError> {
+        Writer::tagged(tag::NO_DATA).finish()
+    }
+
+    /// A `PortalSuspended`, ending an `Execute` that hit its row limit.
+    pub fn portal_suspended() -> Result<Bytes, ProtocolError> {
+        Writer::tagged(tag::PORTAL_SUSPENDED).finish()
+    }
+
+    /// A `ParameterDescription`.
+    pub fn parameter_description(types: &[i32]) -> Result<Bytes, ProtocolError> {
+        let mut w = Writer::tagged(tag::PARAMETER_DESCRIPTION);
+        w.count16(types.len())?;
+        for oid in types {
+            w.i32(*oid);
+        }
+        w.finish()
     }
 
     /// A `RowDescription` of all-text columns of the given type.
@@ -647,6 +695,17 @@ mod tests {
             panic!("expected a DataRow");
         };
         assert_eq!(columns, vec![Some(&b"eu-west"[..]), None, Some(&b""[..])]);
+    }
+
+    #[test]
+    fn parameter_descriptions_round_trip_their_types() {
+        let wire = build::parameter_description(&[23, 25]).unwrap();
+        assert_eq!(
+            Backend::decode(&as_raw(&wire)).unwrap(),
+            Backend::ParameterDescription {
+                types: vec![23, 25]
+            }
+        );
     }
 
     #[test]

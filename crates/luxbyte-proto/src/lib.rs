@@ -25,6 +25,7 @@ pub mod buf;
 pub mod error;
 pub mod frontend;
 pub mod startup;
+pub mod types;
 
 mod framed;
 mod raw;

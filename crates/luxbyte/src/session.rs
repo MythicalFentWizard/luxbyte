@@ -17,6 +17,8 @@ use tokio::net::TcpStream;
 use crate::merge::{RegionResult, merge};
 use crate::split::{SplitError, split_insert};
 
+mod extended;
+
 /// Everything shared between all sessions.
 #[derive(Debug)]
 pub struct Shared {
@@ -74,6 +76,8 @@ pub struct Session {
     transaction: Option<Transaction>,
     /// Advanced per read, to spread reads across a region's replicas.
     reads: usize,
+    /// Prepared statements, portals and the batch in progress.
+    extended: extended::State,
 }
 
 impl Session {
@@ -87,6 +91,7 @@ impl Session {
             settings: Vec::new(),
             transaction: None,
             reads: 0,
+            extended: extended::State::default(),
         };
         if session.startup().await? {
             session.serve().await?;
@@ -157,31 +162,25 @@ impl Session {
             match Frontend::decode(&message)? {
                 Frontend::Query { sql } => {
                     let sql = sql.to_owned();
+                    // A simple query ends an unfinished extended-query batch,
+                    // as it does on PostgreSQL.
+                    if self.extended.active() {
+                        self.end_batch().await?;
+                    }
                     self.handle_query(&sql).await?;
                 }
                 Frontend::Terminate => return Ok(()),
-                // The extended query protocol is not implemented yet. A
-                // clear refusal is better than silence: a client that waits
-                // for a reply it will never get looks like a hung database.
-                Frontend::Parse(_)
-                | Frontend::Bind(_)
-                | Frontend::Describe { .. }
-                | Frontend::Execute { .. }
-                | Frontend::Close { .. } => {
-                    self.error(&Refusal {
-                        sqlstate: "0A000".to_owned(),
-                        message: "the extended query protocol is not supported yet".to_owned(),
-                        hint: Some(
-                            "use simple query mode, for example by disabling prepared \
-                             statements in the client"
-                                .to_owned(),
-                        ),
-                        retryable: false,
-                    })?;
-                    self.ready().await?;
+                Frontend::Parse(parse) => self.on_parse(&parse)?,
+                Frontend::Bind(bind) => self.on_bind(&bind).await?,
+                Frontend::Describe { target, name } => self.on_describe(target, name).await?,
+                Frontend::Execute { portal, max_rows } => {
+                    self.on_execute(portal, max_rows).await?;
                 }
-                // `Sync` ends an extended-query batch; anything else is
-                // acknowledged so a stray message cannot wedge the session.
+                Frontend::Close { target, name } => self.on_close(target, name).await?,
+                Frontend::Sync => self.on_sync().await?,
+                Frontend::Flush => self.on_flush().await?,
+                // Anything else is acknowledged, so a stray message cannot
+                // wedge the session.
                 _ => self.ready().await?,
             }
         }
@@ -297,15 +296,7 @@ impl Session {
     ) -> Result<Result<(), Refusal>, SessionError> {
         match intent {
             LocalIntent::SessionState => {
-                let trimmed = sql.trim().trim_end_matches(';');
-                if trimmed.to_uppercase().starts_with("DISCARD") {
-                    self.settings.clear();
-                } else {
-                    // Replayed onto every backend this session later uses,
-                    // so that a session which moves between regions keeps
-                    // the settings it asked for.
-                    self.settings.push(trimmed.to_owned());
-                }
+                self.record_setting(sql);
                 self.command_complete("SET")?;
                 Ok(Ok(()))
             }
@@ -320,6 +311,18 @@ impl Session {
                 }
             }
             LocalIntent::TransactionControl(op) => self.transaction_control(op).await,
+        }
+    }
+
+    fn record_setting(&mut self, sql: &str) {
+        let trimmed = sql.trim().trim_end_matches(';');
+        if trimmed.to_uppercase().starts_with("DISCARD") {
+            self.settings.clear();
+        } else {
+            // Replayed onto every backend this session later uses, so that a
+            // session which moves between regions keeps the settings it
+            // asked for.
+            self.settings.push(trimmed.to_owned());
         }
     }
 
@@ -343,6 +346,18 @@ impl Session {
                     self.command_complete("COMMIT")?;
                     return Ok(Ok(()));
                 };
+                // Portals end with their transaction, however it ends.
+                self.extended.end_transaction();
+                // A failed transaction cannot commit. PostgreSQL rolls it
+                // back and says so in the tag; committing here would keep the
+                // statements that ran before a refusal the client was told
+                // had aborted the block.
+                if self.status == TransactionStatus::Failed {
+                    let _ = transaction.rollback().await;
+                    self.status = TransactionStatus::Idle;
+                    self.command_complete("ROLLBACK")?;
+                    return Ok(Ok(()));
+                }
                 let outcome = transaction.commit().await;
                 self.status = TransactionStatus::Idle;
                 match outcome {
@@ -362,6 +377,7 @@ impl Session {
             }
             TransactionOp::Rollback => {
                 if let Some(transaction) = self.transaction.take() {
+                    self.extended.end_transaction();
                     let _ = transaction.rollback().await;
                 }
                 self.status = TransactionStatus::Idle;
@@ -396,6 +412,14 @@ impl Session {
     ) -> Result<QueryResult, PoolError> {
         let statement = self.with_settings(sql);
         self.reads = self.reads.wrapping_add(1);
+        // Inside a transaction every region is enlisted on its primary: a
+        // participant opened on a replica because the first statement was a
+        // read would refuse every write after it.
+        let access = if self.transaction.is_some() {
+            Access::ReadWrite
+        } else {
+            access
+        };
         let pool = self
             .shared
             .pool_for(region, access, self.reads)

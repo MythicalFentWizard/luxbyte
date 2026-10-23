@@ -50,6 +50,15 @@ pub enum Format {
 }
 
 impl Format {
+    /// The `i16` the wire uses.
+    #[must_use]
+    pub const fn code(self) -> i16 {
+        match self {
+            Self::Text => 0,
+            Self::Binary => 1,
+        }
+    }
+
     /// Decodes the `i16` the wire uses, rejecting anything undefined.
     pub fn from_code(code: i16) -> Result<Self, ProtocolError> {
         match code {
@@ -312,6 +321,78 @@ pub fn parse(name: &str, sql: &str, parameter_types: &[i32]) -> Result<Bytes, Pr
     w.finish()
 }
 
+/// Builds a `Bind`.
+pub fn bind(
+    portal: &str,
+    statement: &str,
+    parameter_formats: &[Format],
+    parameters: &[Option<&[u8]>],
+    result_formats: &[Format],
+) -> Result<Bytes, ProtocolError> {
+    let mut w = Writer::tagged(tag::BIND);
+    w.cstr(portal);
+    w.cstr(statement);
+    w.count16(parameter_formats.len())?;
+    for format in parameter_formats {
+        w.i16(format.code());
+    }
+    w.count16(parameters.len())?;
+    for value in parameters {
+        w.nullable_bytes(*value)?;
+    }
+    w.count16(result_formats.len())?;
+    for format in result_formats {
+        w.i16(format.code());
+    }
+    w.finish()
+}
+
+impl Bind<'_> {
+    /// Re-encodes this `Bind` with its source statement renamed.
+    ///
+    /// The proxy re-parses a client's statement under a name of its own on
+    /// whichever backend connection it borrows, so the `Bind` has to point
+    /// there instead of at the name the client chose.
+    pub fn encode_from(&self, statement: &str) -> Result<Bytes, ProtocolError> {
+        bind(
+            self.portal,
+            statement,
+            &self.parameter_formats,
+            &self.parameters,
+            &self.result_formats,
+        )
+    }
+}
+
+/// Builds a `Describe`.
+pub fn describe(target: Target, name: &str) -> Result<Bytes, ProtocolError> {
+    let mut w = Writer::tagged(tag::DESCRIBE_OR_DATA_ROW);
+    w.u8(target.as_byte());
+    w.cstr(name);
+    w.finish()
+}
+
+/// Builds an `Execute`; a `max_rows` of `0` means no limit.
+pub fn execute(portal: &str, max_rows: i32) -> Result<Bytes, ProtocolError> {
+    let mut w = Writer::tagged(tag::EXECUTE_OR_ERROR);
+    w.cstr(portal);
+    w.i32(max_rows);
+    w.finish()
+}
+
+/// Builds a `Close`.
+pub fn close(target: Target, name: &str) -> Result<Bytes, ProtocolError> {
+    let mut w = Writer::tagged(tag::CLOSE_OR_COMMAND_COMPLETE);
+    w.u8(target.as_byte());
+    w.cstr(name);
+    w.finish()
+}
+
+/// Builds a `Flush`.
+pub fn flush() -> Result<Bytes, ProtocolError> {
+    Writer::tagged(tag::FLUSH).finish()
+}
+
 /// Builds a `Sync`.
 pub fn sync() -> Result<Bytes, ProtocolError> {
     Writer::tagged(tag::SYNC_OR_PARAMETER_STATUS).finish()
@@ -361,8 +442,8 @@ mod tests {
         assert_eq!(p.parameter_types, vec![23]);
     }
 
-    /// Hand-rolled because this crate never needs to *send* a `Bind`; the
-    /// proxy only ever reads one and relays the original bytes.
+    /// Hand-rolled rather than built with [`bind`], so that the decoder is
+    /// checked against bytes the encoder did not produce.
     fn bind_wire(params: &[Option<&[u8]>], formats: &[i16]) -> Bytes {
         let mut w = Writer::tagged(tag::BIND);
         w.cstr("");
@@ -439,6 +520,54 @@ mod tests {
             Frontend::decode(&raw).unwrap(),
             Frontend::Other { tag: b'@' }
         );
+    }
+
+    #[test]
+    fn a_rebound_bind_keeps_everything_but_the_statement_name() {
+        let wire = bind_wire(&[Some(b"tenant-42"), None], &[0, 1]);
+        let raw = decoded(&wire);
+        let Ok(Frontend::Bind(original)) = Frontend::decode(&raw) else {
+            panic!("expected Bind");
+        };
+        let rebound = decoded(&original.encode_from("luxbyte").unwrap());
+        let Ok(Frontend::Bind(copy)) = Frontend::decode(&rebound) else {
+            panic!("expected Bind");
+        };
+        assert_eq!(copy.statement, "luxbyte");
+        assert_eq!(copy.portal, original.portal);
+        assert_eq!(copy.parameters, original.parameters);
+        assert_eq!(copy.parameter_formats, original.parameter_formats);
+        assert_eq!(copy.result_formats, original.result_formats);
+    }
+
+    #[test]
+    fn describe_execute_and_close_round_trip() {
+        let raw = decoded(&describe(Target::Portal, "p1").unwrap());
+        assert_eq!(
+            Frontend::decode(&raw).unwrap(),
+            Frontend::Describe {
+                target: Target::Portal,
+                name: "p1"
+            }
+        );
+        let raw = decoded(&execute("p1", 50).unwrap());
+        assert_eq!(
+            Frontend::decode(&raw).unwrap(),
+            Frontend::Execute {
+                portal: "p1",
+                max_rows: 50
+            }
+        );
+        let raw = decoded(&close(Target::Statement, "s1").unwrap());
+        assert_eq!(
+            Frontend::decode(&raw).unwrap(),
+            Frontend::Close {
+                target: Target::Statement,
+                name: "s1"
+            }
+        );
+        let raw = decoded(&flush().unwrap());
+        assert_eq!(Frontend::decode(&raw).unwrap(), Frontend::Flush);
     }
 
     #[test]

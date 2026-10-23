@@ -10,6 +10,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::connection::{Connection, ConnectionTarget, Credentials, QueryResult};
 use crate::error::PoolError;
+use crate::pipeline::{Step, StepReply};
 
 /// How a pool behaves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,6 +271,18 @@ impl PooledConnection {
     pub async fn simple_query(&mut self, sql: &str) -> Result<QueryResult, PoolError> {
         let connection = self.connection.as_mut().ok_or(PoolError::Closed)?;
         connection.simple_query(sql).await
+    }
+
+    /// Sends extended-query messages; see [`Connection::pipeline`].
+    pub async fn pipeline(&mut self, steps: &[Step]) -> Result<Vec<StepReply>, PoolError> {
+        let connection = self.connection.as_mut().ok_or(PoolError::Closed)?;
+        connection.pipeline(steps).await
+    }
+
+    /// Which backend this connection goes to.
+    #[must_use]
+    pub fn target(&self) -> &ConnectionTarget {
+        &self.shared.target
     }
 
     /// The underlying connection.
