@@ -61,6 +61,11 @@ pub struct DirectoryStore {
     /// Milliseconds a move waits for the writes already under way and for
     /// each lock it takes, before giving up and leaving everything as it was.
     pub lock_timeout_ms: u64,
+    /// Record a key the first time a statement writes it, so that its reads
+    /// go to one region rather than asking every region. Off only for a
+    /// deployment whose existing rows the directory does not list yet, and
+    /// whose reads must keep finding them wherever they are.
+    pub record_new_keys: bool,
     /// Several proxies use this directory. Each then agrees every move with
     /// the others before making it, claims a new key before writing it, and
     /// stops routing on the directory when it cannot reach the others.
@@ -84,6 +89,7 @@ impl Default for DirectoryStore {
             table: "luxbyte_directory".to_owned(),
             hold_ms: 10_000,
             lock_timeout_ms: 5_000,
+            record_new_keys: true,
             shared: false,
             authority: None,
             poll_ms: 200,

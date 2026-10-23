@@ -100,6 +100,20 @@ impl Shared {
         Some(self.pools.pool(&target, credentials))
     }
 
+    /// Records keys a statement is about to write for the first time: with
+    /// other proxies, in the shared directory, where the first to claim a
+    /// key decides; alone, in the home region's copy of the directory.
+    ///
+    /// # Errors
+    ///
+    /// When the directory cannot be written.
+    pub async fn claim(&self, keys: &[(String, String)]) -> Result<(), Refusal> {
+        match &self.peers {
+            Some(peers) => peers.claim(self, keys).await,
+            None => crate::relocate::record(self, keys).await,
+        }
+    }
+
     /// Analyses a statement, or failing that, takes it as one a region
     /// hint routes.
     ///
@@ -700,12 +714,13 @@ impl Session {
                         // proxy's writes must not wait on the claim too.
                         drop(ticket);
                         claims = claims.saturating_add(1);
-                        let claimed = match &self.shared.peers {
-                            Some(peers) if claims <= 2 => peers.claim(&self.shared, &keys).await,
-                            _ => Err(Refusal::new(
+                        let claimed = if claims <= 2 {
+                            self.shared.claim(&keys).await
+                        } else {
+                            Err(Refusal::new(
                                 "XX000",
                                 "new keys were claimed but the statement still asks for them",
-                            )),
+                            ))
                         };
                         match claimed {
                             Ok(()) => continue,

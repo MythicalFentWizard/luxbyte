@@ -1226,6 +1226,91 @@ pub(crate) fn store_table(store: &DirectoryStore) -> String {
 
 // ----------------------------------------------------- the directory table
 
+/// Records keys written for the first time, each in the home shard it
+/// hashes to, in the home region's copy of the directory: the copy a proxy
+/// alone reads when it starts.
+///
+/// One statement per batch, `ON CONFLICT DO UPDATE` with no change, so
+/// PostgreSQL returns the row whether this inserted it or a move or an
+/// earlier run did, and a key already placed keeps its place.
+///
+/// # Errors
+///
+/// When the home region cannot be written.
+pub async fn record(shared: &Shared, keys: &[(String, String)]) -> Result<(), Refusal> {
+    let Some(store) = shared.moves.store() else {
+        // Without a table to record them in, they are known for this run.
+        for (table, key) in keys {
+            let region = shared.router.topology().new_key_region(key).to_owned();
+            shared.directory.place(table, key, &region);
+        }
+        return Ok(());
+    };
+    let topology = shared.router.topology();
+    let home = topology.home_region.clone();
+    let wanted: Vec<(String, String, String)> = keys
+        .iter()
+        .map(|(table, key)| {
+            (
+                table.clone(),
+                key.clone(),
+                topology.new_key_region(key).to_owned(),
+            )
+        })
+        .collect();
+    let values: Vec<String> = wanted
+        .iter()
+        .map(|(table, key, region)| {
+            format!(
+                "({}, {}, {})",
+                literal(table),
+                literal(key),
+                literal(region)
+            )
+        })
+        .collect();
+    let table = store_table(store);
+    let pool = shared
+        .pool_for(&home, Access::ReadWrite, 0)
+        .ok_or_else(|| fail("08000", format!("the home region {home} is not configured")))?;
+    let result = pool
+        .simple_query(&format!(
+            "INSERT INTO {table} AS d (table_name, shard_key, region) VALUES {} \
+             ON CONFLICT (table_name, shard_key) DO UPDATE SET region = d.region \
+             RETURNING table_name, shard_key, region",
+            values.join(", ")
+        ))
+        .await
+        .map_err(|error| region_error(&home, &error))?;
+    for (table, key, chosen) in &wanted {
+        let placed = result
+            .rows
+            .iter()
+            .find(|row| {
+                row.first().cloned().flatten().as_deref() == Some(table.as_str())
+                    && row.get(1).cloned().flatten().as_deref() == Some(key.as_str())
+            })
+            .and_then(|row| row.get(2).cloned().flatten())
+            // PostgreSQL returns every row; a backend that returned none
+            // still has the key where this proxy chose to put it.
+            .unwrap_or_else(|| chosen.clone());
+        if topology.region(&placed).is_none() {
+            return Err(fail(
+                "XX000",
+                format!("the directory puts {table} {key} in unknown region {placed}"),
+            ));
+        }
+        // A key a move has started on since stays held for the move.
+        if !matches!(
+            shared.directory.locate(table, key),
+            Location::Known(KeyState::Relocating { .. })
+        ) {
+            shared.directory.place(table, key, &placed);
+        }
+    }
+    Ok(())
+}
+
 /// Creates the directory table where it is missing and loads it from the
 /// home region. Returns how many keys it holds.
 ///
