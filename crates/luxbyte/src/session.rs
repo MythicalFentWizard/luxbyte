@@ -673,6 +673,13 @@ impl Session {
             }
             return Ok(true);
         }
+        if let Some(command) = crate::relocate::parse_rebalance(sql) {
+            match self.rebalance(command).await {
+                Ok(result) => self.respond(&result)?,
+                Err(refusal) => self.error(&refusal)?,
+            }
+            return Ok(true);
+        }
         Ok(false)
     }
 
@@ -733,33 +740,43 @@ impl Session {
         Ok(if drain { "DRAIN" } else { "UNDRAIN" })
     }
 
+    /// Checks that a command moving keys may run here: there is a durable
+    /// directory, the user is an operator, and no transaction is open.
+    fn may_move(&self, verb: &str) -> Result<(), Refusal> {
+        if self.shared.moves.store().is_none() {
+            return Err(
+                Refusal::new("55000", format!("{verb} needs a durable directory"))
+                    .with_hint("add a [directory_store] section"),
+            );
+        }
+        self.operator(verb)?;
+        if self.transaction.is_some() {
+            return Err(Refusal::new(
+                "25001",
+                format!("{verb} cannot run inside a transaction block"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Runs `REBALANCE`, for an operator.
+    async fn rebalance(
+        &mut self,
+        command: Result<crate::relocate::Rebalance, String>,
+    ) -> Result<QueryResult, Refusal> {
+        let command = command.map_err(|usage| Refusal::new("42601", usage))?;
+        self.may_move("REBALANCE")?;
+        tracing::info!(user = %self.user, from = %command.from, to = %command.to, limit = command.limit, "REBALANCE");
+        crate::relocate::rebalance(Arc::clone(&self.shared), command).await
+    }
+
     /// Runs `RELOCATE`, for an operator.
     async fn relocate(
         &mut self,
         command: Result<(String, String), String>,
     ) -> Result<QueryResult, Refusal> {
-        let refuse = |sqlstate: &str, message: String, hint: Option<&str>| Refusal {
-            sqlstate: sqlstate.to_owned(),
-            message,
-            hint: hint.map(ToOwned::to_owned),
-            retryable: false,
-        };
-        let (key, to) = command.map_err(|usage| refuse("42601", usage, None))?;
-        if self.shared.moves.store().is_none() {
-            return Err(refuse(
-                "55000",
-                "RELOCATE needs a durable directory".to_owned(),
-                Some("add a [directory_store] section"),
-            ));
-        }
-        self.operator("RELOCATE")?;
-        if self.transaction.is_some() {
-            return Err(refuse(
-                "25001",
-                "RELOCATE cannot run inside a transaction block".to_owned(),
-                None,
-            ));
-        }
+        let (key, to) = command.map_err(|usage| Refusal::new("42601", usage))?;
+        self.may_move("RELOCATE")?;
         let outcome =
             crate::relocate::relocate(Arc::clone(&self.shared), key.clone(), to.clone()).await;
         match &outcome {

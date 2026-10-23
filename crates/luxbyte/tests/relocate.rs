@@ -788,3 +788,79 @@ async fn a_prepared_write_waits_for_the_move_too() {
     );
     assert!(eu.bound().is_empty());
 }
+
+// -------------------------------------------------------------- REBALANCE
+
+const KEYS: &str = "SELECT k FROM (";
+
+#[tokio::test]
+async fn rebalance_moves_each_key_the_source_holds_with_its_own_relocate() {
+    let (eu, us, proxy) = start(
+        europe().reply_to(KEYS, Reply::rows(&["k"], &[&["alice"]])),
+        america(),
+        &sections(),
+    )
+    .await;
+    let mut ops = connect(&proxy, "ops").await;
+    let result = ops
+        .simple_query("REBALANCE eu-west TO us-east LIMIT 5")
+        .await
+        .expect("rebalance");
+    assert_eq!(result.columns, ["key", "rows", "state"]);
+    assert_eq!(rows(&result), [["alice", "3", "moved"]]);
+    // The keys come from the source's rows, across every geo-partitioned
+    // table, so keys the directory never recorded move too.
+    assert!(eu.saw(
+        "SELECT k FROM (SELECT DISTINCT \"tenant_id\"::text AS k FROM \"public\".\"orders\" UNION \
+         SELECT DISTINCT \"tenant_id\"::text AS k FROM \"public\".\"users\") AS keys WHERE k IS \
+         NOT NULL ORDER BY k LIMIT 5"
+    ));
+    assert_eq!(region_of(&proxy, "users", "alice"), resident("us-east"));
+    assert!(us.saw("INSERT INTO \"public\".\"users\""));
+}
+
+#[tokio::test]
+async fn rebalance_stops_at_the_first_key_that_cannot_move() {
+    // zoe is unknown to the directory and has rows in both regions, which
+    // RELOCATE refuses to guess about; nothing after her is tried.
+    let both = "\"tenant_id\" = E'zoe' LIMIT 1";
+    let (_eu, _us, proxy) = start(
+        europe()
+            .reply_to(KEYS, Reply::rows(&["k"], &[&["alice"], &["zoe"], &["zz"]]))
+            .reply_to(both, Reply::rows(&["?column?"], &[&["1"]])),
+        america().reply_to(both, Reply::rows(&["?column?"], &[&["1"]])),
+        &sections(),
+    )
+    .await;
+    let mut ops = connect(&proxy, "ops").await;
+    let result = ops
+        .simple_query("REBALANCE eu-west TO us-east")
+        .await
+        .expect("a report, not an error");
+    let rows = rows(&result);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0], ["alice", "3", "moved"]);
+    assert_eq!(rows[1][0], "zoe");
+    assert!(rows[1][2].starts_with("refused: "), "{rows:?}");
+    assert!(rows[1][2].contains("stopped here"), "{rows:?}");
+}
+
+#[tokio::test]
+async fn rebalance_is_for_operators_and_needs_two_regions() {
+    let (_eu, _us, proxy) = start(europe(), america(), &sections()).await;
+    let mut app = connect(&proxy, "app").await;
+    let error = app
+        .simple_query("REBALANCE eu-west TO us-east")
+        .await
+        .expect_err("not an operator");
+    assert_eq!(error.sqlstate(), Some("42501"), "{error}");
+    let mut ops = connect(&proxy, "ops").await;
+    for (sql, code) in [
+        ("REBALANCE eu-west TO eu-west", "22023"),
+        ("REBALANCE eu-west TO mars", "22023"),
+        ("REBALANCE eu-west", "42601"),
+    ] {
+        let error = ops.simple_query(sql).await.expect_err(sql);
+        assert_eq!(error.sqlstate(), Some(code), "{sql}: {error}");
+    }
+}

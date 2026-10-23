@@ -205,6 +205,146 @@ pub fn parse(sql: &str) -> Option<Result<(String, String), String>> {
     })
 }
 
+/// A `REBALANCE`: move up to `limit` keys from one region to another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rebalance {
+    /// Where the keys are.
+    pub from: String,
+    /// Where they go.
+    pub to: String,
+    /// The most keys to move.
+    pub limit: u64,
+}
+
+/// How many keys a `REBALANCE` without `LIMIT` moves: enough to matter,
+/// few enough that one command cannot hold an operator's terminal for long.
+const REBALANCE_DEFAULT: u64 = 100;
+
+/// Reads `REBALANCE <from> TO <to> [LIMIT <n>]`. `None` if the statement is
+/// something else; `Some(Err(_))` if it is a malformed `REBALANCE`.
+#[must_use]
+pub fn parse_rebalance(sql: &str) -> Option<Result<Rebalance, String>> {
+    let text = sql.trim().trim_end_matches(';').trim();
+    let first = text.split_whitespace().next()?;
+    if !first.eq_ignore_ascii_case("REBALANCE") {
+        return None;
+    }
+    let usage = "say it as: REBALANCE <from-region> TO <to-region> [LIMIT <keys>]".to_owned();
+    let Some(words) = words(text.get(first.len()..).unwrap_or_default()) else {
+        return Some(Err(usage));
+    };
+    let rebalance = |from: &str, to: &str, limit: u64| Rebalance {
+        from: from.to_owned(),
+        to: to.to_owned(),
+        limit,
+    };
+    Some(match words.as_slice() {
+        [from, word, to] if word.eq_ignore_ascii_case("TO") => {
+            Ok(rebalance(from, to, REBALANCE_DEFAULT))
+        }
+        [from, word, to, limit_word, limit]
+            if word.eq_ignore_ascii_case("TO") && limit_word.eq_ignore_ascii_case("LIMIT") =>
+        {
+            match limit.parse::<u64>() {
+                Ok(limit) if limit > 0 => Ok(rebalance(from, to, limit)),
+                _ => Err(usage),
+            }
+        }
+        _ => Err(usage),
+    })
+}
+
+/// Moves up to `limit` keys from one region to another, one `RELOCATE` at
+/// a time, and says what happened to each.
+///
+/// Each key moves atomically; the rebalance as a whole does not. It stops at
+/// the first key that cannot move, since what stopped it — a lock, a proxy
+/// that did not confirm — would most likely stop the next one too, and
+/// reports the keys moved before it.
+///
+/// The keys are read from the source's rows, in order, so a key whose rows
+/// predate the directory moves too.
+///
+/// # Errors
+///
+/// When the regions are wrong or the source cannot be read.
+pub async fn rebalance(shared: Arc<Shared>, command: Rebalance) -> Result<QueryResult, Refusal> {
+    let Rebalance { from, to, limit } = command;
+    let topology = shared.router.topology();
+    for region in [&from, &to] {
+        if topology.region(region).is_none() {
+            return Err(fail("22023", format!("there is no region \"{region}\"")));
+        }
+    }
+    if from == to {
+        return Err(fail("22023", "REBALANCE needs two different regions"));
+    }
+    let keys_query: Vec<String> = topology
+        .tables
+        .iter()
+        .filter_map(|policy| match &policy.placement {
+            Placement::GeoPartitioned { key } => Some(format!(
+                "SELECT DISTINCT {}::text AS k FROM {}.{}",
+                ident(key),
+                ident(&policy.schema),
+                ident(&policy.table)
+            )),
+            _ => None,
+        })
+        .collect();
+    if keys_query.is_empty() {
+        return Err(fail(
+            "55000",
+            "no table is geo_partitioned, so there is nothing to move",
+        ));
+    }
+    let pool = shared
+        .pool_for(&from, Access::ReadWrite, 0)
+        .ok_or_else(|| fail("08000", format!("region {from} is not configured")))?;
+    let found = pool
+        .simple_query(&format!(
+            "SELECT k FROM ({}) AS keys WHERE k IS NOT NULL ORDER BY k LIMIT {limit}",
+            keys_query.join(" UNION ")
+        ))
+        .await
+        .map_err(|error| region_error(&from, &error))?;
+    let keys: Vec<String> = found
+        .rows
+        .iter()
+        .filter_map(|row| row.first().cloned().flatten())
+        .collect();
+
+    let mut rows: Vec<Vec<Option<String>>> = Vec::with_capacity(keys.len());
+    for key in keys {
+        match relocate(Arc::clone(&shared), key.clone(), to.clone()).await {
+            Ok(report) => {
+                let moved: u64 = report.tables.iter().map(|table| table.rows).sum();
+                rows.push(vec![
+                    Some(key),
+                    Some(moved.to_string()),
+                    Some(report.state()),
+                ]);
+            }
+            Err(refusal) => {
+                rows.push(vec![
+                    Some(key),
+                    Some("0".to_owned()),
+                    Some(format!("refused: {}; stopped here", refusal.message)),
+                ]);
+                break;
+            }
+        }
+    }
+    Ok(QueryResult {
+        columns: ["key", "rows", "state"].map(ToOwned::to_owned).to_vec(),
+        // text, int8, text
+        type_oids: vec![25, 20, 25],
+        tags: vec![format!("SELECT {}", rows.len())],
+        rows,
+        ..QueryResult::default()
+    })
+}
+
 /// Splits on whitespace, reading `'quoted words'` with `''` for a quote.
 fn words(text: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
@@ -258,14 +398,20 @@ pub struct Report {
 }
 
 impl Report {
-    /// The report as a result set.
+    /// How the move ended, in a word or a few.
     #[must_use]
-    pub fn result(&self) -> QueryResult {
-        let state = if self.pending.is_empty() {
+    pub fn state(&self) -> String {
+        if self.pending.is_empty() {
             "moved".to_owned()
         } else {
             format!("moved; waiting for {} to confirm", self.pending.join(", "))
-        };
+        }
+    }
+
+    /// The report as a result set.
+    #[must_use]
+    pub fn result(&self) -> QueryResult {
+        let state = self.state();
         let rows: Vec<Vec<Option<String>>> = self
             .tables
             .iter()
@@ -1168,6 +1314,35 @@ mod tests {
             Some(Err(_))
         ));
         assert!(matches!(parse("RELOCATE a b TO c"), Some(Err(_))));
+    }
+
+    #[test]
+    fn rebalance_is_read_with_an_optional_limit() {
+        assert_eq!(
+            parse_rebalance("REBALANCE eu-west-1 TO eu-west-2;"),
+            Some(Ok(Rebalance {
+                from: "eu-west-1".to_owned(),
+                to: "eu-west-2".to_owned(),
+                limit: REBALANCE_DEFAULT,
+            }))
+        );
+        assert_eq!(
+            parse_rebalance("rebalance 'eu 1' to eu-2 limit 7"),
+            Some(Ok(Rebalance {
+                from: "eu 1".to_owned(),
+                to: "eu-2".to_owned(),
+                limit: 7,
+            }))
+        );
+        assert_eq!(parse_rebalance("RELOCATE alice TO us"), None);
+        for wrong in [
+            "REBALANCE a",
+            "REBALANCE a TO b LIMIT 0",
+            "REBALANCE a TO b LIMIT many",
+            "REBALANCE a b c",
+        ] {
+            assert!(matches!(parse_rebalance(wrong), Some(Err(_))), "{wrong}");
+        }
     }
 
     #[test]

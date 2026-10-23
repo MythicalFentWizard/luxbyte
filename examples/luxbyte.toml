@@ -97,6 +97,14 @@ id = "eu-west"
 primary = { host = "eu.db.internal" }
 replicas = [{ host = "eu-replica.db.internal" }]
 
+# A second shard in the same place: new keys created here are spread
+# across the shards of the home region's location by a hash of the key, and
+# REBALANCE eu-west TO eu-west-2 LIMIT 100 moves keys between them.
+# [[topology.regions]]
+# id = "eu-west-2"
+# location = "eu-west"
+# primary = { host = "eu2.db.internal" }
+
 [[topology.regions]]
 id = "us-east"
 primary = { host = "us.db.internal" }

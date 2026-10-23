@@ -619,11 +619,12 @@ impl Router {
                     if analysis.access.needs_primary() {
                         // A key nobody has seen is created where the client
                         // is. This is the whole premise: new rows land in
-                        // the region of whoever made them. With proxies in
-                        // several regions, the first to claim it decides.
+                        // the region of whoever made them — in one of its
+                        // shards, if it has several. With proxies in several
+                        // regions, the first to claim it decides.
                         match unclaimed.as_deref_mut() {
                             Some(keys) => keys.push((table.name.clone(), text)),
-                            None => found.push(self.topology.home_region.clone()),
+                            None => found.push(self.topology.new_key_region(&text).to_owned()),
                         }
                     } else {
                         // Reading a key with no directory entry: it may

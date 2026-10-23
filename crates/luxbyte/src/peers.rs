@@ -162,7 +162,6 @@ pub struct Peers {
     /// name.
     instance: String,
     authority: String,
-    home: String,
     poll: Duration,
     lease: Duration,
     store: Store,
@@ -217,7 +216,6 @@ impl Peers {
                 out
             }),
             authority,
-            home: home.to_owned(),
             poll: Duration::from_millis(config.poll_ms),
             lease: Duration::from_millis(config.lease_ms),
             store,
@@ -558,17 +556,29 @@ impl Peers {
         if self.fenced() {
             return Err(self.fence_refusal());
         }
+        let topology = shared.router.topology();
+        // Each in this proxy's home region, or the home shard it hashes to.
+        let wanted: Vec<(String, String, String)> = keys
+            .iter()
+            .map(|(table, key)| {
+                (
+                    table.clone(),
+                    key.clone(),
+                    topology.new_key_region(key).to_owned(),
+                )
+            })
+            .collect();
         let placed = match &self.store {
             Store::Postgres(tables) => {
                 let pool = self.pool(shared).map_err(|error| unreachable(&error))?;
-                let values: Vec<String> = keys
+                let values: Vec<String> = wanted
                     .iter()
-                    .map(|(table, key)| {
+                    .map(|(table, key, region)| {
                         format!(
                             "({}, {}, {})",
                             literal(table),
                             literal(key),
-                            literal(&self.home)
+                            literal(region)
                         )
                     })
                     .collect();
@@ -593,10 +603,9 @@ impl Peers {
                 triples(&result)
             }
             Store::Memory(memory) => memory
-                .claim(&self.node, keys, &self.home)
+                .claim(&self.node, &wanted)
                 .map_err(|error| unreachable(&error))?,
         };
-        let topology = shared.router.topology();
         for (table, key) in keys {
             let Some((_, _, region)) = placed
                 .iter()
@@ -1290,17 +1299,16 @@ impl MemoryPeers {
     fn claim(
         &self,
         node: &str,
-        keys: &[(String, String)],
-        region: &str,
+        keys: &[(String, String, String)],
     ) -> Result<Vec<(String, String, String)>, String> {
         let mut state = self.reach(node)?;
         Ok(keys
             .iter()
-            .map(|(table, key)| {
+            .map(|(table, key, region)| {
                 let placed = state
                     .directory
                     .entry((table.clone(), key.clone()))
-                    .or_insert_with(|| region.to_owned())
+                    .or_insert_with(|| region.clone())
                     .clone();
                 (table.clone(), key.clone(), placed)
             })
@@ -1478,9 +1486,9 @@ mod tests {
     #[test]
     fn the_first_claim_of_a_key_wins() {
         let memory = MemoryPeers::new();
-        let key = [("users".to_owned(), "carol".to_owned())];
-        let first = memory.claim("a", &key, "eu").unwrap();
-        let second = memory.claim("b", &key, "us").unwrap();
+        let key = |region: &str| [("users".to_owned(), "carol".to_owned(), region.to_owned())];
+        let first = memory.claim("a", &key("eu")).unwrap();
+        let second = memory.claim("b", &key("us")).unwrap();
         assert_eq!(first, second);
         assert_eq!(memory.region_of("users", "carol").as_deref(), Some("eu"));
     }
