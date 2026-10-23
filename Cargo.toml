@@ -1,0 +1,70 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# Built on demand, not as part of the workspace: it depends on shahrah,
+# which needs libclang to build. See compare/README.md.
+exclude = ["compare"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+# repository = "https://github.com/YOUR-USERNAME/meridian"
+authors = ["Meridian contributors"]
+
+[workspace.dependencies]
+meridian-proto = { path = "crates/meridian-proto", version = "0.1.0" }
+meridian-sql = { path = "crates/meridian-sql", version = "0.1.0" }
+meridian-core = { path = "crates/meridian-core", version = "0.1.0" }
+meridian-pool = { path = "crates/meridian-pool", version = "0.1.0" }
+meridian-txn = { path = "crates/meridian-txn", version = "0.1.0" }
+meridian-testkit = { path = "crates/meridian-testkit", version = "0.1.0" }
+
+base64 = "0.23.1"
+criterion = { version = "0.7.0", features = ["html_reports"] }
+bytes = "1.12.1"
+futures-util = "0.3.34"
+hmac = "0.13.0"
+md-5 = "0.11.0"
+parking_lot = "0.13.0"
+rand = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+sqlparser = { version = "0.63.0", features = ["visitor"] }
+subtle = "2.6.1"
+thiserror = "2.0.21"
+tokio = "1.54.1"
+tokio-util = "0.7.20"
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = "0.3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

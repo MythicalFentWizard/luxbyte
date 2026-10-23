@@ -1,0 +1,6 @@
+# table    key      region
+users      alice    eu-west
+users      bob      us-east
+users      chandra  ap-south
+orders     alice    eu-west
+orders     bob      us-east

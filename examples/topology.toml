@@ -1,0 +1,38 @@
+# A three-region deployment.
+home_region = "eu-west"
+
+[[regions]]
+id = "eu-west"
+primary = { host = "eu.db.internal" }
+replicas = [{ host = "eu-replica.db.internal" }]
+
+[[regions]]
+id = "us-east"
+primary = { host = "us.db.internal" }
+replicas = [{ host = "us-replica.db.internal" }]
+
+[[regions]]
+id = "ap-south"
+primary = { host = "ap.db.internal" }
+
+# Rows live in the region their tenant lives in.
+[[tables]]
+table = "users"
+placement = "geo_partitioned"
+key = "tenant_id"
+
+[[tables]]
+table = "orders"
+placement = "geo_partitioned"
+key = "tenant_id"
+
+# Small, read-mostly reference data: a full copy everywhere.
+[[tables]]
+table = "currencies"
+placement = "global_replicated"
+
+# Data that is not allowed to leave the EU.
+[[tables]]
+table = "eu_audit"
+placement = "pinned"
+region = "eu-west"

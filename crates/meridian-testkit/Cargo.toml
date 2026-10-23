@@ -1,0 +1,19 @@
+[package]
+name = "meridian-testkit"
+description = "An in-process PostgreSQL backend that speaks the real wire protocol, so the proxy can be tested without a database."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+bytes.workspace = true
+meridian-proto.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["full"] }
+
+[lints]
+workspace = true

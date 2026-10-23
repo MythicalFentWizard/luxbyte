@@ -1,0 +1,4 @@
+# Build output, at the workspace root and in compare/
+target/
+**/*.rs.bk
+*.pdb
