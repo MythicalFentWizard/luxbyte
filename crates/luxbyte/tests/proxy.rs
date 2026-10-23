@@ -755,3 +755,71 @@ async fn several_clients_are_served_at_once() {
     }
     assert!(f.eu.connections_accepted() <= 8);
 }
+
+#[tokio::test]
+async fn each_statement_of_a_batch_runs_only_where_it_was_routed() {
+    let f = fixture(&placed()).await;
+    let mut client = client(&f.proxy).await;
+    client
+        .simple_query(
+            "UPDATE users SET name = 'a' WHERE tenant_id = 'alice'; \
+             UPDATE users SET name = 'b' WHERE tenant_id = 'bob'",
+        )
+        .await
+        .expect("batch");
+    assert!(f.eu.saw("tenant_id = 'alice'"));
+    assert!(f.us.saw("tenant_id = 'bob'"));
+    // Bob's row lives in us-east; eu-west must never be sent his update.
+    assert!(!f.eu.saw("tenant_id = 'bob'"), "{:?}", f.eu.statements());
+    assert!(!f.us.saw("tenant_id = 'alice'"), "{:?}", f.us.statements());
+}
+
+#[tokio::test]
+async fn a_batch_is_one_transaction_so_a_failure_undoes_what_came_before() {
+    let f = fixture_with(
+        BackendConfig::new("eu-west").reply_to("boom", Reply::fail("23505", "duplicate key")),
+        BackendConfig::new("us-east"),
+        BackendConfig::new("ap-south"),
+        &placed(),
+    )
+    .await;
+    let mut client = client(&f.proxy).await;
+    let error = client
+        .simple_query(
+            "UPDATE users SET name = 'a' WHERE tenant_id = 'alice'; \
+             UPDATE users SET name = 'boom' WHERE tenant_id = 'alice'",
+        )
+        .await
+        .expect_err("the second statement fails");
+    assert_eq!(error.sqlstate(), Some("23505"));
+    // On PostgreSQL the first update would be rolled back with the second.
+    assert!(f.eu.saw("BEGIN"));
+    assert!(f.eu.saw("ROLLBACK"));
+    assert!(!f.eu.saw("COMMIT"));
+    assert_eq!(
+        client.status(),
+        luxbyte_proto::backend::TransactionStatus::Idle
+    );
+}
+
+#[tokio::test]
+async fn a_batch_across_regions_commits_in_two_phases() {
+    let f = fixture(&placed()).await;
+    let mut client = client(&f.proxy).await;
+    client
+        .simple_query(
+            "UPDATE users SET name = 'a' WHERE tenant_id = 'alice'; \
+             UPDATE users SET name = 'b' WHERE tenant_id = 'bob'",
+        )
+        .await
+        .expect("batch");
+    for backend in [&f.eu, &f.us] {
+        let prepared = backend.prepared_transactions();
+        assert_eq!(prepared.len(), 1, "{}", backend.name());
+        assert!(
+            prepared
+                .iter()
+                .all(|(_, outcome)| *outcome == PreparedOutcome::Committed)
+        );
+    }
+}
