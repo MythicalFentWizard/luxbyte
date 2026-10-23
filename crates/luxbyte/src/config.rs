@@ -22,6 +22,9 @@ pub struct Config {
     /// How clients authenticate.
     #[serde(default)]
     pub auth: crate::auth::AuthConfig,
+    /// The admin port: metrics, a snapshot, key lookup and a dashboard.
+    #[serde(default)]
+    pub admin: crate::admin::AdminConfig,
     /// Regions and table placement.
     pub topology: Topology,
     /// Keys to seed the directory with, for a deployment that does not yet

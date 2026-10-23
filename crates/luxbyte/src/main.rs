@@ -125,10 +125,14 @@ fn serve(arguments: &[String]) -> Result<String, String> {
 
         if config.server.commit_log.is_none() {
             tracing::warn!(
-                "no commit_log configured: a crash between prepare and commit will leave                  prepared transactions for an operator to resolve by hand"
+                "no commit_log configured: a crash between prepare and commit will leave \
+                 prepared transactions for an operator to resolve by hand"
             );
         }
 
+        if let Some(admin) = server.admin_addr() {
+            tracing::info!(%admin, "admin port listening: /metrics, /snapshot, /key, /");
+        }
         tracing::info!(%address, node = %config.server.node, "listening");
         server.serve().await;
         Ok::<String, String>(format!("stopped listening on {address}"))

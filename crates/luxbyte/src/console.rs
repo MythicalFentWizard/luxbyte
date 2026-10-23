@@ -191,7 +191,7 @@ fn show_in_doubt(shared: &Shared) -> QueryResult {
     table(&["transaction", "participants", "in_doubt_for"], rows)
 }
 
-fn where_is(shared: &Shared, table_name: &str, key: &str) -> QueryResult {
+pub(crate) fn where_is(shared: &Shared, table_name: &str, key: &str) -> QueryResult {
     let rows = match shared.directory.locate(table_name, key) {
         Location::Known(state) => {
             let (region, status) = describe(&state);

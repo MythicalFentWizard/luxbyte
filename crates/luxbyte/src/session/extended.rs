@@ -203,6 +203,8 @@ enum Output {
         relay: Relay,
         /// Remember the parameter types this `Describe` reports.
         learn: Option<StatementKey>,
+        /// For an `Execute`, when it was asked for, to time it.
+        started: Option<std::time::Instant>,
     },
 }
 
@@ -284,6 +286,7 @@ impl Session {
 
     /// Refuses the current message and discards the rest of the batch.
     fn refuse(&mut self, sequence: u64, refusal: &Refusal) -> Result<(), SessionError> {
+        self.shared.metrics.error(&refusal.sqlstate);
         let mut builder = build::ErrorBuilder::error(&refusal.sqlstate, refusal.message.clone());
         if let Some(hint) = &refusal.hint {
             builder = builder.hint(hint.clone());
@@ -701,8 +704,19 @@ impl Session {
         };
         match bound.destination {
             Destination::Backend(lane) => {
+                let region = match &lane {
+                    LaneId::Participant(region) | LaneId::Implicit { region, .. } => region,
+                };
+                let remote = *region != self.shared.router.topology().home_region;
+                self.shared.metrics.sent(region, remote);
                 let step = Step::new(StepKind::Execute, frontend::execute(portal, max_rows)?);
-                self.queue(sequence, &lane, step, Relay::Answer, None).await
+                self.queue(sequence, &lane, step, Relay::Answer, None)
+                    .await?;
+                // Timed from now until its answer is passed on.
+                if let Some((_, Output::Step { started, .. })) = self.extended.outputs.last_mut() {
+                    *started = Some(std::time::Instant::now());
+                }
+                Ok(())
             }
             Destination::Empty => {
                 self.owe(sequence, vec![build::empty_query_response()?]);
@@ -867,6 +881,7 @@ impl Session {
                         index,
                         relay: Relay::Quiet,
                         learn: None,
+                        started: None,
                     },
                 ));
                 self.flush_to(&lane, true).await?;
@@ -1098,6 +1113,7 @@ impl Session {
                 index,
                 relay,
                 learn,
+                started: None,
             },
         ));
     }
@@ -1240,6 +1256,7 @@ impl Session {
                     index,
                     relay,
                     learn,
+                    started,
                 } => {
                     if let Some(refusal) = lost {
                         self.client.queue_raw(&error_message(refusal)?);
@@ -1256,9 +1273,20 @@ impl Session {
                         self.learn(&key, reply);
                     }
                     if reply.failed {
+                        if let Some(code) = reply.messages.iter().find_map(|message| {
+                            match Backend::decode(message) {
+                                Ok(Backend::Error(notice)) => Some(notice.code().to_owned()),
+                                _ => None,
+                            }
+                        }) {
+                            self.shared.metrics.error(&code);
+                        }
                         self.fail_from(sequence);
                         failed_step = Some(index);
                         break;
+                    }
+                    if let Some(started) = started {
+                        self.shared.metrics.statement("extended", started.elapsed());
                     }
                 }
             }

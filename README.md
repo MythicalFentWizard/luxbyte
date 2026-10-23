@@ -399,9 +399,18 @@ on a reused connection. Once a two-phase commit's decision is durable, cancels
 no longer reach its participants, so a cancel cannot leave a committed
 transaction prepared.
 
+An admin port, off unless configured, serves Prometheus metrics at
+`/metrics` — statement latency by plan, errors by SQLSTATE, statements per
+region and how many left the home region, how each cross-region read was
+finished, transaction outcomes, pool occupancy — plus a JSON `/snapshot`,
+`/key/<table>/<key>` to say which region holds a user's rows, a dashboard at
+`/` that needs no JavaScript, and `/healthz`. It refuses to listen beyond
+loopback without a password; the password is compared in constant time, and
+repeated wrong answers lock an address out for longer each time.
+
 Not written yet:
 
-- Metrics, and TLS to the client.
+- TLS, to clients and to backends.
 
 Alongside, not part of the proxy:
 

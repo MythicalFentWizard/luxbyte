@@ -33,6 +33,24 @@ pub enum ServerError {
     /// The `[auth]` section is invalid.
     #[error("{0}")]
     Auth(#[from] crate::auth::AuthError),
+    /// The admin port would show the topology and where every user's data
+    /// lives, to anyone, on an address other machines reach.
+    #[error(
+        "the admin port {address} is reachable from other machines and has no password; set \
+         admin.password_env, or admin.open = true if something in front of it authenticates"
+    )]
+    AdminUnprotected {
+        /// The admin listen address.
+        address: String,
+    },
+    /// The admin port could not be opened.
+    #[error("could not listen on {address} for the admin port: {source}")]
+    AdminListen {
+        /// The address that was tried.
+        address: String,
+        /// Why it failed.
+        source: std::io::Error,
+    },
     /// The proxy would accept anyone, on an address other machines reach.
     #[error(
         "{address} is reachable from other machines and no client authentication is \
@@ -60,6 +78,8 @@ fn is_loopback(address: &str) -> bool {
 pub struct Server {
     shared: Arc<Shared>,
     listener: TcpListener,
+    /// The admin port and its password, when configured.
+    admin: Option<(TcpListener, Option<String>)>,
 }
 
 impl Server {
@@ -104,6 +124,7 @@ impl Server {
             auth,
             cancels: crate::cancel::CancelRegistry::new(),
             aggregates: parking_lot::Mutex::new(None),
+            metrics: crate::metrics::Metrics::default(),
         });
 
         let listener = TcpListener::bind(&config.server.listen)
@@ -113,7 +134,47 @@ impl Server {
                 source,
             })?;
 
-        Ok(Self { shared, listener })
+        let admin = match &config.admin.listen {
+            None => None,
+            Some(address) => {
+                let password = config.admin.password();
+                if password.is_none() && !config.admin.open && !is_loopback(address) {
+                    return Err(ServerError::AdminUnprotected {
+                        address: address.clone(),
+                    });
+                }
+                let admin_listener = TcpListener::bind(address).await.map_err(|source| {
+                    ServerError::AdminListen {
+                        address: address.clone(),
+                        source,
+                    }
+                })?;
+                Some((admin_listener, password))
+            }
+        };
+
+        Ok(Self {
+            shared,
+            listener,
+            admin,
+        })
+    }
+
+    /// Where the admin port is listening, if it is.
+    pub fn admin_addr(&self) -> Option<SocketAddr> {
+        self.admin
+            .as_ref()
+            .and_then(|(listener, _)| listener.local_addr().ok())
+    }
+
+    /// Starts the admin port in the background, if it is configured.
+    fn start_admin(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        let (listener, password) = self.admin.take()?;
+        let admin = Arc::new(crate::admin::Admin::new(
+            Arc::clone(&self.shared),
+            password.as_deref(),
+        ));
+        Some(tokio::spawn(crate::admin::serve(listener, admin)))
     }
 
     /// Where the proxy is listening.
@@ -150,7 +211,8 @@ impl Server {
     }
 
     /// Serves until the listener fails.
-    pub async fn serve(self) {
+    pub async fn serve(mut self) {
+        let _admin = self.start_admin();
         loop {
             let (stream, peer) = match self.listener.accept().await {
                 Ok(accepted) => accepted,
@@ -171,11 +233,19 @@ impl Server {
     }
 
     /// Serves in the background, returning a handle.
-    pub fn spawn(self) -> Result<ServerHandle, std::io::Error> {
+    pub fn spawn(mut self) -> Result<ServerHandle, std::io::Error> {
         let addr = self.local_addr()?;
+        let admin_addr = self.admin_addr();
+        let admin = self.start_admin();
         let shared = Arc::clone(&self.shared);
         let task = tokio::spawn(self.serve());
-        Ok(ServerHandle { addr, shared, task })
+        Ok(ServerHandle {
+            addr,
+            admin_addr,
+            shared,
+            task,
+            admin,
+        })
     }
 }
 
@@ -186,11 +256,19 @@ impl Server {
 #[derive(Debug)]
 pub struct ServerHandle {
     addr: SocketAddr,
+    admin_addr: Option<SocketAddr>,
     shared: Arc<Shared>,
     task: tokio::task::JoinHandle<()>,
+    admin: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ServerHandle {
+    /// Where the admin port is listening, if it is.
+    #[must_use]
+    pub const fn admin_addr(&self) -> Option<SocketAddr> {
+        self.admin_addr
+    }
+
     /// Where it is listening.
     #[must_use]
     pub const fn addr(&self) -> SocketAddr {
@@ -213,6 +291,9 @@ impl ServerHandle {
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         self.task.abort();
+        if let Some(admin) = &self.admin {
+            admin.abort();
+        }
     }
 }
 
