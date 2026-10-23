@@ -869,6 +869,9 @@ fn observed_parse(message: &luxbyte_proto::RawMessage, observed: &Observed) {
 struct Portal {
     sql: String,
     parameters: Vec<Option<String>>,
+    /// For the proxy's query that renders parameters as typed text, the
+    /// answer PostgreSQL would give.
+    rendered: Option<Vec<Option<String>>>,
     /// Replies not yet sent, for an `Execute` with a row limit: the rows
     /// still to come, then whatever ends the result.
     cursor: Option<(VecDeque<Bytes>, Vec<Bytes>)>,
@@ -877,7 +880,8 @@ struct Portal {
 /// The extended-query state of one connection.
 #[derive(Debug, Default)]
 struct Extended {
-    statements: HashMap<String, String>,
+    /// Statement text and declared parameter types, by name.
+    statements: HashMap<String, (String, Vec<i32>)>,
     portals: HashMap<String, Portal>,
     /// Set after an error, until the next `Sync`.
     skipping: bool,
@@ -934,12 +938,14 @@ impl Extended {
                         format!("prepared statement \"{}\" already exists", parse.name),
                     );
                 }
-                self.statements
-                    .insert(parse.name.to_owned(), parse.sql.to_owned());
+                self.statements.insert(
+                    parse.name.to_owned(),
+                    (parse.sql.to_owned(), parse.parameter_types.clone()),
+                );
                 Ok(vec![build::parse_complete()?])
             }
             Frontend::Bind(bind) => {
-                let Some(sql) = self.statements.get(bind.statement).cloned() else {
+                let Some((sql, types)) = self.statements.get(bind.statement).cloned() else {
                     return error(
                         self,
                         "26000",
@@ -947,11 +953,15 @@ impl Extended {
                     );
                 };
                 let parameters = render_parameters(&bind);
+                let rendered = sql
+                    .starts_with(RENDER_PREFIX)
+                    .then(|| render_typed(&bind, &types));
                 self.portals.insert(
                     bind.portal.to_owned(),
                     Portal {
                         sql,
                         parameters,
+                        rendered,
                         cursor: None,
                     },
                 );
@@ -959,7 +969,7 @@ impl Extended {
             }
             Frontend::Describe { target, name } => {
                 let sql = match target {
-                    Target::Statement => self.statements.get(name).cloned(),
+                    Target::Statement => self.statements.get(name).map(|(sql, _)| sql.clone()),
                     Target::Portal => self.portals.get(name).map(|p| p.sql.clone()),
                 };
                 let Some(sql) = sql else {
@@ -976,7 +986,7 @@ impl Extended {
             }
             Frontend::Close { target, name } => {
                 match target {
-                    Target::Statement => self.statements.remove(name),
+                    Target::Statement => self.statements.remove(name).map(|(sql, _)| sql),
                     Target::Portal => self.portals.remove(name).map(|p| p.sql),
                 };
                 Ok(vec![build::close_complete()?])
@@ -1006,7 +1016,16 @@ impl Extended {
             if *status == TransactionStatus::Idle {
                 self.implicit.push(portal.sql.clone());
             }
-            let replies = answer(&portal.sql, config, observed, status)?;
+            let replies = match &portal.rendered {
+                Some(values) => {
+                    let values: Vec<Option<&str>> = values.iter().map(Option::as_deref).collect();
+                    vec![
+                        build::data_row(&values)?,
+                        build::command_complete("SELECT 1")?,
+                    ]
+                }
+                None => answer(&portal.sql, config, observed, status)?,
+            };
             // An `Execute` never repeats the `RowDescription`; that is what
             // `Describe` is for.
             let (rows, tail): (Vec<Bytes>, Vec<Bytes>) = replies
@@ -1066,6 +1085,40 @@ fn describe_rows(sql: &str, config: &BackendConfig) -> Result<Bytes, ProtocolErr
         }
         _ => build::no_data(),
     }
+}
+
+/// How the proxy's parameter-rendering query begins.
+const RENDER_PREFIX: &str = "SELECT $1::text, pg_catalog.pg_typeof($1)::text";
+
+/// What PostgreSQL answers to the rendering query: each parameter as text,
+/// then its type's name. Binary values are decoded for the types the
+/// testkit knows; a parameter with no declared type is `text`, as the
+/// `Describe` reported.
+fn render_typed(bind: &luxbyte_proto::frontend::Bind<'_>, types: &[i32]) -> Vec<Option<String>> {
+    let mut out = Vec::with_capacity(bind.parameters.len().saturating_mul(2));
+    for (index, value) in bind.parameters.iter().enumerate() {
+        let oid = types.get(index).copied().unwrap_or(0);
+        out.push(value.map(|bytes| {
+            match bind.parameter_format(index) {
+                Format::Text => String::from_utf8_lossy(bytes).into_owned(),
+                Format::Binary => luxbyte_proto::types::text_from_binary(oid, bytes)
+                    .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
+            }
+        }));
+        out.push(Some(
+            match oid {
+                16 => "boolean",
+                20 => "bigint",
+                21 => "smallint",
+                23 => "integer",
+                1043 => "character varying",
+                2950 => "uuid",
+                _ => "text",
+            }
+            .to_owned(),
+        ));
+    }
+    out
 }
 
 /// Renders bound parameters for the log: text as itself, binary as hex.

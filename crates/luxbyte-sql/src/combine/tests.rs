@@ -46,6 +46,19 @@ fn each_region_is_asked_for_limit_plus_offset_and_the_rest_is_done_once() {
 }
 
 #[test]
+fn a_bound_limit_written_in_as_a_typed_literal_is_a_constant() {
+    let (region, finish) =
+        rows("SELECT id FROM users ORDER BY id LIMIT (E'10'::bigint) OFFSET ('2'::int4)");
+    assert_eq!(region, "SELECT id FROM users ORDER BY id LIMIT 12");
+    assert_eq!(finish.limit, Some(10));
+    assert_eq!(finish.offset, 2);
+    let (_, finish) = rows("SELECT id FROM users ORDER BY id LIMIT (NULL::bigint)");
+    assert_eq!(finish.limit, None);
+    // A cast to a type a LIMIT does not take is PostgreSQL's to refuse.
+    assert!(refused("SELECT id FROM users LIMIT ('3'::text)").contains("constant"));
+}
+
+#[test]
 fn an_offset_without_a_limit_is_removed_from_the_regions() {
     let (region, finish) = rows("SELECT id FROM users ORDER BY id OFFSET 5");
     assert_eq!(region, "SELECT id FROM users ORDER BY id");

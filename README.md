@@ -406,13 +406,24 @@ routes each statement on the key bound to it at `Bind`, including keys bound in
 binary once their type is declared or reported by a `Describe`. The proxy keeps
 prepared statements itself and re-parses them on whichever backend connection a
 `Bind` is routed to, so a statement prepared once runs in any region. An error
-discards the rest of the batch and rolls it back, as on one server. What it
+discards the rest of the batch and rolls it back, as on one server.
+
+A prepared statement that spans regions — a read to combine, a write to commit
+in two phases, a multi-row `INSERT` to split by key — runs through the same
+code as a simple query, with each parameter written into the text as a literal
+of its own type. PostgreSQL renders the values and names their types
+(`$1::text, pg_typeof($1)`), so the literal means exactly what the parameter
+did, binary or text, whatever its type. The answer goes back in the formats
+the client asked for, binary ones encoded by the home region, and a
+row-limited `Execute` gets it a part at a time. A batch outside a transaction
+that writes across regions runs, from that statement on, in a transaction the
+proxy commits in two phases at the `Sync`: still all or nothing. What it
 refuses, it refuses with a reason:
 
-- a single statement whose plan spans regions (scatter-gather and split writes
-  are simple-protocol only for now);
-- a batch that writes to two regions outside a transaction, which could not
-  commit atomically — inside `BEGIN`/`COMMIT` it commits in two phases;
+- a batch outside a transaction that has already written to one region and
+  then writes to, or reads across, others: what it wrote is not in any
+  transaction the proxy could commit with the rest, or would read back —
+  inside `BEGIN`/`COMMIT` both work;
 - `COPY`.
 
 Clients authenticate with SCRAM-SHA-256 against PostgreSQL's own stored

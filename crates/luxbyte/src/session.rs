@@ -793,6 +793,21 @@ impl Session {
         regions: &[String],
         sql: &str,
     ) -> Result<Result<(), Refusal>, SessionError> {
+        Ok(match self.scatter_result(regions, sql).await? {
+            Ok(result) => {
+                self.respond(&result)?;
+                Ok(())
+            }
+            Err(refusal) => Err(refusal),
+        })
+    }
+
+    /// Reads from several regions and combines the answers into one.
+    pub(crate) async fn scatter_result(
+        &mut self,
+        regions: &[String],
+        sql: &str,
+    ) -> Result<Result<QueryResult, Refusal>, SessionError> {
         // Always planned, even when the analysis saw nothing to combine: a
         // function it did not recognise may be an aggregate the database
         // knows about, and computing that per region returns each region's
@@ -821,17 +836,10 @@ impl Session {
             Ok(answers) => answers,
             Err(refusal) => return Ok(Err(refusal)),
         };
-        let finished = match &plan.finish {
+        Ok(match &plan.finish {
             Finish::Rows(finish) => self.finish_rows(answers, finish).await?,
             Finish::Aggregate(finish) => self.finish_aggregates(&answers, finish).await?,
-        };
-        match finished {
-            Ok(result) => {
-                self.respond(&result)?;
-                Ok(Ok(()))
-            }
-            Err(refusal) => Ok(Err(refusal)),
-        }
+        })
     }
 
     /// Runs one statement in every region and collects the answers, in
@@ -1053,6 +1061,28 @@ impl Session {
         sql: &str,
         regions: &[String],
     ) -> Result<Result<(), Refusal>, SessionError> {
+        Ok(
+            match self.distributed_result(analysis, sql, regions).await? {
+                Ok(result) => {
+                    self.respond(&result)?;
+                    Ok(())
+                }
+                Err(refusal) => Err(refusal),
+            },
+        )
+    }
+
+    /// Writes to several regions: inside the open transaction if there is
+    /// one, otherwise as a transaction of its own, committed in two phases.
+    ///
+    /// Rows a `RETURNING` clause produces come back from every region, in
+    /// region order; PostgreSQL promises no order for them either.
+    pub(crate) async fn distributed_result(
+        &mut self,
+        analysis: &StatementAnalysis,
+        sql: &str,
+        regions: &[String],
+    ) -> Result<Result<QueryResult, Refusal>, SessionError> {
         // An INSERT has to be split: broadcasting it would write every row
         // in every region.
         let per_region = if analysis.kind == luxbyte_sql::StatementKind::Insert {
@@ -1072,27 +1102,35 @@ impl Session {
                 .collect()
         };
 
+        let mut combined = QueryResult::default();
+        let mut affected = 0_usize;
+        let mut gather = |result: QueryResult| {
+            affected = affected.saturating_add(rows_affected(&result));
+            if combined.columns.is_empty() && !result.columns.is_empty() {
+                combined.columns = result.columns;
+                combined.type_oids = result.type_oids;
+            }
+            combined.rows.extend(result.rows);
+        };
+
         // Inside an explicit transaction the client decides when to commit.
         if self.transaction.is_some() {
-            let mut affected = 0_usize;
             for part in &per_region {
                 match self
                     .run_on(&part.region, Access::ReadWrite, &part.sql)
                     .await
                 {
-                    Ok(result) => affected = affected.saturating_add(rows_affected(&result)),
+                    Ok(result) => gather(result),
                     Err(error) => return Ok(Err(to_refusal(&error))),
                 }
             }
-            let tag = command_tag(analysis, affected);
-            self.command_complete(&tag)?;
-            return Ok(Ok(()));
+            combined.tags = vec![command_tag(analysis, affected)];
+            return Ok(Ok(combined));
         }
 
         // Otherwise the statement is its own transaction.
         let mut transaction = self.shared.coordinator.begin();
         transaction.cancel_with(&self.cancel);
-        let mut affected = 0_usize;
         for part in &per_region {
             let Some(pool) = self.pool_for(&part.region, Access::ReadWrite, 0) else {
                 // Leaving a region out would commit the rest of the write
@@ -1111,7 +1149,7 @@ impl Session {
                 return Ok(Err(txn_refusal(&error)));
             }
             match transaction.execute(&part.region, &statement).await {
-                Ok(result) => affected = affected.saturating_add(rows_affected(&result)),
+                Ok(result) => gather(result),
                 Err(error) => {
                     self.rollback(transaction).await;
                     return Ok(Err(txn_refusal(&error)));
@@ -1121,9 +1159,8 @@ impl Session {
 
         match self.commit(transaction).await {
             Ok(_) => {
-                let tag = command_tag(analysis, affected);
-                self.command_complete(&tag)?;
-                Ok(Ok(()))
+                combined.tags = vec![command_tag(analysis, affected)];
+                Ok(Ok(combined))
             }
             Err(error) => Ok(Err(txn_refusal(&error))),
         }

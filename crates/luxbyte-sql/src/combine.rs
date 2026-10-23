@@ -428,8 +428,21 @@ fn take_limits(query: &mut Query) -> Result<(Option<u64>, u64), Unsupported> {
 
 fn constant(expr: &Expr, clause: &str) -> Result<u64, Unsupported> {
     match expr {
+        // A bound parameter arrives as a literal cast to its type, and
+        // brackets change nothing.
+        Expr::Nested(inner) => constant(inner, clause),
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } if is_whole_number_type(data_type) => constant(inner, clause),
         Expr::Value(value) => match &value.value {
-            Value::Number(text, _) => text
+            // A quoted number is an `unknown` literal, which PostgreSQL
+            // reads as the `bigint` the clause takes.
+            Value::Number(text, _)
+            | Value::SingleQuotedString(text)
+            | Value::EscapedStringLiteral(text) => text
+                .trim()
                 .parse::<u64>()
                 .map_err(|_| Unsupported(format!("{clause} must be a non-negative whole number"))),
             _ => unsupported(format!("{clause} must be a constant")),
@@ -441,7 +454,19 @@ fn constant(expr: &Expr, clause: &str) -> Result<u64, Unsupported> {
 }
 
 fn is_null(expr: &Expr) -> bool {
-    matches!(expr, Expr::Value(value) if value.value == Value::Null)
+    match expr {
+        Expr::Nested(inner) | Expr::Cast { expr: inner, .. } => is_null(inner),
+        Expr::Value(value) => value.value == Value::Null,
+        _ => false,
+    }
+}
+
+/// Whether a cast to this type leaves a whole number a `LIMIT` takes.
+fn is_whole_number_type(data_type: &sqlparser::ast::DataType) -> bool {
+    matches!(
+        data_type.to_string().to_ascii_lowercase().as_str(),
+        "bigint" | "integer" | "int" | "smallint" | "int2" | "int4" | "int8"
+    )
 }
 
 // ------------------------------------------------------------ aggregates
@@ -1044,6 +1069,24 @@ pub fn source(columns: &[(String, Vec<Option<String>>)]) -> String {
         .collect();
     let names: Vec<String> = (1..=columns.len()).map(|n| format!("c{n}")).collect();
     format!("unnest({}) AS p({})", arrays.join(", "), names.join(", "))
+}
+
+/// Like [`source`], with each row numbered so that a query over it can keep
+/// the rows in the order given: `unnest(...) WITH ORDINALITY AS p(c1, ...,
+/// n)`.
+#[must_use]
+pub fn ordered_source(columns: &[(String, Vec<Option<String>>)]) -> String {
+    let arrays: Vec<String> = columns
+        .iter()
+        .map(|(type_name, values)| format!("{}::{type_name}[]", array_literal(values)))
+        .collect();
+    let mut names: Vec<String> = (1..=columns.len()).map(|n| format!("c{n}")).collect();
+    names.push("n".to_owned());
+    format!(
+        "unnest({}) WITH ORDINALITY AS p({})",
+        arrays.join(", "),
+        names.join(", ")
+    )
 }
 
 /// An array literal of text values, as an escape string so that it means

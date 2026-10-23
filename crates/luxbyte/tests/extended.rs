@@ -380,12 +380,13 @@ async fn a_binary_key_routes_once_a_describe_has_reported_its_type() {
 }
 
 #[tokio::test]
-async fn a_binary_key_of_unknown_type_is_not_guessed_at() {
+async fn a_binary_key_of_unknown_type_is_written_everywhere_rather_than_guessed() {
     let f = fixture().await;
     let mut client = client(&f.proxy).await;
 
     // No declared type and no Describe: the proxy cannot read the key, so
-    // the write's region is unknown — and it says so instead of picking one.
+    // the write goes to every region, where it changes only the rows that
+    // match — and commits in two phases.
     let replies = client
         .pipeline(&[
             parse("", "UPDATE users SET name = 'x' WHERE tenant_id = $1"),
@@ -395,10 +396,11 @@ async fn a_binary_key_of_unknown_type_is_not_guessed_at() {
         ])
         .await
         .expect("pipeline");
-    assert_eq!(tags(&replies), ["1", "E", "", "Z"]);
-    assert_eq!(error_code(&replies).as_deref(), Some("0A000"));
-    assert!(!f.eu.saw("UPDATE"));
-    assert!(!f.us.saw("UPDATE"));
+    assert_eq!(tags(&replies), ["1", "2", "C", "Z"]);
+    for backend in [&f.eu, &f.us] {
+        assert!(backend.saw("UPDATE users SET name = 'x' WHERE tenant_id = (E'bob'::text)"));
+        assert_eq!(backend.prepared_transactions().len(), 1);
+    }
 }
 
 // ------------------------------------------------------------------ errors
@@ -532,26 +534,274 @@ async fn an_error_in_one_region_stops_the_batch_before_the_next_region() {
     assert!(!f.us.saw(SELECT_USER));
 }
 
+// ------------------------------------------------------- across regions
+
+fn bind_formats(portal: &str, statement: &str, values: &[&str], results: &[Format]) -> Step {
+    let values: Vec<Option<&[u8]>> = values.iter().map(|v| Some(v.as_bytes())).collect();
+    Step::new(
+        StepKind::Bind,
+        frontend::bind(portal, statement, &[], &values, results).unwrap(),
+    )
+}
+
+/// The values of every `DataRow` in the answers, as text.
+fn data(replies: &[StepReply]) -> Vec<Vec<String>> {
+    replies
+        .iter()
+        .flat_map(|reply| &reply.messages)
+        .filter_map(|message| match Message::decode(message) {
+            Ok(Message::DataRow { columns }) => Some(
+                columns
+                    .iter()
+                    .map(|value| String::from_utf8_lossy(value.unwrap_or_default()).into_owned())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+fn ids(region: &str, ids: &[&str]) -> BackendConfig {
+    let rows: Vec<Vec<Option<&str>>> = ids.iter().map(|id| vec![Some(*id)]).collect();
+    let rows: Vec<&[Option<&str>]> = rows.iter().map(Vec::as_slice).collect();
+    BackendConfig::new(region).reply_to("SELECT id FROM users", Reply::typed(&[("id", 23)], &rows))
+}
+
 #[tokio::test]
-async fn a_statement_spanning_regions_is_refused_with_a_hint() {
-    let f = fixture().await;
+async fn a_read_across_regions_is_combined_over_the_extended_protocol() {
+    let f = fixture_with(
+        ids("eu-west", &["1", "4"]),
+        ids("us-east", &["2", "3"]),
+        false,
+    )
+    .await;
     let mut client = client(&f.proxy).await;
 
     let replies = client
         .pipeline(&[
+            // A limit is a bigint, as PostgreSQL would infer.
+            parse_typed("", "SELECT id FROM users ORDER BY id LIMIT $1", &[20]),
+            bind("", "", &["3"]),
+            describe_portal(""),
+            execute("", 0),
+            sync(),
+        ])
+        .await
+        .expect("pipeline");
+    assert_eq!(tags(&replies), ["1", "2", "T", "DDDC", "Z"]);
+    // Merged in order across the regions, then limited — the bound limit
+    // written in as a literal of its own type.
+    assert_eq!(data(&replies), [["1"], ["2"], ["3"]]);
+    assert!(f.us.saw("ORDER BY id LIMIT 3"));
+}
+
+#[tokio::test]
+async fn a_combined_read_can_be_fetched_a_few_rows_at_a_time() {
+    let f = fixture_with(ids("eu-west", &["1"]), ids("us-east", &["2"]), false).await;
+    let mut client = client(&f.proxy).await;
+
+    client.simple_query("BEGIN").await.unwrap();
+    let replies = client
+        .pipeline(&[
             parse("", "SELECT id FROM users"),
+            bind("p", "", &[]),
+            execute("p", 1),
+            sync(),
+        ])
+        .await
+        .expect("first part");
+    assert_eq!(tags(&replies), ["1", "2", "Ds", "Z"]);
+    let replies = client
+        .pipeline(&[execute("p", 1), sync()])
+        .await
+        .expect("second part");
+    assert_eq!(tags(&replies), ["Ds", "Z"]);
+    let replies = client
+        .pipeline(&[execute("p", 1), sync()])
+        .await
+        .expect("the end");
+    assert_eq!(tags(&replies), ["C", "Z"]);
+    client.simple_query("COMMIT").await.unwrap();
+}
+
+#[tokio::test]
+async fn binary_results_across_regions_are_encoded_by_the_home_region() {
+    let f = fixture_with(
+        ids("eu-west", &["1"]).reply_to(
+            "WITH ORDINALITY",
+            Reply::typed(&[("c1", 23)], &[&[Some("binary-1")], &[Some("binary-2")]]),
+        ),
+        ids("us-east", &["2"]),
+        false,
+    )
+    .await;
+    let mut client = client(&f.proxy).await;
+    let replies = client
+        .pipeline(&[
+            parse("", "SELECT id FROM users"),
+            bind_formats("", "", &[], &[Format::Binary]),
+            execute("", 0),
+            sync(),
+        ])
+        .await
+        .expect("pipeline");
+    assert_eq!(tags(&replies), ["1", "2", "DDC", "Z"]);
+    // The rows carried home as typed arrays, in order, and encoded there.
+    assert!(f.eu.saw(
+        "SELECT p.c1 FROM unnest(E'{\"1\",\"2\"}'::int4[]) WITH ORDINALITY AS p(c1, n) ORDER BY p.n"
+    ));
+    assert_eq!(data(&replies), [["binary-1"], ["binary-2"]]);
+}
+
+#[tokio::test]
+async fn a_write_across_regions_outside_a_transaction_commits_with_its_batch_in_two_phases() {
+    let f = fixture_with(
+        BackendConfig::new("eu-west").reply_to(
+            "UPDATE users",
+            Reply::Done {
+                tag: "UPDATE 2".to_owned(),
+            },
+        ),
+        BackendConfig::new("us-east").reply_to(
+            "UPDATE users",
+            Reply::Done {
+                tag: "UPDATE 3".to_owned(),
+            },
+        ),
+        false,
+    )
+    .await;
+    let mut client = client(&f.proxy).await;
+    let replies = client
+        .pipeline(&[
+            parse("", "UPDATE users SET name = $1"),
+            bind("", "", &["it's \\ fine"]),
+            execute("", 0),
+            parse("", SELECT_USER),
+            bind("", "", &["bob"]),
+            execute("", 0),
+            sync(),
+        ])
+        .await
+        .expect("pipeline");
+    assert_eq!(tags(&replies), ["1", "2", "C", "1", "2", "C", "Z"]);
+    let complete = replies
+        .get(2)
+        .and_then(|reply| reply.messages.first())
+        .map(|message| match Message::decode(message) {
+            Ok(Message::CommandComplete { tag }) => tag.to_owned(),
+            other => panic!("{other:?}"),
+        });
+    assert_eq!(complete.as_deref(), Some("UPDATE 5"));
+    assert_eq!(client.status(), TransactionStatus::Idle);
+    for backend in [&f.eu, &f.us] {
+        // Quotes and backslashes survive the trip as a literal.
+        assert!(backend.saw("UPDATE users SET name = (E'it''s \\\\ fine'::text)"));
+        let prepared = backend.prepared_transactions();
+        assert_eq!(prepared.len(), 1, "{prepared:?}");
+        assert_eq!(prepared[0].1, PreparedOutcome::Committed);
+    }
+    // The read that followed ran inside the same transaction.
+    assert!(f.us.saw(SELECT_USER));
+}
+
+#[tokio::test]
+async fn a_failure_later_in_the_batch_rolls_back_a_write_across_regions() {
+    let f = fixture_with(
+        BackendConfig::new("eu-west").reply_to("boom", Reply::fail("23505", "duplicate key")),
+        BackendConfig::new("us-east"),
+        false,
+    )
+    .await;
+    let mut client = client(&f.proxy).await;
+    let replies = client
+        .pipeline(&[
+            parse("", "UPDATE users SET name = 'x'"),
+            bind("", "", &[]),
+            execute("", 0),
+            parse("", "UPDATE users SET name = 'boom' WHERE tenant_id = $1"),
+            bind("", "", &["alice"]),
+            execute("", 0),
+            sync(),
+        ])
+        .await
+        .expect("pipeline");
+    assert_eq!(error_code(&replies).as_deref(), Some("23505"));
+    for backend in [&f.eu, &f.us] {
+        assert!(backend.saw("UPDATE users SET name = 'x'"));
+        assert!(backend.prepared_transactions().is_empty());
+        assert!(backend.saw("ROLLBACK"));
+    }
+    assert_eq!(client.status(), TransactionStatus::Idle);
+    assert!(client.simple_query("SELECT 1").await.is_ok());
+}
+
+#[tokio::test]
+async fn a_multi_row_insert_with_parameters_is_split_by_key() {
+    let f = fixture().await;
+    let mut client = client(&f.proxy).await;
+    let replies = client
+        .pipeline(&[
+            parse(
+                "",
+                "INSERT INTO users (tenant_id, name) VALUES ($1, 'a'), ($2, 'b')",
+            ),
+            bind("", "", &["alice", "bob"]),
+            execute("", 0),
+            sync(),
+        ])
+        .await
+        .expect("pipeline");
+    assert_eq!(tags(&replies), ["1", "2", "C", "Z"]);
+    assert!(f.eu.saw("VALUES ((E'alice'::TEXT), 'a')"));
+    assert!(!f.eu.saw("bob"));
+    assert!(f.us.saw("VALUES ((E'bob'::TEXT), 'b')"));
+    assert!(!f.us.saw("'alice'"));
+}
+
+#[tokio::test]
+async fn a_batch_that_wrote_outside_a_transaction_cannot_then_write_elsewhere() {
+    let f = fixture().await;
+    let mut client = client(&f.proxy).await;
+    let replies = client
+        .pipeline(&[
+            parse("", INSERT_USER),
+            bind("", "", &["alice"]),
+            execute("", 0),
+            parse("", "UPDATE users SET name = 'y'"),
             bind("", "", &[]),
             execute("", 0),
             sync(),
         ])
         .await
         .expect("pipeline");
-    assert_eq!(tags(&replies), ["1", "E", "", "Z"]);
     assert_eq!(error_code(&replies).as_deref(), Some("0A000"));
-    assert!(error_message(&replies).contains("spans regions"));
+    assert!(error_message(&replies).contains("has written outside a transaction"));
+    assert!(!f.us.saw("UPDATE"));
+}
 
-    // The session is fine afterwards.
-    assert!(client.simple_query("SELECT 1").await.is_ok());
+#[tokio::test]
+async fn inside_a_transaction_a_write_across_regions_waits_for_commit() {
+    let f = fixture().await;
+    let mut client = client(&f.proxy).await;
+    client.simple_query("BEGIN").await.unwrap();
+    let replies = client
+        .pipeline(&[
+            parse("", "DELETE FROM users WHERE name = $1"),
+            bind("", "", &["gone"]),
+            execute("", 0),
+            sync(),
+        ])
+        .await
+        .expect("pipeline");
+    assert_eq!(tags(&replies), ["1", "2", "C", "Z"]);
+    assert_eq!(client.status(), TransactionStatus::InTransaction);
+    assert!(f.eu.prepared_transactions().is_empty());
+    client.simple_query("COMMIT").await.unwrap();
+    for backend in [&f.eu, &f.us] {
+        assert!(backend.saw("DELETE FROM users WHERE name = (E'gone'::text)"));
+        assert_eq!(backend.prepared_transactions().len(), 1);
+    }
 }
 
 #[tokio::test]

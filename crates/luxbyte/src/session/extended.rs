@@ -37,15 +37,30 @@
 //!   that would commit it. Its connection is dropped instead, which
 //!   PostgreSQL treats as a rollback.
 //!
+//! # Statements across regions
+//!
+//! A statement whose plan spans regions — a read to combine, a write to
+//! commit in two phases — is run by the same code as a simple query, with
+//! its parameters written into the text as literals of their own types.
+//! PostgreSQL renders each value and names its type (`$1::text,
+//! pg_typeof($1)`), so the literal means exactly what the parameter did,
+//! whatever its type or format. The answer is sent in the formats the
+//! client asked for; binary ones are encoded by the home region, which
+//! knows every type's binary form.
+//!
+//! A write across regions outside a transaction opens one for the rest of
+//! the batch, committed in two phases at the `Sync`, so the batch stays all
+//! or nothing as PostgreSQL promises.
+//!
 //! # What is refused
 //!
-//! A batch outside a transaction may read from any number of regions but
-//! write to only one: atomicity across two would need two-phase commit,
-//! which only an explicit transaction gets. A statement whose plan spans
-//! regions is refused too, because scatter-gather and split writes are built
-//! on the simple protocol's text results. Both refusals say what to do.
+//! A batch outside a transaction that has already written to one region
+//! cannot then write to another, since what it wrote is not part of any
+//! transaction the proxy can commit atomically with the rest; nor can it
+//! read across regions, which would miss what it wrote. Both refusals say
+//! what to do.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -112,8 +127,31 @@ enum Destination {
     Local(LocalIntent),
     /// A console command's result, computed at `Bind`.
     Console(QueryResult),
+    /// Across regions, through the simple protocol's machinery.
+    Spread(Arc<Spread>),
     /// Nothing to run.
     Empty,
+}
+
+/// A statement spanning regions, with its parameters written in.
+#[derive(Debug)]
+struct Spread {
+    /// The statement, every parameter a literal of its own type.
+    sql: String,
+    regions: Vec<String>,
+    write: bool,
+    /// The format the client asked for each result column in.
+    formats: Vec<Format>,
+}
+
+/// What a spread statement produced and has not yet sent, for an
+/// `Execute` that asks for some rows at a time.
+#[derive(Debug, Default)]
+struct Answer {
+    rows: VecDeque<Bytes>,
+    tag: String,
+    /// Whether an earlier `Execute` stopped at its row limit.
+    suspended: bool,
 }
 
 /// A portal the client bound.
@@ -240,6 +278,12 @@ pub(super) struct State {
     /// A portal can run in a later batch of the same transaction, so inside
     /// one they last until it ends.
     writes: Vec<crate::relocate::Ticket>,
+    /// Answers to spread statements still being fetched, by portal.
+    answers: HashMap<String, Answer>,
+    /// The open transaction was begun by the proxy for this batch, to
+    /// commit a write across regions atomically with the rest of it, and
+    /// ends at the `Sync`.
+    implicit: bool,
 }
 
 impl State {
@@ -264,6 +308,8 @@ impl State {
     pub(super) fn end_transaction(&mut self) {
         self.portals.clear();
         self.writes.clear();
+        self.answers.clear();
+        self.implicit = false;
         self.lanes
             .retain(|lane| !matches!(lane.id, LaneId::Participant(_)));
     }
@@ -469,21 +515,11 @@ impl Session {
             ),
             Plan::Local(intent) => return Ok(Ok(Destination::Local(intent))),
             Plan::Refuse(refusal) => return Ok(Err(refusal)),
-            Plan::ScatterGather { regions, .. } | Plan::Distributed { regions } => {
-                return Ok(Err(Refusal {
-                    sqlstate: "0A000".to_owned(),
-                    message: format!(
-                        "the statement spans regions {}, which the extended query protocol \
-                         does not support yet",
-                        regions.join(", ")
-                    ),
-                    hint: Some(
-                        "bind a shard key that names one region, or send this statement as a \
-                         simple query"
-                            .to_owned(),
-                    ),
-                    retryable: false,
-                }));
+            Plan::ScatterGather { regions, .. } => {
+                return self.spread(statement, bind, regions, false).await;
+            }
+            Plan::Distributed { regions } => {
+                return self.spread(statement, bind, regions, true).await;
             }
             // Parameters were supplied, so the planner has what it asked for.
             Plan::NeedsParameters { .. } => {
@@ -556,6 +592,7 @@ impl Session {
                         self.owe(sequence, vec![reply]);
                         Ok(())
                     }
+                    Destination::Spread(spread) => self.describe_spread(sequence, spread).await,
                     Destination::Local(_) | Destination::Empty => {
                         self.owe(sequence, vec![build::no_data()?]);
                         Ok(())
@@ -737,6 +774,10 @@ impl Session {
                 self.owe(sequence, vec![build::empty_query_response()?]);
                 Ok(())
             }
+            Destination::Spread(spread) => {
+                self.execute_spread(sequence, portal, &spread, max_rows)
+                    .await
+            }
             Destination::Console(result) => {
                 let mut messages = Vec::with_capacity(result.rows.len().saturating_add(1));
                 for row in &result.rows {
@@ -782,6 +823,19 @@ impl Session {
             return Ok(());
         }
 
+        if op == TransactionOp::Begin && self.extended.implicit {
+            return self.refuse(
+                sequence,
+                &Refusal {
+                    hint: Some("send a Sync before BEGIN".to_owned()),
+                    ..plain(
+                        "0A000",
+                        "BEGIN after a write across regions in the same extended-query batch \
+                         is not supported",
+                    )
+                },
+            );
+        }
         if op == TransactionOp::Begin
             && self.transaction.is_none()
             && self
@@ -838,6 +892,7 @@ impl Session {
                 self.journal(sequence, Undo::Statement(name.to_owned(), previous));
             }
             Target::Portal => {
+                self.extended.answers.remove(name);
                 let previous = self.extended.portals.remove(name);
                 let lane = previous
                     .as_ref()
@@ -956,9 +1011,13 @@ impl Session {
             // to the pool if it is clean and retires it if not.
         }
 
+        if self.extended.implicit {
+            self.end_implicit().await?;
+        }
         if self.transaction.is_none() {
             self.extended.portals.clear();
             self.extended.writes.clear();
+            self.extended.answers.clear();
             self.status = TransactionStatus::Idle;
         }
         self.extended.skipping = false;
@@ -985,6 +1044,460 @@ impl Session {
             lane.unnamed = None;
         }
         self.extended.lanes = lanes;
+        Ok(())
+    }
+
+    // ------------------------------------------------------ across regions
+
+    /// Plans a statement spanning regions: writes its parameters in, and
+    /// opens a transaction for the batch if a write needs one.
+    async fn spread(
+        &mut self,
+        statement: &Statement,
+        bind: &Bind<'_>,
+        regions: Vec<String>,
+        write: bool,
+    ) -> Result<Result<Destination, Refusal>, SessionError> {
+        if self.transaction.is_none() {
+            if self.extended.lanes.iter().any(|lane| lane.writes) {
+                let what = if write {
+                    "write to more regions"
+                } else {
+                    "read across regions, which would not see what it wrote"
+                };
+                return Ok(Err(Refusal {
+                    hint: Some(
+                        "send a Sync first, or wrap the batch in BEGIN and COMMIT".to_owned(),
+                    ),
+                    ..plain(
+                        "0A000",
+                        format!(
+                            "this extended-query batch has written outside a transaction, and \
+                             cannot then {what}"
+                        ),
+                    )
+                }));
+            }
+            if write {
+                // Everything the batch does from here commits together, in
+                // two phases, at the `Sync`.
+                let mut transaction = self.shared.coordinator.begin();
+                transaction.cancel_with(&self.cancel);
+                self.transaction = Some(transaction);
+                self.extended.implicit = true;
+            }
+        }
+        let sql = match self.literal_sql(statement, bind).await? {
+            Ok(sql) => sql,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        Ok(Ok(Destination::Spread(Arc::new(Spread {
+            sql,
+            regions,
+            write,
+            formats: bind.result_formats.clone(),
+        }))))
+    }
+
+    /// The statement's text with each parameter replaced by a literal of
+    /// its own type, rendered by PostgreSQL in the home region.
+    async fn literal_sql(
+        &mut self,
+        statement: &Statement,
+        bind: &Bind<'_>,
+    ) -> Result<Result<String, Refusal>, SessionError> {
+        let count = bind.parameters.len();
+        if count == 0 {
+            return Ok(Ok(statement.sql().to_owned()));
+        }
+        let home = self.shared.router.topology().home_region.clone();
+        let Some(pool) = self.pool_for(&home, Access::ReadOnly, 0) else {
+            return Ok(Err(unconfigured(&home)));
+        };
+        let mut connection = match pool.acquire().await {
+            Ok(connection) => connection,
+            Err(error) => return Ok(Err(to_refusal(&error))),
+        };
+        connection.join(&self.cancel);
+
+        let types = match self
+            .parameter_types(&mut connection, statement, count)
+            .await?
+        {
+            Ok(types) => types,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+
+        let columns: Vec<String> = (1..=count)
+            .map(|n| format!("${n}::text, pg_catalog.pg_typeof(${n})::text"))
+            .collect();
+        let steps = [
+            Step::new(
+                StepKind::Parse,
+                frontend::parse("", &format!("SELECT {}", columns.join(", ")), &types)?,
+            ),
+            Step::new(
+                StepKind::Bind,
+                frontend::bind("", "", &bind.parameter_formats, &bind.parameters, &[])?,
+            ),
+            Step::new(StepKind::Execute, frontend::execute("", 0)?),
+            Step::new(StepKind::Sync, frontend::sync()?),
+        ];
+        let replies = match connection.pipeline(&steps).await {
+            Ok(replies) => replies,
+            Err(error) => return Ok(Err(to_refusal(&error))),
+        };
+        if let Some(refusal) = failure(&replies) {
+            return Ok(Err(refusal));
+        }
+        let rendered: Vec<Option<String>> = replies
+            .get(2)
+            .into_iter()
+            .flat_map(|reply| &reply.messages)
+            .find_map(|message| match Backend::decode(message) {
+                Ok(Backend::DataRow { columns }) => Some(
+                    columns
+                        .into_iter()
+                        .map(|value| value.map(|bytes| String::from_utf8_lossy(bytes).into_owned()))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let literals: Vec<String> = rendered
+            .chunks(2)
+            .map(|pair| match pair {
+                [value, Some(type_name)] => match value {
+                    Some(value) => format!("({}::{type_name})", escape_literal(value)),
+                    None => format!("(NULL::{type_name})"),
+                },
+                _ => "NULL".to_owned(),
+            })
+            .collect();
+        if literals.len() != count {
+            return Ok(Err(plain(
+                "XX000",
+                "the parameters could not be rendered as literals",
+            )));
+        }
+        Ok(luxbyte_sql::statements::substitute(statement.sql(), &literals).map_err(|number| {
+            plain(
+                "08P01",
+                format!("the statement refers to ${number}, but the Bind supplied {count} parameters"),
+            )
+        }))
+    }
+
+    /// The types a statement's parameters have: declared, learned from a
+    /// `Describe`, or else asked of `connection` now.
+    async fn parameter_types(
+        &mut self,
+        connection: &mut PooledConnection,
+        statement: &Statement,
+        count: usize,
+    ) -> Result<Result<Vec<i32>, Refusal>, SessionError> {
+        let mut types: Vec<i32> = (0..count)
+            .map(|index| statement.declared().get(index).copied().unwrap_or(0))
+            .collect();
+        if types.contains(&0) {
+            if !self.extended.learned.contains_key(&statement.key) {
+                let steps = [
+                    Step::new(
+                        StepKind::Parse,
+                        frontend::parse("", statement.sql(), statement.declared())?,
+                    ),
+                    Step::new(
+                        StepKind::DescribeStatement,
+                        frontend::describe(Target::Statement, "")?,
+                    ),
+                    Step::new(StepKind::Sync, frontend::sync()?),
+                ];
+                let replies = match connection.pipeline(&steps).await {
+                    Ok(replies) => replies,
+                    Err(error) => return Ok(Err(to_refusal(&error))),
+                };
+                if let Some(refusal) = failure(&replies) {
+                    return Ok(Err(refusal));
+                }
+                if let Some(reply) = replies.get(1) {
+                    self.learn(&statement.key, reply);
+                }
+            }
+            let known = self
+                .extended
+                .learned
+                .get(&statement.key)
+                .cloned()
+                .unwrap_or_default();
+            for (slot, learned) in types.iter_mut().zip(known) {
+                if *slot == 0 {
+                    *slot = learned;
+                }
+            }
+        }
+        // Rendered as text, a parameter of unknown type could be read back
+        // as something else entirely; PostgreSQL knows every parameter a
+        // statement has, so one it does not know is one too many.
+        if types.contains(&0) {
+            return Ok(Err(plain(
+                "08P01",
+                format!("the Bind supplied {count} parameters, more than the statement has"),
+            )));
+        }
+        Ok(Ok(types))
+    }
+
+    /// Describes a spread portal by binding its statement in the home
+    /// region, which knows the columns and their formats as well as any.
+    async fn describe_spread(
+        &mut self,
+        sequence: u64,
+        spread: &Spread,
+    ) -> Result<(), SessionError> {
+        let home = self.shared.router.topology().home_region.clone();
+        let Some(pool) = self.pool_for(&home, Access::ReadOnly, 0) else {
+            return self.refuse(sequence, &unconfigured(&home));
+        };
+        let steps = [
+            Step::new(StepKind::Parse, frontend::parse("", &spread.sql, &[])?),
+            Step::new(
+                StepKind::Bind,
+                frontend::bind("", "", &[], &[], &spread.formats)?,
+            ),
+            Step::new(
+                StepKind::DescribePortal,
+                frontend::describe(Target::Portal, "")?,
+            ),
+            Step::new(StepKind::Sync, frontend::sync()?),
+        ];
+        let replies = match pool.acquire().await {
+            Ok(mut connection) => {
+                connection.join(&self.cancel);
+                connection.pipeline(&steps).await
+            }
+            Err(error) => Err(error),
+        };
+        let replies = match replies {
+            Ok(replies) => replies,
+            Err(error) => return self.refuse(sequence, &to_refusal(&error)),
+        };
+        if let Some(refusal) = failure(&replies) {
+            return self.refuse(sequence, &refusal);
+        }
+        let messages = replies
+            .get(2)
+            .map(|reply| {
+                reply
+                    .messages
+                    .iter()
+                    .map(RawMessage::to_bytes)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        self.owe(sequence, messages);
+        Ok(())
+    }
+
+    /// Runs a spread portal, or sends more of what it already produced.
+    async fn execute_spread(
+        &mut self,
+        sequence: u64,
+        portal: &str,
+        spread: &Spread,
+        max_rows: i32,
+    ) -> Result<(), SessionError> {
+        if !self.extended.answers.contains_key(portal) {
+            // Everything before it has to have run, and been answered, first.
+            self.flush_pending().await?;
+            if self.extended.skipping {
+                return Ok(());
+            }
+            if self.transaction.is_some() {
+                // The participants speak the simple protocol from here.
+                self.sync_participants().await?;
+            }
+            let analysis =
+                self.extended
+                    .portals
+                    .get(portal)
+                    .and_then(|bound| match &bound.statement.body {
+                        Body::Sql(prepared) => prepared.analyses.first().cloned(),
+                        _ => None,
+                    });
+            let Some(analysis) = analysis else {
+                return self.refuse(sequence, &plain("XX000", "the portal lost its statement"));
+            };
+            let started = std::time::Instant::now();
+            let outcome = if spread.write {
+                self.distributed_result(&analysis, &spread.sql, &spread.regions)
+                    .await?
+            } else {
+                self.scatter_result(&spread.regions, &spread.sql).await?
+            };
+            self.shared.metrics.statement(
+                if spread.write {
+                    "distributed"
+                } else {
+                    "scatter"
+                },
+                started.elapsed(),
+            );
+            let result = match outcome {
+                Ok(result) => result,
+                Err(refusal) => {
+                    self.refuse(sequence, &refusal)?;
+                    return self.flush_pending().await;
+                }
+            };
+            let rows = match self.encode_rows(&result, &spread.formats).await? {
+                Ok(rows) => rows,
+                Err(refusal) => {
+                    self.refuse(sequence, &refusal)?;
+                    return self.flush_pending().await;
+                }
+            };
+            let tag = result
+                .tags
+                .last()
+                .cloned()
+                .unwrap_or_else(|| format!("SELECT {}", result.rows.len()));
+            self.extended.answers.insert(
+                portal.to_owned(),
+                Answer {
+                    rows: rows.into(),
+                    tag,
+                    suspended: false,
+                },
+            );
+        }
+        self.send_answer(sequence, portal, max_rows)
+    }
+
+    /// Sends up to `max_rows` rows of a spread portal's answer, as
+    /// PostgreSQL would from a portal: `PortalSuspended` when the limit is
+    /// reached, `CommandComplete` when the rows run out.
+    fn send_answer(
+        &mut self,
+        sequence: u64,
+        portal: &str,
+        max_rows: i32,
+    ) -> Result<(), SessionError> {
+        let Some(answer) = self.extended.answers.get_mut(portal) else {
+            return Ok(());
+        };
+        let limit = usize::try_from(max_rows).ok().filter(|limit| *limit > 0);
+        let take = limit.unwrap_or(answer.rows.len()).min(answer.rows.len());
+        let mut messages: Vec<Bytes> = answer.rows.drain(..take).collect();
+        if limit.is_some_and(|limit| take == limit) {
+            answer.suspended = true;
+            messages.push(build::portal_suspended()?);
+        } else {
+            // A portal fetched in parts reports the rows of its last part.
+            let tag = if answer.suspended && answer.tag.starts_with("SELECT ") {
+                format!("SELECT {take}")
+            } else {
+                answer.tag.clone()
+            };
+            messages.push(build::command_complete(&tag)?);
+            self.extended.answers.remove(portal);
+        }
+        self.owe(sequence, messages);
+        Ok(())
+    }
+
+    /// The rows as `DataRow` messages in the formats the client asked for.
+    /// Text comes straight from the result; binary is encoded by the home
+    /// region, from the same values carried there as typed arrays.
+    async fn encode_rows(
+        &mut self,
+        result: &QueryResult,
+        formats: &[Format],
+    ) -> Result<Result<Vec<Bytes>, Refusal>, SessionError> {
+        if result.columns.is_empty() || result.rows.is_empty() {
+            return Ok(Ok(Vec::new()));
+        }
+        if formats.iter().all(|format| *format == Format::Text) {
+            let mut rows = Vec::with_capacity(result.rows.len());
+            for row in &result.rows {
+                let values: Vec<Option<&str>> = row.iter().map(Option::as_deref).collect();
+                rows.push(build::data_row(&values)?);
+            }
+            return Ok(Ok(rows));
+        }
+
+        let types = match super::type_names(&result.type_oids) {
+            Ok(types) => types,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        let columns: Vec<(String, Vec<Option<String>>)> = types
+            .into_iter()
+            .enumerate()
+            .map(|(index, type_name)| {
+                let values = result
+                    .rows
+                    .iter()
+                    .map(|row| row.get(index).cloned().flatten())
+                    .collect();
+                (type_name, values)
+            })
+            .collect();
+        let selected: Vec<String> = (1..=columns.len()).map(|n| format!("p.c{n}")).collect();
+        let sql = format!(
+            "SELECT {} FROM {} ORDER BY p.n",
+            selected.join(", "),
+            luxbyte_sql::combine::ordered_source(&columns)
+        );
+        let home = self.shared.router.topology().home_region.clone();
+        let Some(pool) = self.pool_for(&home, Access::ReadOnly, 0) else {
+            return Ok(Err(unconfigured(&home)));
+        };
+        let steps = [
+            Step::new(StepKind::Parse, frontend::parse("", &sql, &[])?),
+            Step::new(StepKind::Bind, frontend::bind("", "", &[], &[], formats)?),
+            Step::new(StepKind::Execute, frontend::execute("", 0)?),
+            Step::new(StepKind::Sync, frontend::sync()?),
+        ];
+        let replies = match pool.acquire().await {
+            Ok(mut connection) => {
+                connection.join(&self.cancel);
+                connection.pipeline(&steps).await
+            }
+            Err(error) => Err(error),
+        };
+        let replies = match replies {
+            Ok(replies) => replies,
+            Err(error) => return Ok(Err(to_refusal(&error))),
+        };
+        if let Some(refusal) = failure(&replies) {
+            return Ok(Err(refusal));
+        }
+        let rows = replies
+            .get(2)
+            .into_iter()
+            .flat_map(|reply| &reply.messages)
+            .filter(|message| message.is(tag::DESCRIBE_OR_DATA_ROW))
+            .map(RawMessage::to_bytes)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Ok(rows))
+    }
+
+    /// Ends the transaction the proxy opened for a batch: committed if the
+    /// batch succeeded, rolled back if anything in it failed.
+    async fn end_implicit(&mut self) -> Result<(), SessionError> {
+        let Some(transaction) = self.transaction.take() else {
+            self.extended.implicit = false;
+            return Ok(());
+        };
+        self.extended.end_transaction();
+        if self.extended.batch_failed {
+            self.rollback(transaction).await;
+        } else if let Err(error) = self.commit(transaction).await {
+            let refusal = txn_refusal(&error);
+            self.shared.metrics.error(&refusal.sqlstate);
+            self.client.queue_raw(&error_message(&refusal)?);
+        }
+        self.status = TransactionStatus::Idle;
         Ok(())
     }
 
@@ -1354,6 +1867,33 @@ fn restore<T>(map: &mut HashMap<String, T>, name: String, previous: Option<T>) {
             map.remove(&name);
         }
     }
+}
+
+/// The first error in a pipeline's answers, as a refusal.
+fn failure(replies: &[StepReply]) -> Option<Refusal> {
+    replies
+        .iter()
+        .flat_map(|reply| &reply.messages)
+        .find_map(|message| match Backend::decode(message) {
+            Ok(Backend::Error(notice)) => Some(plain(notice.code(), notice.message())),
+            _ => None,
+        })
+}
+
+/// A string literal that means the same whatever
+/// `standard_conforming_strings` is set to.
+fn escape_literal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().saturating_add(3));
+    out.push_str("E'");
+    for character in text.chars() {
+        match character {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("''"),
+            other => out.push(other),
+        }
+    }
+    out.push('\'');
+    out
 }
 
 fn plain(sqlstate: &str, message: impl Into<String>) -> Refusal {
