@@ -34,15 +34,16 @@ Luxbyte handles the hard half.
 | `INSERT ... VALUES ('alice'),('bob')` | two shards — refuse | one distributed transaction across both |
 | `SELECT country, count(*), avg(age) ... GROUP BY country HAVING ...` across regions | refuse | partial aggregates per region, regrouped by PostgreSQL in the home region |
 | `count(DISTINCT ...)`, `stddev()` across regions | refuse | **refuse** — and say exactly why |
-| `users JOIN orders` across regions | refuse | **refuse** — and say exactly why |
+| `users JOIN orders ON o.tenant_id = u.tenant_id`, no key | refuse | every region at once: rows only meet where their keys match |
+| `users JOIN orders ON o.buyer = u.id` across regions | refuse | **refuse** — and say exactly why |
 
 See [docs/NUMBERS.md](docs/NUMBERS.md) for a measured head-to-head against
 shahrah on the same machine with the same statements.
 
 The last two rows matter as much as the others. A `count(DISTINCT country)`
 cannot be rebuilt from per-region answers: the same country in two regions
-looks like two. A join run separately in two regions silently drops exactly
-the rows that match across the boundary. Both would look like they worked.
+looks like two. A join on anything but the shard key, run separately in two
+regions, silently drops exactly the rows that match across the boundary. Both would look like they worked.
 Luxbyte refuses them with a real SQLSTATE and a hint, because **a wrong answer
 is worse than an error**.
 
@@ -199,12 +200,44 @@ builds a small lattice over the `WHERE` clause:
 - `OR` widens: a column survives only if *both* sides pin it, and the answer is
   their union. So `tenant_id = 1 OR created_at > now()` pins nothing, which is
   correct — it really can match any tenant.
-- Anything else — a function, a subquery, a `NOT`, a range — yields no
-  constraint.
+- Anything else — a function, a `NOT`, a range — yields no constraint.
 
 Every rule errs towards more candidate regions, never fewer. Over-approximating
 costs an extra region in the fan-out; under-approximating returns the wrong
 rows.
+
+**Every query block** is read, not just the outer one. A table in a
+subquery, a `WITH` query, a `LATERAL` join or the `SELECT` of an `INSERT` is
+a table the statement reads, and a predicate restricts only the tables of the
+block it is written in: under `NOT EXISTS`, a subquery's `WHERE` says nothing
+about the outer rows. Keys flow along join conditions and into correlated
+subqueries, so in
+
+```sql
+SELECT * FROM users u WHERE u.tenant_id = 'alice'
+  AND EXISTS (SELECT 1 FROM orders o WHERE o.tenant_id = u.tenant_id)
+```
+
+both tables are alice's and one region answers. Without a key, a statement
+whose geo-partitioned tables are joined **shard key to shard key** runs in
+every region at once: matching rows have equal keys, equal keys live
+together, so each region finds every pair it holds and no pair comes back
+twice. That covers joins, correlated subqueries, an `INSERT ... SELECT` that
+copies keys, and a `MERGE` that only updates. A join on anything else, or a
+replicated table filtered by rows spread over regions, is refused; so is a
+write that would change each copy of a replicated table from different rows.
+
+**PostgreSQL's own parser** stands behind `sqlparser`, which is fast but a
+reimplementation of the grammar. For each statement shape not seen before,
+PostgreSQL's parser names the tables the statement reads, in a few
+microseconds; if it names one `sqlparser` did not — `FROM ONLY users` reads
+to `sqlparser` as a table called `only` — PostgreSQL's reading is used. A
+statement `sqlparser` cannot parse at all (`users*`, `ROWS FROM`, `TABLE`,
+`OVERRIDING SYSTEM VALUE`, ...) is read from PostgreSQL's parse tree. This is
+the `pg-parser` feature, on by default; it needs a C compiler and `libclang`
+to build. On 51 statements over real data in three regions, Luxbyte gives
+PostgreSQL's answer 46 times, refuses 5, and is never wrong
+([`compare/fidelity`](compare/fidelity)).
 
 **The directory** maps each key to a region, and is the reason this is not just
 hash sharding. A key with no entry is created in the proxy's home region: new
@@ -400,9 +433,9 @@ A routing decision, with the analysis cache warm:
 
 | | |
 |---|---|
-| Point read | **781 ns** |
-| Inlined literals, 256 distinct values | **891 ns** |
-| Distributed write across two regions | **1.41 µs** |
+| Point read | **853 ns** |
+| Inlined literals, 256 distinct values | **1.06 µs** |
+| Distributed write across two regions | **1.59 µs** |
 | Directory lookup among 1 000 000 keys | **316 ns** |
 
 Parsing is about 95% of the cold cost, so the analysis cache is where the
@@ -419,9 +452,11 @@ caches the shape only if they agree. A bug in the normaliser costs a cache
 miss, never a wrong answer.
 
 Against shahrah, compiled into one process and run on one machine rather than
-compared across published figures: **3.2-4.0x faster cached** on two machines,
-and faster on all 23 statements cold. It runs 22 of those 23 statements; shahrah
-runs 12, or 18 with its opt-in broadcast reads. In front of real PostgreSQL
+compared across published figures: **3.3-4.3x faster cached**, and faster on
+all 23 statements cold even with PostgreSQL's parser checking each new one.
+It runs all 23 of those statements; shahrah runs 12, or 18 with its opt-in
+broadcast reads. On 51 statements over real data in three regions, Luxbyte
+gives PostgreSQL's answer 46 times and shahrah 22; neither gives a wrong one. In front of real PostgreSQL
 16 under pgbench, on one machine, Luxbyte ran **1.15x to 1.23x** shahrah's
 transactions per second, simple and prepared, one client and sixteen. Through
 the proxy end to end, a point read costs 21 µs over a direct connection on
@@ -513,16 +548,16 @@ effect:
 
 ### Tests
 
-506 tests, no database required, `cargo test` and nothing else:
+595 tests, no database required, `cargo test` and nothing else:
 
 ```
 luxbyte-proto    62   framing, truncation, bad lengths, SCRAM both directions
-luxbyte-sql     107   key extraction, the AND/OR lattice, combining, the cache
-luxbyte-core     67   topology, relocation state machine, end-to-end routing
-luxbyte-pool     38   handshake, reuse, resets, TLS, limits, lost connections
+luxbyte-sql     124   every query block, keys and links, PostgreSQL's parser, the cache
+luxbyte-core     83   topology, relocation state machine, end-to-end routing
+luxbyte-pool     39   handshake, reuse, resets, TLS, limits, lost connections
 luxbyte-txn      31   two-phase commit and recovery, including the crash cases
-luxbyte-testkit   3   the fake backend itself
-luxbyte         198   merging, splitting, config, health, and 131 through the proxy
+luxbyte-testkit   2   the fake backend itself
+luxbyte         253   merging, splitting, peers, config, and 175 through the proxy
 ```
 
 The last 131 are the proxy as a whole: a real client connects over TCP to a
@@ -671,8 +706,11 @@ Alongside, not part of the proxy:
 
 - **[`compare/`](compare)** — both Luxbyte's and shahrah's routing analysis
   compiled into one process, for a head-to-head with no cross-machine
-  arithmetic in it. Kept out of the workspace because shahrah needs `libclang`
-  to build and Luxbyte does not.
+  arithmetic in it. Kept out of the workspace so that a plain `cargo test`
+  never has to fetch and build shahrah.
+- **[`compare/fidelity`](compare/fidelity)** — 51 statements run through
+  proxies on real data split across three PostgreSQL databases, each answer
+  graded against one database holding every row.
 
 See [docs/NUMBERS.md](docs/NUMBERS.md) for what is measured, how, and what
 is not measured yet.

@@ -35,16 +35,23 @@ The full job: SQL text in, routing decision out.
 
 | Statement | Cold | **Cached** | Speed-up |
 |---|---|---|---|
-| `SELECT 1` | 2.24 µs | **352 ns** | 6.4× |
-| point read, `WHERE tenant_id = 'alice'` | 8.66 µs | **781 ns** | 11.1× |
-| point write, `UPDATE ... WHERE tenant_id = 'alice'` | 5.25 µs | **909 ns** | 5.8× |
-| scatter over two regions, `IN ('alice','bob')` | 7.65 µs | **1.15 µs** | 6.7× |
-| scatter over three regions, no key | 5.44 µs | **613 ns** | 8.9× |
-| distributed write, multi-row `INSERT` | 7.53 µs | **1.41 µs** | 5.3× |
-| join inside one region | 15.05 µs | **1.29 µs** | 11.7× |
-| refused aggregate | 4.90 µs | **517 ns** | 9.5× |
+| `SELECT 1` | 4.63 µs | **264 ns** | 17.5× |
+| point read, `WHERE tenant_id = 'alice'` | 14.79 µs | **853 ns** | 17.3× |
+| point write, `UPDATE ... WHERE tenant_id = 'alice'` | 10.72 µs | **944 ns** | 11.4× |
+| scatter over two regions, `IN ('alice','bob')` | 15.84 µs | **1.33 µs** | 11.9× |
+| scatter over three regions, no key | 12.77 µs | **715 ns** | 17.9× |
+| distributed write, multi-row `INSERT` | 14.16 µs | **1.59 µs** | 8.9× |
+| join inside one region | 34.96 µs | **1.60 µs** | 21.9× |
+| refused aggregate | 10.09 µs | **415 ns** | 24.3× |
 
-**Inlined literals, 256 distinct values, cache warm: 891 ns.**
+**Inlined literals, 256 distinct values, cache warm: 1.06 µs.**
+
+These are as the proxy ships: the analyser reads every query block of a
+statement, not just its outer `FROM`, and PostgreSQL's own parser checks the
+tables of every statement shape it has not seen before (see *Parser
+fidelity* below). That made the cold column 1.7–2.4× what it was (a point
+read was 8.66 µs); the cached column, which is what every repeat of a shape
+costs, did not move beyond noise.
 
 That last row is the one that matters for a real application. Every statement
 has a different literal in it, so a cache keyed on SQL text would miss on
@@ -54,7 +61,8 @@ every single call. This one hits, because the key is the statement's *shape*.
 
 | | |
 |---|---|
-| Parsing (`sqlparser`) | 7–13 µs |
+| Parsing and reading every block (`sqlparser`) | 9–21 µs |
+| Checking the tables with PostgreSQL's parser, first sight of a shape | 2.5–7 µs |
 | Planning (topology, directory, merge safety) | **40–635 ns** |
 | Directory lookup, 1 000 keys | 198 ns |
 | Directory lookup, 100 000 keys | 221 ns |
@@ -121,6 +129,22 @@ Cold, Luxbyte is again faster on all 23, between 1.70x (a multi-row `INSERT`,
 31.9 µs). The cold gap is wider on this machine than on the first; both are
 reported rather than either being picked.
 
+Measured a third time, on the same VM, after the analyser learned to read
+every query block and PostgreSQL's own parser began checking every new
+statement shape, as the proxy now ships (`compare/` builds `luxbyte-sql` with
+`pg-parser`):
+
+| Workload | Luxbyte | shahrah | Ratio |
+|---|---|---|---|
+| Cached, 256 varying literals | **834 ns** | 3.62 µs | **4.3x** |
+| Cached, repeated statement | **934 ns** | 3.12 µs | **3.3x** |
+| Cold, median across 23 statements | — | — | **1.41x** |
+
+Cold, Luxbyte is still faster on all 23, now between 1.05x (`count(*)`
+across regions, 11.5 µs against 12.1 µs) and 1.83x (the same key under `OR`,
+16.9 µs against 31.0 µs). The check costs Luxbyte most of its cold lead, and
+it is paid once per statement shape.
+
 The gap widens with the cache because the two caches are doing different
 amounts of work on a hit, not because either is badly written.
 
@@ -164,9 +188,9 @@ sharded tables opted in.
 | **multi-region insert** | distributed write | refused | refused |
 | **join within one region** | one region | refused | refused |
 | replicated write | every region, two-phase commit | writer region | writer region |
-| join across regions | refused | refused | refused |
+| **join across regions** | fan out, rows meet only on the key | refused | refused |
 
-**Of 23 statements, Luxbyte runs 22; shahrah runs 12, or 18 with broadcast
+**Of 23 statements, Luxbyte runs 23; shahrah runs 12, or 18 with broadcast
 on.** Reproduce with `cargo run --release --manifest-path compare/Cargo.toml`.
 
 Three rows are worth separating out:
@@ -193,21 +217,61 @@ and broadcast is decided later, in its proxy. With broadcast on, shahrah runs
 18. The harness now applies the rule shahrah's proxy applies
 (`crates/proxy/src/session.rs` at the pinned revision) and reports both
 columns. Luxbyte's own count has also moved, to 22, because it now combines
-aggregates across regions that it used to refuse.
+aggregates across regions that it used to refuse, and then to 23: the join
+across regions is on the shard key, so its rows only ever meet in one
+region, and running it in each region finds every pair (here none, since the
+two keys differ).
+
+### Parser fidelity, measured
+
+shahrah parses with [`pg_query`](https://github.com/pganalyze/pg_query.rs),
+PostgreSQL's own parser, so it reads exactly what PostgreSQL reads. Luxbyte
+parses with `sqlparser`, a reimplementation that is faster and builds
+anywhere, and now puts the same libpg_query behind it (the `pg-parser`
+feature, on by default): for every statement shape it has not seen, PostgreSQL's
+parser names the tables the statement reads, and if it names one sqlparser
+did not, PostgreSQL's reading is used; a statement sqlparser cannot parse at
+all is analysed from PostgreSQL's parse tree. Building without the feature
+needs no C compiler and keeps everything else.
+
+Parsing is half of it; the other half is what a proxy does with what it
+parsed. [`compare/fidelity`](../compare/fidelity) runs 51 statements through
+each proxy on real data split across three PostgreSQL 16 databases, and
+compares every answer with the one PostgreSQL gives over a single database
+holding every row: point and scatter reads, grammar sqlparser does not know,
+subqueries and `WITH`, joins, set operations, replicated tables and writes.
+
+| | correct | refused | **wrong** |
+|---|---|---|---|
+| Luxbyte | **46** | 5 | **0** |
+| shahrah (broadcast on, `currencies` replicated) | 22 | 29 | 0 |
+| Luxbyte before this work | 30 | 15 | **6** |
+
+shahrah is never wrong: when PostgreSQL's parser shows it a table inside a
+subquery, a `WITH` query, a set operation or a second sharded table, it
+refuses. Luxbyte was wrong six times, and that is the finding worth stating
+plainly: its analyser collected tables from `FROM` clauses only, so a table
+read in a subquery or a `WITH` query was invisible to the router, which
+answered from one region's rows; and sqlparser reads `FROM ONLY users` as a
+table called `only`. A write to a replicated table whose subquery read
+geo-partitioned rows would also have changed each region's copy differently
+(the command tag does not show that, so the table counts it correct).
+
+All six are fixed. The analyser walks every query block, credits each
+predicate to the block it belongs to, and carries a key along join conditions
+and into correlated subqueries; statements whose geo-partitioned tables are
+joined shard key to shard key run in every region at once, since their rows
+only meet where the keys are equal, which is how Luxbyte answers the joins,
+correlated subqueries and `INSERT ... SELECT`s shahrah refuses. PostgreSQL's
+parser catches what sqlparser misreads and reads what it cannot. The five
+statements Luxbyte still refuses need rows from several regions combined in a
+way no region can do alone (a join not on the key, a replicated table
+filtered by rows spread across regions), and shahrah refuses them too.
 
 ### Where shahrah is better
 
-- **Parser fidelity.** shahrah uses [`pg_query`](https://github.com/pganalyze/pg_query.rs),
-  PostgreSQL's own C parser, so it accepts precisely what PostgreSQL accepts —
-  every operator, every extension, every corner of the grammar. Luxbyte uses
-  pure-Rust `sqlparser`: faster, builds anywhere, and a *reimplementation* of
-  the grammar rather than the grammar itself. Sufficiently exotic PostgreSQL
-  will parse differently for us, or not at all. That is the price of the speed
-  above, and it is a real one. (A statement Luxbyte cannot parse is refused
-  rather than guessed at, so the failure mode is an error and not a wrong
-  region; and one the application marks `/* luxbyte: region=... */` runs
-  there unread, which covers the gap but puts the routing in the
-  application's hands.)
+- **Parser fidelity.** No longer ahead: see *Parser fidelity, measured*
+  above.
 - **Replicated writes.** No longer ahead. shahrah sends a write to a
   replicated table to one writer region and lets PostgreSQL replication
   carry it. Luxbyte does that too when a table names a `writer`, and then
