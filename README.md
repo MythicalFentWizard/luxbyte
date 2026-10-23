@@ -1,16 +1,16 @@
-# Meridian
+# Luxbyte
 
 A geo-distributed PostgreSQL proxy. Applications speak the ordinary PostgreSQL
-wire protocol to it; Meridian works out which region holds the rows a statement
+wire protocol to it; Luxbyte works out which region holds the rows a statement
 touches and sends it there.
 
-Sharding by a hash puts a user's data wherever the hash lands. Meridian puts it
+Sharding by a hash puts a user's data wherever the hash lands. Luxbyte puts it
 where the user is, and keeps a directory so it can be moved later when they
 move. A read in your home region is a local round trip. The same read against a
 single distant cluster is the speed of light and back.
 
 **Status: in progress.** The protocol codec, the statement analyser and the
-routing planner are complete, tested and usable through the `meridian explain`
+routing planner are complete, tested and usable through the `luxbyte explain`
 command. The proxy server, connection pooling and the two-phase commit driver
 are not written yet. See [Where it stands](#where-it-stands).
 
@@ -23,9 +23,9 @@ to one shard, and refuse anything that does not fit. Refusing is easy to
 implement and easy to defend, and it pushes the hard half of the problem back
 onto the application.
 
-Meridian handles the hard half.
+Luxbyte handles the hard half.
 
-| Statement | A proxy that refuses what it cannot pin down | Meridian |
+| Statement | A proxy that refuses what it cannot pin down | Luxbyte |
 |---|---|---|
 | `WHERE tenant_id = $1` | no value yet — refuse, or broadcast | defer the decision to `Bind`, then route to one region |
 | `WHERE tenant_id IN ('alice','bob')` | two shards — refuse | scatter to those two regions, merge the results |
@@ -36,7 +36,7 @@ Meridian handles the hard half.
 | `users JOIN orders` across regions | refuse | **refuse** — and say exactly why |
 
 Measured against shahrah on the same machine with the same statements,
-Meridian runs **19 of 23** where shahrah runs **12** — including a join
+Luxbyte runs **19 of 23** where shahrah runs **12** — including a join
 between two sharded tables provably in the same region, which shahrah refuses
 outright.
 
@@ -44,7 +44,7 @@ The last two rows matter as much as the others. A `count(*)` fanned out to
 three regions returns three partial counts; concatenating them gives you three
 rows, each wrong. A join run separately in two regions silently drops exactly
 the rows that match across the boundary. Both would look like they worked.
-Meridian refuses them with a real SQLSTATE and a hint, because **a wrong answer
+Luxbyte refuses them with a real SQLSTATE and a hint, because **a wrong answer
 is worse than an error**.
 
 Everything else errs the other way. Any predicate the analyser does not
@@ -54,7 +54,7 @@ fans out — slower, and correct.
 ## Try it
 
 ```bash
-cargo run -p meridian -- explain \
+cargo run -p luxbyte -- explain \
   --topology examples/topology.toml \
   --directory examples/keys.tsv \
   "SELECT * FROM users WHERE tenant_id = 'alice'"
@@ -68,7 +68,7 @@ cargo run -p meridian -- explain \
 A read whose key spans two regions, with an ordering to preserve:
 
 ```
-$ meridian explain "SELECT * FROM users WHERE tenant_id IN ('alice','bob') ORDER BY created_at DESC"
+$ luxbyte explain "SELECT * FROM users WHERE tenant_id IN ('alice','bob') ORDER BY created_at DESC"
   kind    Select, ReadOnly, tables: users
   plan    scatter-gather over eu-west, us-east
   merge   sorted merge on created_at desc
@@ -77,7 +77,7 @@ $ meridian explain "SELECT * FROM users WHERE tenant_id IN ('alice','bob') ORDER
 A write that spans regions:
 
 ```
-$ meridian explain "INSERT INTO users (tenant_id, name) VALUES ('alice','a'), ('bob','b')"
+$ luxbyte explain "INSERT INTO users (tenant_id, name) VALUES ('alice','a'), ('bob','b')"
   kind    Insert, ReadWrite, tables: users
   plan    distributed write over eu-west, us-east (two-phase commit)
 ```
@@ -85,7 +85,7 @@ $ meridian explain "INSERT INTO users (tenant_id, name) VALUES ('alice','a'), ('
 A refusal, with its reason:
 
 ```
-$ meridian explain "SELECT * FROM users u JOIN orders o ON o.tenant_id = u.tenant_id
+$ luxbyte explain "SELECT * FROM users u JOIN orders o ON o.tenant_id = u.tenant_id
                     WHERE u.tenant_id = 'alice' AND o.tenant_id = 'bob'"
   kind    Select, ReadOnly, tables: users, orders
   plan    refused [0A000]
@@ -96,10 +96,10 @@ $ meridian explain "SELECT * FROM users u JOIN orders o ON o.tenant_id = u.tenan
 And a prepared statement, before and after its parameter is known:
 
 ```
-$ meridian explain "SELECT * FROM users WHERE tenant_id = $1"
+$ luxbyte explain "SELECT * FROM users WHERE tenant_id = $1"
   plan    deferred until $1 is bound
 
-$ meridian explain --param bob "SELECT * FROM users WHERE tenant_id = $1"
+$ luxbyte explain --param bob "SELECT * FROM users WHERE tenant_id = $1"
   plan    one region: us-east (ReadOnly)
 ```
 
@@ -223,10 +223,10 @@ effect:
 200 tests, no database required, `cargo test` and nothing else:
 
 ```
-meridian-proto   49   framing, truncation, bad lengths, SCRAM both directions
-meridian-sql     81   key extraction, the AND/OR lattice, merge safety, cache
-meridian-core    64   topology, relocation state machine, end-to-end routing
-meridian          6   command line
+luxbyte-proto   49   framing, truncation, bad lengths, SCRAM both directions
+luxbyte-sql     81   key extraction, the AND/OR lattice, merge safety, cache
+luxbyte-core    64   topology, relocation state machine, end-to-end routing
+luxbyte          6   command line
 ```
 
 They cover the cases that decide whether the thing is correct: a write during a
@@ -239,34 +239,34 @@ benchmark harness nobody can stand up is a benchmark nobody checks.
 
 Done, tested, and working:
 
-- **`meridian-proto`** — PostgreSQL wire protocol v3. Framing over any async
+- **`luxbyte-proto`** — PostgreSQL wire protocol v3. Framing over any async
   stream, startup and cancellation, SCRAM-SHA-256 as both client and server,
   MD5, and borrowed zero-copy views of the messages routing depends on. A proxy
   forwards far more bytes than it inspects, so the transport unit is an opaque
   tag-plus-body and typed decoding is a view over it.
-- **`meridian-sql`** — statement analysis. Shard-key extraction, read/write
+- **`luxbyte-sql`** — statement analysis. Shard-key extraction, read/write
   classification, transaction and session-state detection, and merge-safety
   analysis.
-- **`meridian-core`** — topology, placement, the key directory with its
+- **`luxbyte-core`** — topology, placement, the key directory with its
   relocation state machine, and the routing planner.
-- **`meridian`** — the `explain` command.
+- **`luxbyte`** — the `explain` command.
 
 Not written yet:
 
-- **`meridian-pool`** — per-endpoint connection pooling.
-- **`meridian-txn`** — the two-phase commit driver. `Plan::Distributed` already
+- **`luxbyte-pool`** — per-endpoint connection pooling.
+- **`luxbyte-txn`** — the two-phase commit driver. `Plan::Distributed` already
   identifies the statements that need it.
-- **`meridian-testkit`** — an in-process PostgreSQL backend speaking the real
+- **`luxbyte-testkit`** — an in-process PostgreSQL backend speaking the real
   wire protocol, so the proxy can be tested end to end with no database.
 - The proxy server itself: listener, session, scatter-gather execution, the
   operator console, metrics.
 
 Alongside, not part of the proxy:
 
-- **[`compare/`](compare)** — both Meridian's and shahrah's routing analysis
+- **[`compare/`](compare)** — both Luxbyte's and shahrah's routing analysis
   compiled into one process, for a head-to-head with no cross-machine
   arithmetic in it. Kept out of the workspace because shahrah needs `libclang`
-  to build and Meridian does not.
+  to build and Luxbyte does not.
 
 Benchmarks for the server will land with it. See
 [docs/NUMBERS.md](docs/NUMBERS.md) for what is measured today.

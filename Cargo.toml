@@ -10,16 +10,16 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-# repository = "https://github.com/YOUR-USERNAME/meridian"
-authors = ["Meridian contributors"]
+# repository = "https://github.com/YOUR-USERNAME/luxbyte"
+authors = ["Luxbyte contributors"]
 
 [workspace.dependencies]
-meridian-proto = { path = "crates/meridian-proto", version = "0.1.0" }
-meridian-sql = { path = "crates/meridian-sql", version = "0.1.0" }
-meridian-core = { path = "crates/meridian-core", version = "0.1.0" }
-meridian-pool = { path = "crates/meridian-pool", version = "0.1.0" }
-meridian-txn = { path = "crates/meridian-txn", version = "0.1.0" }
-meridian-testkit = { path = "crates/meridian-testkit", version = "0.1.0" }
+luxbyte-proto = { path = "crates/luxbyte-proto", version = "0.1.0" }
+luxbyte-sql = { path = "crates/luxbyte-sql", version = "0.1.0" }
+luxbyte-core = { path = "crates/luxbyte-core", version = "0.1.0" }
+luxbyte-pool = { path = "crates/luxbyte-pool", version = "0.1.0" }
+luxbyte-txn = { path = "crates/luxbyte-txn", version = "0.1.0" }
+luxbyte-testkit = { path = "crates/luxbyte-testkit", version = "0.1.0" }
 
 base64 = "0.23.1"
 criterion = { version = "0.7.0", features = ["html_reports"] }

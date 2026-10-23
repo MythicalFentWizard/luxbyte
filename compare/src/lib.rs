@@ -3,7 +3,7 @@
 //! Both analysers are given the same statements and the same placement
 //! policy, expressed in each project's own configuration vocabulary:
 //!
-//! | | Meridian | shahrah |
+//! | | Luxbyte | shahrah |
 //! |---|---|---|
 //! | sharded by a key | `geo_partitioned` | `with_key` |
 //! | copy in every region | `global_replicated` | `with_replicated` |
@@ -13,12 +13,12 @@
 
 use std::sync::Arc;
 
-use meridian_core::{MemoryDirectory, ParameterValues, Plan, Router, Topology};
-use meridian_sql::AnalysisCache;
+use luxbyte_core::{MemoryDirectory, ParameterValues, Plan, Router, Topology};
+use luxbyte_sql::AnalysisCache;
 use shahrah_sql::analysis::{Access as ShahrahAccess, KeyType, Policy, Routing, TableClass};
 use shahrah_sql::cache::Cache;
 
-/// Meridian's view of the deployment.
+/// Luxbyte's view of the deployment.
 pub const TOPOLOGY: &str = r#"
 home_region = "eu-west"
 
@@ -58,9 +58,9 @@ pub fn shahrah_policy() -> Policy {
         .with_replicated("currencies", "eu-west")
 }
 
-/// Meridian's router over the same deployment.
+/// Luxbyte's router over the same deployment.
 #[must_use]
-pub fn meridian_router() -> Router {
+pub fn luxbyte_router() -> Router {
     let topology = Topology::from_toml(TOPOLOGY).expect("topology should parse");
     let directory = MemoryDirectory::with_entries([
         ("users", "alice", "eu-west"),
@@ -174,9 +174,9 @@ impl Decision {
     }
 }
 
-/// Runs a statement through Meridian.
+/// Runs a statement through Luxbyte.
 #[must_use]
-pub fn meridian_decision(router: &Router, cache: &AnalysisCache, sql: &str) -> Decision {
+pub fn luxbyte_decision(router: &Router, cache: &AnalysisCache, sql: &str) -> Decision {
     let prepared = match cache.analyze(sql) {
         Ok(prepared) => prepared,
         Err(error) => return Decision::Failed(error.to_string()),

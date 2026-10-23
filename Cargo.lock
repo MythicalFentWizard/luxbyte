@@ -443,6 +443,108 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "luxbyte"
+version = "0.1.0"
+dependencies = [
+ "luxbyte-core",
+ "luxbyte-pool",
+ "luxbyte-proto",
+ "luxbyte-sql",
+ "luxbyte-testkit",
+ "luxbyte-txn",
+ "parking_lot 0.13.0",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "luxbyte-core"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "luxbyte-sql",
+ "parking_lot 0.13.0",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "luxbyte-pool"
+version = "0.1.0"
+dependencies = [
+ "luxbyte-core",
+ "luxbyte-proto",
+ "luxbyte-testkit",
+ "parking_lot 0.13.0",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "luxbyte-proto"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "hmac",
+ "md-5",
+ "rand",
+ "sha2",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "luxbyte-sql"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "serde",
+ "sqlparser",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "luxbyte-testkit"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "luxbyte-proto",
+ "parking_lot 0.13.0",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "luxbyte-txn"
+version = "0.1.0"
+dependencies = [
+ "luxbyte-core",
+ "luxbyte-pool",
+ "luxbyte-proto",
+ "luxbyte-testkit",
+ "parking_lot 0.13.0",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -466,108 +568,6 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
-
-[[package]]
-name = "meridian"
-version = "0.1.0"
-dependencies = [
- "meridian-core",
- "meridian-pool",
- "meridian-proto",
- "meridian-sql",
- "meridian-testkit",
- "meridian-txn",
- "parking_lot 0.13.0",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "meridian-core"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "meridian-sql",
- "parking_lot 0.13.0",
- "serde",
- "serde_json",
- "thiserror",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "meridian-pool"
-version = "0.1.0"
-dependencies = [
- "meridian-core",
- "meridian-proto",
- "meridian-testkit",
- "parking_lot 0.13.0",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "meridian-proto"
-version = "0.1.0"
-dependencies = [
- "base64",
- "bytes",
- "hmac",
- "md-5",
- "rand",
- "sha2",
- "subtle",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "meridian-sql"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "serde",
- "sqlparser",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "meridian-testkit"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "meridian-proto",
- "parking_lot 0.13.0",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "meridian-txn"
-version = "0.1.0"
-dependencies = [
- "meridian-core",
- "meridian-pool",
- "meridian-proto",
- "meridian-testkit",
- "parking_lot 0.13.0",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
-]
 
 [[package]]
 name = "mio"

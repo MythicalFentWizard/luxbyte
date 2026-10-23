@@ -92,13 +92,13 @@ every call, so each is doing the work it was built for. Benchmarking one
 project's cold path against the other's warm one would produce a larger number
 and mean nothing.
 
-| Workload | Meridian | shahrah | Ratio |
+| Workload | Luxbyte | shahrah | Ratio |
 |---|---|---|---|
 | Cached, 256 varying literals | **802 ns** | 2.75 µs | **3.4x** |
 | Cached, repeated statement | **718 ns** | 2.85 µs | **4.0x** |
 | Cold, median across 23 statements | — | — | **~1.7x** |
 
-Cold, Meridian is faster on **all 23** statements, between 1.18x and 2.05x.
+Cold, Luxbyte is faster on **all 23** statements, between 1.18x and 2.05x.
 The widest gaps are where predicates get complicated — `tenant_id = 'alice' OR
 name = 'ada'` is 7.56 µs against 15.27 µs — and the narrowest is a plain
 single-row `INSERT`, at 6.68 µs against 7.88 µs.
@@ -108,7 +108,7 @@ amounts of work on a hit, not because either is badly written.
 
 ### A correction
 
-An earlier draft of this document compared Meridian's measured 0.78 µs against
+An earlier draft of this document compared Luxbyte's measured 0.78 µs against
 shahrah's **published** 13 µs and described the resulting 15x as "indicated but
 not proven". That extrapolation was wrong by about a factor of four.
 
@@ -125,7 +125,7 @@ document that quietly drops its own overstatements is not worth reading.
 Speed is the easy comparison and the less interesting one. Given identical
 input, which statements does each project agree to run?
 
-| Statement | Meridian | shahrah |
+| Statement | Luxbyte | shahrah |
 |---|---|---|
 | point read, including reversed, aliased, cast and negative keys | one region | one region |
 | point write, insert, delete | one region | one region |
@@ -142,7 +142,7 @@ input, which statements does each project agree to run?
 | join across regions | refused | refused |
 | `count(*)`, `sum()`, `DISTINCT` across regions | refused | refused |
 
-**Meridian runs 19 of the 23; shahrah runs 12.**
+**Luxbyte runs 19 of the 23; shahrah runs 12.**
 
 Two of those rows are worth separating out:
 
@@ -151,7 +151,7 @@ Two of those rows are worth separating out:
   both are constrained to the same key and therefore provably in one place.
   That is a large class of ordinary application queries.
 - **Aggregates across regions.** Both refuse, but for different reasons.
-  shahrah refuses for want of a shard key; Meridian gets far enough to say
+  shahrah refuses for want of a shard key; Luxbyte gets far enough to say
   that the statement *reads three regions and cannot be merged because it
   aggregates*. Same outcome, and one of the two errors tells you what to do.
 
@@ -159,15 +159,15 @@ Two of those rows are worth separating out:
 
 - **Parser fidelity.** shahrah uses [`pg_query`](https://github.com/pganalyze/pg_query.rs),
   PostgreSQL's own C parser, so it accepts precisely what PostgreSQL accepts —
-  every operator, every extension, every corner of the grammar. Meridian uses
+  every operator, every extension, every corner of the grammar. Luxbyte uses
   pure-Rust `sqlparser`: faster, builds anywhere, and a *reimplementation* of
   the grammar rather than the grammar itself. Sufficiently exotic PostgreSQL
   will parse differently for us, or not at all. That is the price of the speed
-  above, and it is a real one. (A statement Meridian cannot parse is refused
+  above, and it is a real one. (A statement Luxbyte cannot parse is refused
   rather than guessed at, so the failure mode is an error and not a wrong
   region.)
 - **Replicated writes.** shahrah sends a write to a replicated table to one
-  configured writer region and lets PostgreSQL replication carry it. Meridian
+  configured writer region and lets PostgreSQL replication carry it. Luxbyte
   broadcasts to every region under two-phase commit. Ours is synchronous and
   therefore consistent on read-your-writes from any region; his is much
   cheaper. Which is correct depends on the application, and his default is the
@@ -182,7 +182,7 @@ shahrah's NUMBERS.md records a bug this introduced:
 > absolute value.
 
 That is an easy bug to write and a hard one to notice: it is silent, it only
-affects negative keys, and the query still returns rows. Meridian guards
+affects negative keys, and the query still returns rows. Luxbyte guards
 against the whole class rather than that one instance. On every cache miss it
 analyses the original statement *and* the normalised one and compares them,
 and caches the shape only if they agree. A shape that fails is marked
