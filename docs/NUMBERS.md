@@ -205,7 +205,9 @@ aggregates across regions that it used to refuse.
   will parse differently for us, or not at all. That is the price of the speed
   above, and it is a real one. (A statement Luxbyte cannot parse is refused
   rather than guessed at, so the failure mode is an error and not a wrong
-  region.)
+  region; and one the application marks `/* luxbyte: region=... */` runs
+  there unread, which covers the gap but puts the routing in the
+  application's hands.)
 - **Replicated writes.** shahrah sends a write to a replicated table to one
   configured writer region and lets PostgreSQL replication carry it. Luxbyte
   broadcasts to every region under two-phase commit. Ours is synchronous and
@@ -227,9 +229,10 @@ aggregates across regions that it used to refuse.
   key is finer and keeps a key's tables together; per range moves many keys
   in fewer steps, and a range's keys never need a directory entry each.
 - **Operating it.** shahrah's dashboard is live over a WebSocket and shows
-  every proxy in the group, and it has a comment to supply a key a view
-  hides. Luxbyte now has `DRAIN`, `ROUTE`, warm connections, `SHOW HEALTH`
-  and alerts, but its dashboard is a page that refreshes, for one proxy.
+  every proxy in the group in detail. Luxbyte has `DRAIN`, `ROUTE`, warm
+  connections, `SHOW HEALTH`, `SHOW PEERS`, alerts, and `key=`/`region=`
+  hints as shahrah has `key=`/`shard=`, but its dashboard is a page that
+  refreshes, and shows other proxies only by name and heartbeat.
 - **Measured across regions.** shahrah reports end-to-end numbers from a
   three-region bed with real latencies, against pgbouncer, pgcat and PgDog.
   Luxbyte's figures against PostgreSQL below are from one machine, over

@@ -23,8 +23,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use luxbyte_sql::{
-    Access, KeyValue, MergeStrategy, Prepared, StatementAnalysis, StatementKind, TableRef,
-    TransactionOp,
+    Access, ColumnRef, Hint, KeyConstraints, KeyValue, MergeStrategy, Prepared, StatementAnalysis,
+    StatementKind, TableRef, TransactionOp,
 };
 
 use crate::directory::{Directory, Location, Reads, RelocationPhase};
@@ -293,7 +293,18 @@ impl Router {
     /// A new key is shown in the home region, where it is placed unless
     /// another proxy claimed it first.
     pub fn plan(&self, analysis: &StatementAnalysis, parameters: Option<&ParameterValues>) -> Plan {
-        match self.route_with(analysis, parameters, false) {
+        self.plan_hinted(analysis, parameters, None)
+    }
+
+    /// [`Router::plan`], following a hint the statement carries.
+    #[must_use]
+    pub fn plan_hinted(
+        &self,
+        analysis: &StatementAnalysis,
+        parameters: Option<&ParameterValues>,
+        hint: Option<&Hint>,
+    ) -> Plan {
+        match self.follow_hint(analysis, parameters, hint, false) {
             Routing::Ready(plan) => plan,
             Routing::Held(refusal) => Plan::Refuse(refusal),
             // Never asked for when planning without claims.
@@ -312,7 +323,119 @@ impl Router {
         analysis: &StatementAnalysis,
         parameters: Option<&ParameterValues>,
     ) -> Routing {
-        self.route_with(analysis, parameters, self.claims)
+        self.route_hinted(analysis, parameters, None)
+    }
+
+    /// [`Router::route`], following a hint the statement carries: see
+    /// [`luxbyte_sql::hint`].
+    #[must_use]
+    pub fn route_hinted(
+        &self,
+        analysis: &StatementAnalysis,
+        parameters: Option<&ParameterValues>,
+        hint: Option<&Hint>,
+    ) -> Routing {
+        self.follow_hint(analysis, parameters, hint, self.claims)
+    }
+
+    fn follow_hint(
+        &self,
+        analysis: &StatementAnalysis,
+        parameters: Option<&ParameterValues>,
+        hint: Option<&Hint>,
+        claims: bool,
+    ) -> Routing {
+        let hint = match (hint, analysis.kind) {
+            // What the proxy answers itself, or keeps per session, goes
+            // nowhere a hint could point.
+            (
+                Some(_),
+                StatementKind::TransactionControl(_)
+                | StatementKind::SessionState
+                | StatementKind::Show,
+            )
+            | (None, _) => return self.route_with(analysis, parameters, claims),
+            (Some(hint), _) => hint,
+        };
+        let geo: Vec<(&TableRef, &str)> = analysis
+            .tables
+            .iter()
+            .filter(|table| !is_catalog_table(table))
+            .filter_map(|table| {
+                match self
+                    .topology
+                    .placement(table.schema.as_deref(), &table.name)
+                {
+                    Some(Placement::GeoPartitioned { key }) => Some((table, key.as_str())),
+                    _ => None,
+                }
+            })
+            .collect();
+        match hint {
+            Hint::Region(region) => {
+                if self.topology.region(region).is_none() {
+                    return Routing::Ready(Plan::Refuse(Refusal::new(
+                        "22023",
+                        format!(
+                            "a luxbyte hint names region \"{region}\", which is not configured"
+                        ),
+                    )));
+                }
+                // The hint says where, but a move still has to be waited
+                // for: a write landing in a key's old region after its rows
+                // left would be lost to every later read.
+                for (table, _) in &geo {
+                    match self.directory.moving_in(&table.name) {
+                        Some(_) if analysis.access.needs_primary() => {
+                            return Routing::Held(moving(
+                                &format!("a key of \"{table}\" is moving between regions"),
+                                "a write sent by a hint waits for it",
+                            ));
+                        }
+                        Some(RelocationPhase::Committing) => {
+                            return Routing::Held(moving(
+                                &format!("a key of \"{table}\" is moving between regions"),
+                                "a read sent by a hint waits while the move commits",
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                Routing::Ready(Plan::Single {
+                    region: region.clone(),
+                    access: analysis.access,
+                })
+            }
+            Hint::Key(key) => {
+                if geo.is_empty() {
+                    return Routing::Ready(Plan::Refuse(
+                        Refusal::new(
+                            "0A000",
+                            "a luxbyte key hint needs a geo-partitioned table in the statement, \
+                             to know which key it names",
+                        )
+                        .with_hint("name the region instead, as /* luxbyte: region=... */"),
+                    ));
+                }
+                // Every geo-partitioned table, pinned to the key by its own
+                // name, which is how a statement over several tables is
+                // matched; whatever the statement said of the key gives way.
+                let mut hinted = analysis.clone();
+                hinted.constraints = geo.iter().fold(
+                    KeyConstraints::unconstrained(),
+                    |constraints, (table, column)| {
+                        constraints.and(KeyConstraints::pinned(
+                            ColumnRef {
+                                qualifier: Some(table.name.clone()),
+                                column: (*column).to_owned(),
+                            },
+                            KeyValue::Literal(key.clone()),
+                        ))
+                    },
+                );
+                self.route_with(&hinted, parameters, claims)
+            }
+        }
     }
 
     fn route_with(

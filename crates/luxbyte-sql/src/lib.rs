@@ -17,12 +17,14 @@
 mod analyze;
 pub mod cache;
 pub mod combine;
+pub mod hint;
 pub mod key;
 pub mod merge;
 pub mod shape;
 pub mod statements;
 
 pub use cache::{AnalysisCache, CacheStats, Prepared};
+pub use hint::Hint;
 pub use key::{ColumnRef, KeyConstraints, KeyValue};
 pub use merge::{MergeStrategy, PostProcessing, SortKey};
 pub use shape::{Literal, Shape, normalize};

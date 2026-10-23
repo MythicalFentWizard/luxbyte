@@ -100,6 +100,77 @@ impl Shared {
         Some(self.pools.pool(&target, credentials))
     }
 
+    /// Analyses a statement, or failing that, takes it as one a region
+    /// hint routes.
+    ///
+    /// # Errors
+    ///
+    /// When it cannot be read and no region hint routes it.
+    pub fn read(&self, sql: &str) -> Result<luxbyte_sql::Prepared, Refusal> {
+        self.cache
+            .analyze(sql)
+            .or_else(|error| self.unread(sql, &error.to_string()))
+    }
+
+    /// A statement the parser could not read, if a region hint routes it.
+    ///
+    /// Nothing is known of what it does, so it is taken to write, to the
+    /// primary, and to touch every geo-partitioned table: it waits for any
+    /// move, and a proxy that cannot hear about moves refuses it.
+    ///
+    /// # Errors
+    ///
+    /// The parser's error, when no region hint routes it.
+    pub fn unread(&self, sql: &str, error: &str) -> Result<luxbyte_sql::Prepared, Refusal> {
+        let unreadable = || {
+            Refusal::new("42601", error.to_owned()).with_hint(
+                "if PostgreSQL accepts it, name its region in a comment, as \
+                 /* luxbyte: region=... */",
+            )
+        };
+        match luxbyte_sql::hint::find(sql) {
+            Ok(Some(luxbyte_sql::Hint::Region(_))) => {}
+            Ok(_) => return Err(unreadable()),
+            Err(message) => return Err(Refusal::new("42601", message)),
+        }
+        // One statement only: the proxy cannot tell where this one ends.
+        if luxbyte_sql::statements::split(sql).len() != 1 {
+            return Err(unreadable());
+        }
+        let tables = self
+            .router
+            .topology()
+            .tables
+            .iter()
+            .filter(|policy| {
+                matches!(
+                    policy.placement,
+                    luxbyte_core::topology::Placement::GeoPartitioned { .. }
+                )
+            })
+            .map(|policy| luxbyte_sql::TableRef {
+                schema: Some(policy.schema.clone()),
+                name: policy.table.clone(),
+                alias: None,
+            })
+            .collect();
+        Ok(luxbyte_sql::Prepared {
+            analyses: Arc::new(vec![StatementAnalysis {
+                kind: luxbyte_sql::StatementKind::Other,
+                access: Access::ReadWrite,
+                tables,
+                constraints: luxbyte_sql::KeyConstraints::unconstrained(),
+                assigned_columns: Vec::new(),
+                highest_parameter: 0,
+                post_processing: luxbyte_sql::PostProcessing::default(),
+                branches: Vec::new(),
+            }]),
+            literals: Vec::new(),
+            first_placeholder: 1,
+            hit: false,
+        })
+    }
+
     /// Whether where a statement goes depends on the directory: whether it
     /// touches a geo-partitioned table.
     pub fn uses_directory(&self, analysis: &StatementAnalysis) -> bool {
@@ -482,15 +553,10 @@ impl Session {
             return self.ready().await;
         }
 
-        let prepared = match self.shared.cache.analyze(sql) {
+        let prepared = match self.shared.read(sql) {
             Ok(prepared) => prepared,
-            Err(error) => {
-                self.error(&Refusal {
-                    sqlstate: "42601".to_owned(),
-                    message: error.to_string(),
-                    hint: None,
-                    retryable: false,
-                })?;
+            Err(refusal) => {
+                self.error(&refusal)?;
                 return self.ready().await;
             }
         };
@@ -542,8 +608,15 @@ impl Session {
                 break;
             }
 
+            let hint = match luxbyte_sql::hint::find(text) {
+                Ok(hint) => hint,
+                Err(message) => {
+                    self.error(&Refusal::new("42601", message))?;
+                    break;
+                }
+            };
             let started = std::time::Instant::now();
-            let (plan, _write) = self.route(analysis, &parameters).await;
+            let (plan, _write) = self.route(analysis, &parameters, hint.as_ref()).await;
             let kind = plan_kind(&plan);
             let writes: Vec<String> = if analysis.access.needs_primary() {
                 plan.regions().into_iter().map(ToOwned::to_owned).collect()
@@ -591,6 +664,7 @@ impl Session {
         &self,
         analysis: &StatementAnalysis,
         parameters: &ParameterValues,
+        hint: Option<&luxbyte_sql::Hint>,
     ) -> (Plan, Option<crate::relocate::Ticket>) {
         let moves = &self.shared.moves;
         let started = std::time::Instant::now();
@@ -614,7 +688,11 @@ impl Session {
                 // this point either is seen by the planner or waits for this
                 // write.
                 let ticket = analysis.access.needs_primary().then(|| moves.write());
-                match self.shared.router.route(analysis, Some(parameters)) {
+                match self
+                    .shared
+                    .router
+                    .route_hinted(analysis, Some(parameters), hint)
+                {
                     Routing::Ready(plan) => return (plan, ticket),
                     Routing::Held(refusal) => refusal,
                     Routing::Claim(keys) => {

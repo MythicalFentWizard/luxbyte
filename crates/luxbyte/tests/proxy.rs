@@ -901,3 +901,61 @@ async fn a_large_result_streams_through_whole() {
     assert_eq!(result.rows[19_999][0].as_deref(), Some("row-19999"));
     assert_eq!(result.tags.last().map(String::as_str), Some("SELECT 20000"));
 }
+
+// ------------------------------------------------------------------ hints
+
+#[tokio::test]
+async fn a_key_hint_routes_what_the_proxy_cannot_see_the_key_of() {
+    let f = fixture(&placed()).await;
+    let mut client = client(&f.proxy).await;
+    let sql = "/* luxbyte: key=bob */ SELECT * FROM users WHERE lower(tenant_id) = 'bob'";
+    client.simple_query(sql).await.expect("routed by the hint");
+    assert!(f.us.saw("lower(tenant_id)"));
+    assert!(!f.eu.saw("lower(tenant_id)"));
+    assert!(!f.ap.saw("lower(tenant_id)"));
+}
+
+#[tokio::test]
+async fn a_region_hint_runs_a_statement_the_proxy_cannot_parse() {
+    let f = fixture(&placed()).await;
+    let mut client = client(&f.proxy).await;
+
+    // PostgreSQL accepts REINDEX; the proxy's parser does not, and says
+    // how to send it anyway rather than guessing where it goes.
+    let error = client
+        .simple_query("REINDEX TABLE users")
+        .await
+        .expect_err("unreadable without a hint");
+    assert_eq!(error.sqlstate(), Some("42601"), "{error}");
+
+    client
+        .simple_query("/* luxbyte: region=us-east */ REINDEX TABLE users")
+        .await
+        .expect("sent where the hint said");
+    assert!(f.us.saw("REINDEX TABLE users"));
+    assert!(!f.eu.saw("REINDEX"));
+
+    // A hint that cannot be read is an error, not ignored.
+    let error = client
+        .simple_query("/* luxbyte: shard=2 */ SELECT 1")
+        .await
+        .expect_err("malformed hint");
+    assert_eq!(error.sqlstate(), Some("42601"), "{error}");
+}
+
+#[tokio::test]
+async fn route_shows_where_a_hint_sends_a_statement() {
+    let f = fixture(&placed()).await;
+    let mut client = client(&f.proxy).await;
+    let result = client
+        .simple_query(
+            "ROUTE /* luxbyte: key=bob */ SELECT * FROM users WHERE lower(tenant_id) = 'x'",
+        )
+        .await
+        .unwrap();
+    let details = values(&result, 2);
+    assert!(
+        details.iter().any(|detail| detail.contains("us-east")),
+        "{details:?}"
+    );
+}

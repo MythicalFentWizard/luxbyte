@@ -773,3 +773,87 @@ key = "tenant_id"
     };
     assert_eq!(regions.len(), 3);
 }
+
+// ------------------------------------------------------------------ hints
+
+fn hinted(router: &Router, sql: &str) -> Routing {
+    let hint = luxbyte_sql::hint::find(sql).expect("a readable hint");
+    let parsed = luxbyte_sql::analyze(sql).expect("parse");
+    let statement = parsed.first().expect("one statement");
+    router.route_hinted(statement, Some(&ParameterValues::default()), hint.as_ref())
+}
+
+fn ready_region(routing: Routing) -> String {
+    match routing {
+        Routing::Ready(Plan::Single { region, .. }) => region,
+        other => panic!("expected one region, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_key_hint_routes_a_statement_whose_key_the_analyser_cannot_see() {
+    let router = router();
+    // The key is inside a function call, so the analysis sees no key.
+    assert_eq!(
+        ready_region(hinted(
+            &router,
+            "/* luxbyte: key=bob */ SELECT * FROM users WHERE lower(tenant_id) = lower('BOB')"
+        )),
+        "us-east"
+    );
+    // Every geo-partitioned table in the statement is pinned, joins included.
+    assert_eq!(
+        ready_region(hinted(
+            &router,
+            "/* luxbyte: key=alice */ SELECT * FROM users u JOIN orders o ON o.uid = u.id"
+        )),
+        "eu-west"
+    );
+    // A statement naming no geo-partitioned table has no key to route on.
+    let Routing::Ready(Plan::Refuse(refusal)) =
+        hinted(&router, "/* luxbyte: key=bob */ SELECT * FROM currencies")
+    else {
+        panic!("expected a refusal");
+    };
+    assert_eq!(refusal.sqlstate, "0A000");
+}
+
+#[test]
+fn a_region_hint_sends_a_statement_there_but_still_waits_for_a_move() {
+    let router = router();
+    assert_eq!(
+        ready_region(hinted(
+            &router,
+            "/* luxbyte: region=ap-south */ SELECT count(*) FROM users"
+        )),
+        "ap-south"
+    );
+    let Routing::Ready(Plan::Refuse(refusal)) =
+        hinted(&router, "/* luxbyte: region=mars */ SELECT 1")
+    else {
+        panic!("expected a refusal");
+    };
+    assert_eq!(refusal.sqlstate, "22023");
+
+    // A write the hint sends where a moving key's rows were could be lost.
+    let router = moving_alice(luxbyte_core::RelocationPhase::Cutover);
+    assert!(matches!(
+        hinted(
+            &router,
+            "/* luxbyte: region=eu-west */ UPDATE users SET name = 'x' WHERE id = 1"
+        ),
+        Routing::Held(_)
+    ));
+    assert!(matches!(
+        hinted(&router, "/* luxbyte: region=eu-west */ SELECT * FROM users"),
+        Routing::Ready(_)
+    ));
+}
+
+#[test]
+fn hints_leave_alone_what_the_proxy_answers_itself() {
+    assert!(matches!(
+        hinted(&router(), "/* luxbyte: region=ap-south */ BEGIN"),
+        Routing::Ready(Plan::Local(_))
+    ));
+}

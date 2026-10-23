@@ -1354,3 +1354,32 @@ async fn backend_connections_are_reused_after_extended_batches() {
     }
     assert_eq!(f.eu.connections_accepted(), 1);
 }
+
+#[tokio::test]
+async fn a_hinted_statement_routes_over_the_extended_protocol_too() {
+    let f = fixture().await;
+    let mut client = client(&f.proxy).await;
+    let replies = client
+        .pipeline(&[
+            parse(
+                "reindex",
+                "/* luxbyte: region=us-east */ REINDEX TABLE users",
+            ),
+            bind("", "reindex", &[]),
+            execute("", 0),
+            parse(
+                "",
+                "/* luxbyte: key=bob */ SELECT id FROM users WHERE lower(tenant_id) = $1",
+            ),
+            bind("", "", &["bob"]),
+            execute("", 0),
+            sync(),
+        ])
+        .await
+        .expect("pipeline");
+    assert_eq!(error_code(&replies), None, "{:?}", tags(&replies));
+    assert!(f.us.saw("REINDEX TABLE users"));
+    assert!(f.us.saw("lower(tenant_id)"));
+    assert!(!f.eu.saw("REINDEX"));
+    assert!(!f.eu.saw("lower(tenant_id)"));
+}

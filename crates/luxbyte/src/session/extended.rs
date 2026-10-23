@@ -122,6 +122,8 @@ struct Statement {
     /// When the client parsed it: a backend copy parsed earlier is not
     /// used.
     parsed_at: std::time::Instant,
+    /// Where a comment in it says it goes.
+    hint: Option<luxbyte_sql::Hint>,
 }
 
 impl Statement {
@@ -428,7 +430,7 @@ impl Session {
                 ),
             );
         } else {
-            match self.shared.cache.analyze(parse.sql) {
+            match self.shared.read(parse.sql) {
                 Ok(prepared) if prepared.analyses.len() > 1 => {
                     return self.refuse(
                         sequence,
@@ -447,10 +449,14 @@ impl Session {
                     return self.refuse(sequence, &aborted());
                 }
                 Ok(prepared) => Body::Sql(prepared),
-                Err(error) => return self.refuse(sequence, &plain("42601", error.to_string())),
+                Err(refusal) => return self.refuse(sequence, &refusal),
             }
         };
 
+        let hint = match luxbyte_sql::hint::find(parse.sql) {
+            Ok(hint) => hint,
+            Err(message) => return self.refuse(sequence, &plain("42601", message)),
+        };
         let backend_name = (!parse.name.is_empty() && matches!(body, Body::Sql(_)))
             .then(|| backend_name(parse.sql, &parse.parameter_types));
         let statement = Arc::new(Statement {
@@ -458,6 +464,7 @@ impl Session {
             body,
             backend_name,
             parsed_at: std::time::Instant::now(),
+            hint,
         });
         let previous = self
             .extended
@@ -543,7 +550,9 @@ impl Session {
 
         let values = self.bound_values(statement, bind);
         let parameters = ParameterValues::from_prepared(prepared, &values);
-        let (plan, write) = self.route(analysis, &parameters).await;
+        let (plan, write) = self
+            .route(analysis, &parameters, statement.hint.as_ref())
+            .await;
         self.extended.writes.extend(write);
         if let (Plan::Single { region, access }, true) = (&plan, self.transaction.is_some()) {
             if access.needs_primary() {

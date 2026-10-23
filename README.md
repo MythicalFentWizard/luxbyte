@@ -238,6 +238,28 @@ guessed. A table outside the move with a foreign key onto one inside it is
 refused too, since the move would break it; foreign keys between the moved
 tables are followed, parents inserted first and deleted last.
 
+### Hints
+
+Sometimes the key is there but the proxy cannot see it — inside a function
+call, a subquery, a view — and sometimes the proxy cannot read the
+statement at all, because its parser does not know that corner of
+PostgreSQL's grammar. The application can say where the statement goes:
+
+```sql
+/* luxbyte: key=alice */ SELECT * FROM users WHERE lower(tenant_id) = lower($1);
+/* luxbyte: region=eu-west */ REINDEX TABLE users;
+```
+
+`key=` routes as if every geo-partitioned table in the statement were
+constrained to that key, through the directory as usual. `region=` sends
+the statement to one region; a statement the proxy cannot parse runs there
+too, treated as a write that may touch any geo-partitioned table. Either
+way a move in progress is still waited for. A hint is only read from a
+comment that begins with `luxbyte:`, never from inside a string; one that
+cannot be read is an error rather than ignored; and hints are left out of
+the analysis cache's key, so a key per statement costs no cache entries.
+`ROUTE` shows where a hinted statement would go.
+
 ### Shards within a region
 
 One primary per region is not always enough. Regions that share a

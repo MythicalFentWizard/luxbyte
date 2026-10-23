@@ -93,8 +93,12 @@ fn route(shared: &Shared, sql: &str) -> QueryResult {
     let texts = luxbyte_sql::statements::split(sql);
     let mut rows = Vec::new();
     for (position, analysis) in analyses.iter().enumerate() {
-        let plan = shared.router.plan(analysis, None);
         let text = texts.get(position).copied().unwrap_or(sql);
+        let hint = match luxbyte_sql::hint::find(text) {
+            Ok(hint) => hint,
+            Err(message) => return table_error(&message),
+        };
+        let plan = shared.router.plan_hinted(analysis, None, hint.as_ref());
         for (step, detail) in crate::explain::lines(text, analysis, &plan) {
             rows.push(vec![
                 position.saturating_add(1).to_string(),
