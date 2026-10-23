@@ -70,6 +70,12 @@ impl std::fmt::Display for ConnectionTarget {
 pub struct QueryResult {
     /// Column names, from the last `RowDescription` seen.
     pub columns: Vec<String>,
+    /// Datatype OID of each column.
+    ///
+    /// Kept because merging two regions' results in `ORDER BY` order needs
+    /// to know whether a column compares as text or as a number. Sorting
+    /// integers lexicographically puts 10 before 9.
+    pub type_oids: Vec<i32>,
     /// Result rows, with `None` for SQL `NULL`.
     pub rows: Vec<Vec<Option<String>>>,
     /// Command tags, one per statement in the query.
@@ -274,6 +280,7 @@ impl Connection {
             match Backend::decode(&message)? {
                 Backend::RowDescription { fields } => {
                     result.columns = fields.iter().map(|field| field.name.to_owned()).collect();
+                    result.type_oids = fields.iter().map(|field| field.type_oid).collect();
                 }
                 Backend::DataRow { columns } => {
                     result.rows.push(

@@ -1,0 +1,731 @@
+//! One client connection, from startup to disconnect.
+
+use std::sync::Arc;
+
+use luxbyte_core::directory::MemoryDirectory;
+use luxbyte_core::topology::Endpoint;
+use luxbyte_core::{LocalIntent, ParameterValues, Plan, Refusal, Router};
+use luxbyte_pool::{ConnectionTarget, Credentials, Pool, PoolError, PoolSet, QueryResult};
+use luxbyte_proto::backend::{TransactionStatus, build};
+use luxbyte_proto::frontend::Frontend;
+use luxbyte_proto::startup::{SSL_REQUEST_CODE, StartupRequest};
+use luxbyte_proto::{Framed, Peer, ProtocolError};
+use luxbyte_sql::{Access, AnalysisCache, MergeStrategy, StatementAnalysis, TransactionOp};
+use luxbyte_txn::{Coordinator, Transaction};
+use tokio::net::TcpStream;
+
+use crate::merge::{RegionResult, merge};
+use crate::split::{SplitError, split_insert};
+
+/// Everything shared between all sessions.
+#[derive(Debug)]
+pub struct Shared {
+    /// Decides where statements go.
+    pub router: Router,
+    /// Reuses statement analyses across sessions.
+    pub cache: AnalysisCache,
+    /// Backend connections.
+    pub pools: PoolSet,
+    /// Issues and resolves distributed transactions.
+    pub coordinator: Coordinator,
+    /// The key directory, shared with the router.
+    pub directory: Arc<MemoryDirectory>,
+    /// How to authenticate to backends.
+    pub credentials: Credentials,
+    /// Role to connect to backends as.
+    pub backend_user: String,
+    /// Database to connect to.
+    pub backend_database: String,
+}
+
+impl Shared {
+    /// The pool for a region, choosing a replica for reads where one exists.
+    pub fn pool_for(&self, region: &str, access: Access, nth: usize) -> Option<Pool> {
+        let region = self.router.topology().region(region)?;
+        let endpoint: &Endpoint = if access.needs_primary() {
+            &region.primary
+        } else {
+            region.read_endpoint(nth)
+        };
+        let target = ConnectionTarget::new(endpoint, &self.backend_database, &self.backend_user);
+        Some(self.pools.pool(&target, &self.credentials))
+    }
+}
+
+/// What ended a session.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SessionError {
+    /// The connection failed or the protocol was violated.
+    #[error("protocol error: {0}")]
+    Protocol(#[from] ProtocolError),
+    /// The socket failed.
+    #[error("i/o error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// One client connection.
+pub struct Session {
+    shared: Arc<Shared>,
+    client: Framed<TcpStream>,
+    status: TransactionStatus,
+    /// `SET` statements to replay onto every backend this session uses.
+    settings: Vec<String>,
+    transaction: Option<Transaction>,
+    /// Advanced per read, to spread reads across a region's replicas.
+    reads: usize,
+}
+
+impl Session {
+    /// Serves one client until it disconnects.
+    pub async fn run(shared: Arc<Shared>, stream: TcpStream) -> Result<(), SessionError> {
+        stream.set_nodelay(true)?;
+        let mut session = Self {
+            shared,
+            client: Framed::new(stream, Peer::Frontend),
+            status: TransactionStatus::Idle,
+            settings: Vec::new(),
+            transaction: None,
+            reads: 0,
+        };
+        if session.startup().await? {
+            session.serve().await?;
+        }
+        Ok(())
+    }
+
+    /// Handles the startup phase. Returns whether to go on to serving.
+    async fn startup(&mut self) -> Result<bool, SessionError> {
+        let mut first = self.client.read_untagged().await?;
+
+        if is_request(&first, SSL_REQUEST_CODE) {
+            // TLS to the client is not implemented, and declining is the
+            // protocol's own answer rather than an error.
+            self.client.queue_raw(b"N");
+            self.client.flush().await?;
+            first = self.client.read_untagged().await?;
+        }
+
+        match StartupRequest::decode(&first)? {
+            StartupRequest::Startup(parameters) => {
+                // Client authentication is not implemented. Saying so here,
+                // once, is better than pretending: the listener must not be
+                // reachable from anywhere the backends are not.
+                self.client.queue_raw(&build::authentication_ok()?);
+                for (name, value) in [
+                    ("server_version", "18.0 (luxbyte)"),
+                    ("client_encoding", "UTF8"),
+                    ("DateStyle", "ISO, MDY"),
+                    ("integer_datetimes", "on"),
+                    ("standard_conforming_strings", "on"),
+                    (
+                        "application_name",
+                        parameters.get("application_name").unwrap_or(""),
+                    ),
+                ] {
+                    self.client
+                        .queue_raw(&build::parameter_status(name, value)?);
+                }
+                // The proxy's own key, not a backend's: a cancel request
+                // arrives on a new connection and has to be routed, which
+                // needs a key this proxy issued.
+                self.client.queue_raw(&build::backend_key_data(0, 0)?);
+                self.ready().await?;
+                Ok(true)
+            }
+            // A cancel arrives on its own connection and carries no
+            // credentials. Routing one needs a key registry this proxy does
+            // not keep yet, so it is accepted and dropped rather than
+            // forwarded to a guess.
+            StartupRequest::Cancel(_) => Ok(false),
+            StartupRequest::GssEnc | StartupRequest::Ssl => {
+                self.fatal("0A000", "GSSAPI encryption is not supported")
+                    .await?;
+                Ok(false)
+            }
+        }
+    }
+
+    async fn serve(&mut self) -> Result<(), SessionError> {
+        loop {
+            let message = match self.client.read_message().await {
+                Ok(message) => message,
+                Err(ProtocolError::Closed(_)) => return Ok(()),
+                Err(error) => return Err(error.into()),
+            };
+
+            match Frontend::decode(&message)? {
+                Frontend::Query { sql } => {
+                    let sql = sql.to_owned();
+                    self.handle_query(&sql).await?;
+                }
+                Frontend::Terminate => return Ok(()),
+                // The extended query protocol is not implemented yet. A
+                // clear refusal is better than silence: a client that waits
+                // for a reply it will never get looks like a hung database.
+                Frontend::Parse(_)
+                | Frontend::Bind(_)
+                | Frontend::Describe { .. }
+                | Frontend::Execute { .. }
+                | Frontend::Close { .. } => {
+                    self.error(&Refusal {
+                        sqlstate: "0A000".to_owned(),
+                        message: "the extended query protocol is not supported yet".to_owned(),
+                        hint: Some(
+                            "use simple query mode, for example by disabling prepared \
+                             statements in the client"
+                                .to_owned(),
+                        ),
+                        retryable: false,
+                    })?;
+                    self.ready().await?;
+                }
+                // `Sync` ends an extended-query batch; anything else is
+                // acknowledged so a stray message cannot wedge the session.
+                _ => self.ready().await?,
+            }
+        }
+    }
+
+    // --------------------------------------------------------- statements
+
+    async fn handle_query(&mut self, sql: &str) -> Result<(), SessionError> {
+        if sql.trim().is_empty() {
+            self.client.queue_raw(&build::empty_query_response()?);
+            return self.ready().await;
+        }
+
+        if let Some(result) = crate::console::handle(&self.shared, sql) {
+            self.respond(&result)?;
+            return self.ready().await;
+        }
+
+        let prepared = match self.shared.cache.analyze(sql) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.error(&Refusal {
+                    sqlstate: "42601".to_owned(),
+                    message: error.to_string(),
+                    hint: None,
+                    retryable: false,
+                })?;
+                return self.ready().await;
+            }
+        };
+
+        let parameters = ParameterValues::from_prepared(&prepared, &[]);
+        // Each statement in a batch is routed on its own, because a batch
+        // may well touch more than one region.
+        for analysis in prepared.analyses.iter() {
+            if self.blocked_by_failed_transaction(analysis) {
+                self.error(&Refusal {
+                    sqlstate: "25P02".to_owned(),
+                    message: "current transaction is aborted, commands ignored until end of \
+                              transaction block"
+                        .to_owned(),
+                    hint: Some("send ROLLBACK".to_owned()),
+                    retryable: false,
+                })?;
+                break;
+            }
+
+            let plan = self.shared.router.plan(analysis, Some(&parameters));
+            if let Err(refusal) = self.execute(analysis, sql, plan).await? {
+                self.error(&refusal)?;
+                // A failed statement inside a transaction poisons it, as it
+                // would on a single server.
+                if self.transaction.is_some() {
+                    self.status = TransactionStatus::Failed;
+                }
+                break;
+            }
+        }
+
+        self.ready().await
+    }
+
+    fn blocked_by_failed_transaction(&self, analysis: &StatementAnalysis) -> bool {
+        if self.status != TransactionStatus::Failed {
+            return false;
+        }
+        // Only the statements that end the block are allowed through.
+        !matches!(
+            analysis.kind,
+            luxbyte_sql::StatementKind::TransactionControl(
+                TransactionOp::Commit | TransactionOp::Rollback
+            )
+        )
+    }
+
+    /// Runs one planned statement. `Ok(Err(refusal))` means the statement
+    /// was refused; `Err(_)` means the session cannot continue.
+    async fn execute(
+        &mut self,
+        analysis: &StatementAnalysis,
+        sql: &str,
+        plan: Plan,
+    ) -> Result<Result<(), Refusal>, SessionError> {
+        match plan {
+            Plan::Refuse(refusal) => Ok(Err(refusal)),
+            Plan::NeedsParameters { .. } => Ok(Err(Refusal {
+                sqlstate: "0A000".to_owned(),
+                message: "the shard key is a placeholder, which needs the extended query \
+                          protocol"
+                    .to_owned(),
+                hint: None,
+                retryable: false,
+            })),
+            Plan::Local(intent) => self.local(intent, sql).await,
+            Plan::Single { region, access } => match self.run_on(&region, access, sql).await {
+                Ok(result) => {
+                    self.respond(&result)?;
+                    Ok(Ok(()))
+                }
+                Err(error) => Ok(Err(to_refusal(&error))),
+            },
+            Plan::ScatterGather { regions, merge } => self.scatter(&regions, sql, &merge).await,
+            Plan::Distributed { regions } => self.distributed(analysis, sql, &regions).await,
+        }
+    }
+
+    // ------------------------------------------------------- local work
+
+    async fn local(
+        &mut self,
+        intent: LocalIntent,
+        sql: &str,
+    ) -> Result<Result<(), Refusal>, SessionError> {
+        match intent {
+            LocalIntent::SessionState => {
+                let trimmed = sql.trim().trim_end_matches(';');
+                if trimmed.to_uppercase().starts_with("DISCARD") {
+                    self.settings.clear();
+                } else {
+                    // Replayed onto every backend this session later uses,
+                    // so that a session which moves between regions keeps
+                    // the settings it asked for.
+                    self.settings.push(trimmed.to_owned());
+                }
+                self.command_complete("SET")?;
+                Ok(Ok(()))
+            }
+            LocalIntent::Show => {
+                let home = self.shared.router.topology().home_region.clone();
+                match self.run_on(&home, Access::ReadOnly, sql).await {
+                    Ok(result) => {
+                        self.respond(&result)?;
+                        Ok(Ok(()))
+                    }
+                    Err(error) => Ok(Err(to_refusal(&error))),
+                }
+            }
+            LocalIntent::TransactionControl(op) => self.transaction_control(op).await,
+        }
+    }
+
+    async fn transaction_control(
+        &mut self,
+        op: TransactionOp,
+    ) -> Result<Result<(), Refusal>, SessionError> {
+        match op {
+            TransactionOp::Begin => {
+                if self.transaction.is_none() {
+                    self.transaction = Some(self.shared.coordinator.begin());
+                    self.status = TransactionStatus::InTransaction;
+                }
+                self.command_complete("BEGIN")?;
+                Ok(Ok(()))
+            }
+            TransactionOp::Commit => {
+                let Some(transaction) = self.transaction.take() else {
+                    // `COMMIT` with no transaction open is a warning in
+                    // PostgreSQL, not an error.
+                    self.command_complete("COMMIT")?;
+                    return Ok(Ok(()));
+                };
+                let outcome = transaction.commit().await;
+                self.status = TransactionStatus::Idle;
+                match outcome {
+                    Ok(_) => {
+                        self.command_complete("COMMIT")?;
+                        Ok(Ok(()))
+                    }
+                    Err(error) => Ok(Err(Refusal {
+                        sqlstate: if error.retryable() { "40001" } else { "40000" }.to_owned(),
+                        message: error.to_string(),
+                        hint: error
+                            .retryable()
+                            .then(|| "retry the transaction".to_owned()),
+                        retryable: error.retryable(),
+                    })),
+                }
+            }
+            TransactionOp::Rollback => {
+                if let Some(transaction) = self.transaction.take() {
+                    let _ = transaction.rollback().await;
+                }
+                self.status = TransactionStatus::Idle;
+                self.command_complete("ROLLBACK")?;
+                Ok(Ok(()))
+            }
+            // A savepoint inside a distributed transaction would have to be
+            // taken and released on every participant atomically, which is
+            // a second consensus problem on top of the commit.
+            // `TransactionOp` is non-exhaustive, so anything added later
+            // is refused rather than silently mishandled.
+            _ => Ok(Err(Refusal {
+                sqlstate: "0A000".to_owned(),
+                message: "savepoints are not supported inside a transaction that may span \
+                          regions"
+                    .to_owned(),
+                hint: None,
+                retryable: false,
+            })),
+        }
+    }
+
+    // ------------------------------------------------------- backend work
+
+    /// Runs a statement on one region, through the open transaction if
+    /// there is one.
+    async fn run_on(
+        &mut self,
+        region: &str,
+        access: Access,
+        sql: &str,
+    ) -> Result<QueryResult, PoolError> {
+        let statement = self.with_settings(sql);
+        self.reads = self.reads.wrapping_add(1);
+        let pool = self
+            .shared
+            .pool_for(region, access, self.reads)
+            .ok_or_else(|| PoolError::Auth(format!("region {region} is not configured")))?;
+
+        if let Some(transaction) = self.transaction.as_mut() {
+            transaction
+                .enlist(region, &pool)
+                .await
+                .map_err(|error| PoolError::Auth(error.to_string()))?;
+            return transaction
+                .execute(region, &statement)
+                .await
+                .map_err(|error| PoolError::Auth(error.to_string()));
+        }
+        pool.simple_query(&statement).await
+    }
+
+    /// Prefixes the session's settings so a freshly borrowed connection
+    /// behaves like the one the client last used.
+    ///
+    /// Sent in the same round trip rather than separately, because a
+    /// settings replay that costs an extra transatlantic round trip would
+    /// undo the point of routing.
+    fn with_settings(&self, sql: &str) -> String {
+        if self.settings.is_empty() {
+            return sql.to_owned();
+        }
+        format!("{}; {sql}", self.settings.join("; "))
+    }
+
+    async fn scatter(
+        &mut self,
+        regions: &[String],
+        sql: &str,
+        strategy: &MergeStrategy,
+    ) -> Result<Result<(), Refusal>, SessionError> {
+        let statement = self.with_settings(sql);
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for (index, region) in regions.iter().enumerate() {
+            let Some(pool) =
+                self.shared
+                    .pool_for(region, Access::ReadOnly, self.reads.wrapping_add(index))
+            else {
+                continue;
+            };
+            let region = region.clone();
+            let statement = statement.clone();
+            // Every region is queried at once: the whole point is to pay
+            // the latency of the slowest region, not the sum of them all.
+            tasks.spawn(async move {
+                let outcome = pool.simple_query(&statement).await;
+                (region, outcome)
+            });
+        }
+        self.reads = self.reads.wrapping_add(regions.len());
+
+        let mut answers = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            let Ok((region, outcome)) = joined else {
+                continue;
+            };
+            match outcome {
+                Ok(result) => answers.push(RegionResult { region, result }),
+                // One region failing makes the result incomplete, and an
+                // incomplete result that looks whole is worse than an error.
+                Err(error) => {
+                    return Ok(Err(Refusal {
+                        sqlstate: error.sqlstate().unwrap_or("08000").to_owned(),
+                        message: format!("{region} did not answer: {error}"),
+                        hint: None,
+                        retryable: error.retryable(),
+                    }));
+                }
+            }
+        }
+
+        // Regions answer in whatever order they finish; the merge has to
+        // see them in a stable order or an equal-keyed row could move.
+        answers.sort_by(|left, right| left.region.cmp(&right.region));
+        let merged = merge(answers, strategy);
+        self.respond(&merged)?;
+        Ok(Ok(()))
+    }
+
+    async fn distributed(
+        &mut self,
+        analysis: &StatementAnalysis,
+        sql: &str,
+        regions: &[String],
+    ) -> Result<Result<(), Refusal>, SessionError> {
+        // An INSERT has to be split: broadcasting it would write every row
+        // in every region.
+        let per_region = if analysis.kind == luxbyte_sql::StatementKind::Insert {
+            match self.split_for_regions(analysis, sql) {
+                Ok(parts) => parts,
+                Err(refusal) => return Ok(Err(refusal)),
+            }
+        } else {
+            // Every other write applies to the rows a region already holds,
+            // so the same statement is correct everywhere.
+            regions
+                .iter()
+                .map(|region| crate::split::RegionStatement {
+                    region: region.clone(),
+                    sql: sql.to_owned(),
+                })
+                .collect()
+        };
+
+        // Inside an explicit transaction the client decides when to commit.
+        if self.transaction.is_some() {
+            for part in &per_region {
+                if let Err(error) = self
+                    .run_on(&part.region, Access::ReadWrite, &part.sql)
+                    .await
+                {
+                    return Ok(Err(to_refusal(&error)));
+                }
+            }
+            self.command_complete("INSERT 0 0")?;
+            return Ok(Ok(()));
+        }
+
+        // Otherwise the statement is its own transaction.
+        let mut transaction = self.shared.coordinator.begin();
+        let mut affected = 0_usize;
+        for part in &per_region {
+            let Some(pool) = self.shared.pool_for(&part.region, Access::ReadWrite, 0) else {
+                continue;
+            };
+            let statement = self.with_settings(&part.sql);
+            if let Err(error) = transaction.enlist(&part.region, &pool).await {
+                let _ = transaction.rollback().await;
+                return Ok(Err(txn_refusal(&error)));
+            }
+            match transaction.execute(&part.region, &statement).await {
+                Ok(result) => affected = affected.saturating_add(rows_affected(&result)),
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    return Ok(Err(txn_refusal(&error)));
+                }
+            }
+        }
+
+        match transaction.commit().await {
+            Ok(_) => {
+                let tag = command_tag(analysis, affected);
+                self.command_complete(&tag)?;
+                Ok(Ok(()))
+            }
+            Err(error) => Ok(Err(txn_refusal(&error))),
+        }
+    }
+
+    fn split_for_regions(
+        &self,
+        analysis: &StatementAnalysis,
+        sql: &str,
+    ) -> Result<Vec<crate::split::RegionStatement>, Refusal> {
+        let table = analysis.tables.first().ok_or_else(|| Refusal {
+            sqlstate: "0A000".to_owned(),
+            message: "the statement writes to no table".to_owned(),
+            hint: None,
+            retryable: false,
+        })?;
+        let key = match self
+            .shared
+            .router
+            .topology()
+            .placement(table.schema.as_deref(), &table.name)
+        {
+            Some(luxbyte_core::topology::Placement::GeoPartitioned { key }) => key.clone(),
+            _ => {
+                return Err(Refusal {
+                    sqlstate: "0A000".to_owned(),
+                    message: format!("\"{table}\" is not partitioned by a key"),
+                    hint: None,
+                    retryable: false,
+                });
+            }
+        };
+
+        let directory = Arc::clone(&self.shared.directory);
+        let home = self.shared.router.topology().home_region.clone();
+        let table_name = table.name.clone();
+        split_insert(sql, &key, move |value| {
+            use luxbyte_core::directory::{Directory, Location};
+            match directory.locate(&table_name, value) {
+                Location::Known(state) => state.read_region().to_owned(),
+                Location::Unseen => home.clone(),
+            }
+        })
+        .map_err(|error: SplitError| Refusal {
+            sqlstate: "0A000".to_owned(),
+            message: format!(
+                "this write spans regions and cannot be split: {}",
+                error.reason()
+            ),
+            hint: Some("insert the rows for each region in separate statements".to_owned()),
+            retryable: false,
+        })
+    }
+
+    // ---------------------------------------------------------- replying
+
+    fn respond(&mut self, result: &QueryResult) -> Result<(), SessionError> {
+        if !result.columns.is_empty() {
+            let names: Vec<&str> = result.columns.iter().map(String::as_str).collect();
+            self.client
+                .queue_raw(&build::row_description_typed(&names, &result.type_oids)?);
+            for row in &result.rows {
+                let values: Vec<Option<&str>> = row.iter().map(|value| value.as_deref()).collect();
+                self.client.queue_raw(&build::data_row(&values)?);
+            }
+        }
+        // A batch that replayed settings produced several tags; the one the
+        // client asked about is the last.
+        let tag = result
+            .tags
+            .last()
+            .cloned()
+            .unwrap_or_else(|| format!("SELECT {}", result.rows.len()));
+        self.client.queue_raw(&build::command_complete(&tag)?);
+        Ok(())
+    }
+
+    fn command_complete(&mut self, tag: &str) -> Result<(), SessionError> {
+        self.client.queue_raw(&build::command_complete(tag)?);
+        Ok(())
+    }
+
+    fn error(&mut self, refusal: &Refusal) -> Result<(), SessionError> {
+        let mut builder = build::ErrorBuilder::error(&refusal.sqlstate, refusal.message.clone());
+        if let Some(hint) = &refusal.hint {
+            builder = builder.hint(hint.clone());
+        }
+        self.client.queue_raw(&builder.build()?);
+        Ok(())
+    }
+
+    async fn fatal(&mut self, sqlstate: &str, message: &str) -> Result<(), SessionError> {
+        self.client
+            .queue_raw(&build::ErrorBuilder::fatal(sqlstate, message).build()?);
+        self.client.flush().await?;
+        Ok(())
+    }
+
+    async fn ready(&mut self) -> Result<(), SessionError> {
+        self.client.queue_raw(&build::ready_for_query(self.status)?);
+        self.client.flush().await?;
+        Ok(())
+    }
+}
+
+fn is_request(message: &luxbyte_proto::RawMessage, code: i32) -> bool {
+    message
+        .body
+        .get(..4)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .is_some_and(|bytes| i32::from_be_bytes(bytes) == code)
+}
+
+fn to_refusal(error: &PoolError) -> Refusal {
+    Refusal {
+        // `08000` is connection_exception, which is what a backend that
+        // cannot be reached amounts to from the client's point of view.
+        sqlstate: error.sqlstate().unwrap_or("08000").to_owned(),
+        message: error.to_string(),
+        hint: None,
+        retryable: error.retryable(),
+    }
+}
+
+fn txn_refusal(error: &luxbyte_txn::TxnError) -> Refusal {
+    Refusal {
+        sqlstate: if error.retryable() { "40001" } else { "40000" }.to_owned(),
+        message: error.to_string(),
+        hint: error
+            .retryable()
+            .then(|| "retry the transaction".to_owned()),
+        retryable: error.retryable(),
+    }
+}
+
+/// How many rows a command tag says it changed.
+fn rows_affected(result: &QueryResult) -> usize {
+    result
+        .tags
+        .last()
+        .and_then(|tag| tag.rsplit(' ').next())
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(0)
+}
+
+fn command_tag(analysis: &StatementAnalysis, affected: usize) -> String {
+    use luxbyte_sql::StatementKind;
+    match analysis.kind {
+        StatementKind::Insert => format!("INSERT 0 {affected}"),
+        StatementKind::Update => format!("UPDATE {affected}"),
+        StatementKind::Delete => format!("DELETE {affected}"),
+        _ => format!("SELECT {affected}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(tags: &[&str]) -> QueryResult {
+        QueryResult {
+            tags: tags.iter().map(|t| (*t).to_owned()).collect(),
+            ..QueryResult::default()
+        }
+    }
+
+    #[test]
+    fn row_counts_are_read_from_the_command_tag() {
+        assert_eq!(rows_affected(&result(&["INSERT 0 3"])), 3);
+        assert_eq!(rows_affected(&result(&["UPDATE 7"])), 7);
+        assert_eq!(rows_affected(&result(&["DELETE 0"])), 0);
+        assert_eq!(rows_affected(&result(&["BEGIN"])), 0);
+        assert_eq!(rows_affected(&result(&[])), 0);
+    }
+
+    #[test]
+    fn a_batch_reports_the_last_tag_not_the_first() {
+        // Settings are replayed in the same batch, so the first tags belong
+        // to the SETs rather than to the client's statement.
+        assert_eq!(rows_affected(&result(&["SET", "SET", "UPDATE 4"])), 4);
+    }
+}

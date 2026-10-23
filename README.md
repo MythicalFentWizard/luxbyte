@@ -9,10 +9,10 @@ where the user is, and keeps a directory so it can be moved later when they
 move. A read in your home region is a local round trip. The same read against a
 single distant cluster is the speed of light and back.
 
-**Status: in progress.** The protocol codec, the statement analyser and the
-routing planner are complete, tested and usable through the `luxbyte explain`
-command. The proxy server, connection pooling and the two-phase commit driver
-are not written yet. See [Where it stands](#where-it-stands).
+**Status: it runs.** `luxbyte serve` accepts PostgreSQL clients, routes their
+statements, merges scattered reads and commits across regions in two phases.
+The extended query protocol and client authentication are the notable gaps —
+see [Where it stands](#where-it-stands).
 
 ---
 
@@ -52,6 +52,30 @@ understand produces *no* constraint rather than a guessed one, so the statement
 fans out — slower, and correct.
 
 ## Try it
+
+```bash
+luxbyte serve --config examples/luxbyte.toml
+psql -h 127.0.0.1 -p 6432 -d shop
+```
+
+```
+shop=> SHOW REGIONS;
+  region  | home |        primary        |         replicas
+----------+------+-----------------------+---------------------------
+ eu-west  | yes  | eu.db.internal:5432   | eu-replica.db.internal:5432
+ us-east  | no   | us.db.internal:5432   |
+ ap-south | no   | ap.db.internal:5432   |
+
+shop=> WHERE IS users alice;
+ table | key   | region  |  state
+-------+-------+---------+----------
+ users | alice | eu-west | resident
+```
+
+The console answers over the same connection, so the only tool needed to see
+what the router is doing is the one already on the machine.
+
+To see a routing decision without starting anything:
 
 ```bash
 cargo run -p luxbyte -- explain \
@@ -219,6 +243,29 @@ identifiers this coordinator issued, and rolls back any the log never decided
 on. It is scoped to its own identifier prefix, because rolling back another
 system's prepared transaction would destroy data it knows nothing about.
 
+## Splitting a write, rather than broadcasting it
+
+Most multi-region writes need no special handling. `UPDATE users SET active =
+false WHERE last_seen < '2026-01-01'` can go verbatim to every region: each
+applies it to the rows it holds, and the union is what one server would have
+done.
+
+`INSERT ... VALUES` is the exception, and getting it wrong is silent.
+Broadcasting
+
+```sql
+INSERT INTO users (tenant_id, name) VALUES ('alice', 'a'), ('bob', 'b')
+```
+
+to two regions does not write one row in each — it writes **both rows in
+both**, and nothing complains. The duplicate sits in a region the directory
+will never look in, so it stays invisible until somebody counts.
+
+So the rows are partitioned by where their key belongs and each region gets an
+`INSERT` containing only its own, rebuilt from the parse tree rather than by
+cutting up the text — because the text has commas inside string literals and
+the parse tree does not. Anything that cannot be split that way is refused.
+
 ## Engineering rules
 
 The workspace denies, not warns:
@@ -248,14 +295,23 @@ effect:
 
 ### Tests
 
-200 tests, no database required, `cargo test` and nothing else:
+321 tests, no database required, `cargo test` and nothing else:
 
 ```
-luxbyte-proto   49   framing, truncation, bad lengths, SCRAM both directions
-luxbyte-sql     81   key extraction, the AND/OR lattice, merge safety, cache
-luxbyte-core    64   topology, relocation state machine, end-to-end routing
-luxbyte          6   command line
+luxbyte-proto    49   framing, truncation, bad lengths, SCRAM both directions
+luxbyte-sql      81   key extraction, the AND/OR lattice, merge safety, cache
+luxbyte-core     64   topology, relocation state machine, end-to-end routing
+luxbyte-pool     23   handshake, reuse, limits, lifetimes, lost connections
+luxbyte-txn      29   two-phase commit and recovery, including the crash cases
+luxbyte-testkit   3   the fake backend itself
+luxbyte          72   merging, splitting, config, and 30 through the proxy
 ```
+
+The last thirty are the proxy as a whole: a real client connects over TCP to a
+real proxy, which connects over TCP to real backends, and everything speaks
+the wire protocol. The only thing that is not PostgreSQL is the backends, and
+they are only pretending so that a participant can be made to refuse a prepare,
+or vanish mid-commit, on purpose rather than on a bad day.
 
 They cover the cases that decide whether the thing is correct: a write during a
 cutover, an `OR` with one unconstrained branch, an aggregate hidden inside a
@@ -277,12 +333,31 @@ Done, tested, and working:
   analysis.
 - **`luxbyte-core`** — topology, placement, the key directory with its
   relocation state machine, and the routing planner.
-- **`luxbyte`** — the `explain` command.
+- **`luxbyte-pool`** — per-endpoint connection pooling, keyed by endpoint,
+  database and role. A connection goes back to the pool only once the server
+  has reported it idle.
+- **`luxbyte-txn`** — the two-phase commit coordinator, with a durable
+  decision log and recovery in both directions.
+- **`luxbyte-testkit`** — an in-process PostgreSQL backend speaking the real
+  wire protocol on a real socket, so all of the above is tested with
+  `cargo test` and no database.
+- **`luxbyte`** — the proxy server itself: listener, session, scatter-gather
+  execution with sorted merge, statement splitting, the operator console, and
+  the `explain` command.
 
 Not written yet:
 
-- The proxy server itself: listener, session, scatter-gather execution, the
-  operator console, metrics. Everything it needs is in place.
+- **The extended query protocol.** `Parse`/`Bind`/`Execute` are refused with a
+  clear error rather than left to hang, so a client that uses prepared
+  statements by default must be told to use simple query mode. The planner
+  already defers routing until `Bind`, so the machinery exists; the session
+  does not use it yet.
+- **Client authentication.** The proxy authenticates *to* backends with SCRAM
+  or MD5, but accepts any client. Do not expose the listener anywhere the
+  backends are not already reachable from.
+- **Query cancellation.** A `CancelRequest` arrives on its own connection and
+  needs a key registry to route; it is accepted and dropped.
+- Metrics, and TLS to the client.
 
 Alongside, not part of the proxy:
 

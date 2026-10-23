@@ -2,3 +2,6 @@
 target/
 **/*.rs.bk
 *.pdb
+
+# Created by `luxbyte serve` with the example configuration
+/commit-log/

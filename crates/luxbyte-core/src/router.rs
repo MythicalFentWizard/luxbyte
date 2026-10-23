@@ -102,7 +102,7 @@ pub enum LocalIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     /// A real PostgreSQL SQLSTATE, so existing error handling applies.
-    pub sqlstate: &'static str,
+    pub sqlstate: String,
     /// The primary message.
     pub message: String,
     /// What to do about it, where there is something to do.
@@ -112,9 +112,9 @@ pub struct Refusal {
 }
 
 impl Refusal {
-    fn new(sqlstate: &'static str, message: impl Into<String>) -> Self {
+    fn new(sqlstate: &str, message: impl Into<String>) -> Self {
         Self {
-            sqlstate,
+            sqlstate: sqlstate.to_owned(),
             message: message.into(),
             hint: None,
             retryable: false,

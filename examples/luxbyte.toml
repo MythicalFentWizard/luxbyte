@@ -1,0 +1,51 @@
+# A three-region deployment. Start it with:
+#   luxbyte serve --config examples/luxbyte.toml
+
+[server]
+listen = "127.0.0.1:6432"
+# Unique per proxy: it goes into every PREPARE TRANSACTION identifier and is
+# what stops two proxies resolving each other's in-doubt transactions.
+node = "eu-proxy-1"
+# Where commit decisions are written. Without it, a crash between prepare and
+# commit leaves prepared transactions for an operator to resolve by hand.
+commit_log = "./commit-log"
+
+[backend]
+user = "postgres"
+database = "shop"
+# password = "..."
+
+[pool]
+max_size = 16
+
+[topology]
+home_region = "eu-west"
+
+[[topology.regions]]
+id = "eu-west"
+primary = { host = "eu.db.internal" }
+replicas = [{ host = "eu-replica.db.internal" }]
+
+[[topology.regions]]
+id = "us-east"
+primary = { host = "us.db.internal" }
+
+[[topology.regions]]
+id = "ap-south"
+primary = { host = "ap.db.internal" }
+
+[[topology.tables]]
+table = "users"
+placement = "geo_partitioned"
+key = "tenant_id"
+
+[[topology.tables]]
+table = "currencies"
+placement = "global_replicated"
+
+# Keys already placed. In a real deployment the directory is populated as
+# rows are created; these are only a starting point.
+[[directory]]
+table = "users"
+key = "alice"
+region = "eu-west"

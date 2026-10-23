@@ -427,6 +427,31 @@ pub mod build {
         w.finish()
     }
 
+    /// A `RowDescription` whose columns have individual datatypes.
+    ///
+    /// Needed when relaying a result assembled from several backends: the
+    /// client has to be told the real types, or it will parse a number as
+    /// a string and sort it wrongly.
+    pub fn row_description_typed(
+        columns: &[&str],
+        type_oids: &[i32],
+    ) -> Result<Bytes, ProtocolError> {
+        let mut w = Writer::tagged(tag::TERMINATE_OR_ROW_DESCRIPTION);
+        w.count16(columns.len())?;
+        for (index, name) in columns.iter().enumerate() {
+            w.cstr(name);
+            w.i32(0);
+            w.i16(0);
+            // An unknown column falls back to `text`, which every client
+            // can render.
+            w.i32(type_oids.get(index).copied().unwrap_or(25));
+            w.i16(-1);
+            w.i32(-1);
+            w.i16(0);
+        }
+        w.finish()
+    }
+
     /// A `DataRow` of text values, with `None` for SQL `NULL`.
     pub fn data_row(values: &[Option<&str>]) -> Result<Bytes, ProtocolError> {
         let mut w = Writer::tagged(tag::DESCRIBE_OR_DATA_ROW);

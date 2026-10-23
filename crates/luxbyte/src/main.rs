@@ -20,15 +20,22 @@ const USAGE: &str = "\
 luxbyte — a geo-distributed PostgreSQL proxy
 
 USAGE:
+    luxbyte serve   --config <FILE>
     luxbyte explain --topology <FILE> [OPTIONS] <SQL>
 
-OPTIONS:
+SERVE OPTIONS:
+    --config <FILE>      Proxy configuration in TOML. Required.
+
+EXPLAIN OPTIONS:
     --topology <FILE>    Topology in TOML. Required.
     --directory <FILE>   Key directory, one `table key region` per line.
     --param <VALUE>      Bind a placeholder; repeat for $1, $2, ... in order.
+
     -h, --help           Print this message.
 
-EXAMPLE:
+EXAMPLES:
+    luxbyte serve --config examples/luxbyte.toml
+
     luxbyte explain --topology topology.toml \\
         --directory keys.tsv \\
         \"SELECT * FROM users WHERE tenant_id = 'alice'\"
@@ -52,9 +59,80 @@ fn run(arguments: &[String]) -> Result<String, String> {
     let first = arguments.first().map(String::as_str);
     match first {
         None | Some("-h" | "--help" | "help") => Ok(USAGE.to_owned()),
+        Some("serve") => serve(arguments.get(1..).unwrap_or_default()),
         Some("explain") => explain(arguments.get(1..).unwrap_or_default()),
         Some(other) => Err(format!("unknown command {other:?}\n\n{USAGE}")),
     }
+}
+
+/// Starts the proxy and serves until interrupted.
+fn serve(arguments: &[String]) -> Result<String, String> {
+    let mut path = None;
+    let mut index = 0_usize;
+    while let Some(argument) = arguments.get(index) {
+        match argument.as_str() {
+            "--config" => {
+                path = arguments.get(index.saturating_add(1)).cloned();
+                index = index.saturating_add(2);
+            }
+            other => {
+                return Err(format!(
+                    "unknown option {other:?}
+
+{USAGE}"
+                ));
+            }
+        }
+    }
+    let path = path.ok_or_else(|| {
+        format!(
+            "--config is required
+
+{USAGE}"
+        )
+    })?;
+    let config = luxbyte::Config::load(&path).map_err(|error| error.to_string())?;
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("luxbyte=info")),
+        )
+        .init();
+
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    runtime.block_on(async move {
+        let server = luxbyte::Server::bind(&config)
+            .await
+            .map_err(|error| error.to_string())?;
+        let address = server.local_addr().map_err(|error| error.to_string())?;
+
+        // Resolve anything a previous run left in doubt before taking
+        // traffic: an unresolved prepared transaction holds locks and stops
+        // VACUUM reclaiming, and serving more work makes that worse.
+        match server.recover().await {
+            Ok(report) if report.is_clean() => {
+                tracing::info!("no transactions were left in doubt");
+            }
+            Ok(report) => tracing::warn!(
+                committed = report.committed.len(),
+                rolled_back = report.rolled_back.len(),
+                still_in_doubt = report.still_in_doubt.len(),
+                "resolved transactions from a previous run"
+            ),
+            Err(error) => tracing::error!(%error, "recovery failed; continuing"),
+        }
+
+        if config.server.commit_log.is_none() {
+            tracing::warn!(
+                "no commit_log configured: a crash between prepare and commit will leave                  prepared transactions for an operator to resolve by hand"
+            );
+        }
+
+        tracing::info!(%address, node = %config.server.node, "listening");
+        server.serve().await;
+        Ok::<String, String>(format!("stopped listening on {address}"))
+    })
 }
 
 /// Arguments to `luxbyte explain`.
