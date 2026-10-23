@@ -582,6 +582,48 @@ async fn discard_forgets_the_settings() {
     assert!(!f.eu.saw("work_mem"));
 }
 
+#[tokio::test]
+async fn one_clients_settings_never_reach_another_client() {
+    // Connections are pooled across clients, so a SET replayed onto one
+    // would otherwise be inherited by whoever borrows it next.
+    let f = fixture(&placed()).await;
+    let mut first = client(&f.proxy).await;
+    first
+        .simple_query("SET search_path = tenant_a")
+        .await
+        .expect("set");
+    first
+        .simple_query("SELECT id FROM users WHERE tenant_id = 'alice'")
+        .await
+        .expect("read");
+
+    // The reset runs as the connection is returned, off the client's path.
+    for _ in 0..200 {
+        if f.eu.saw("DISCARD ALL") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let mut second = client(&f.proxy).await;
+    second
+        .simple_query("SELECT id FROM users WHERE tenant_id = 'alice'")
+        .await
+        .expect("read");
+
+    let statements = f.eu.statements();
+    let reset = statements.iter().position(|sql| sql == "DISCARD ALL");
+    let last = statements.len().checked_sub(1);
+    assert!(reset.is_some() && reset < last, "{statements:?}");
+    assert_eq!(
+        statements.last().map(String::as_str),
+        Some("SELECT id FROM users WHERE tenant_id = 'alice'"),
+        "the second client's statement carries none of the first's settings"
+    );
+    // Same connection, reset rather than reopened.
+    assert_eq!(f.eu.connections_accepted(), 1);
+}
+
 // ---------------------------------------------------------------- console
 
 #[tokio::test]

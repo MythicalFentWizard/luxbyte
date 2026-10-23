@@ -1049,6 +1049,18 @@ fn answer(
         return scripted_reply(reply, status);
     }
 
+    // Session-level commands report their own tags, which is how a pool
+    // tells that a connection needs resetting.
+    for (verb, tag) in [
+        ("SET ", "SET"),
+        ("RESET", "RESET"),
+        ("DISCARD", "DISCARD ALL"),
+    ] {
+        if upper.starts_with(verb) {
+            return Ok(vec![build::command_complete(tag)?]);
+        }
+    }
+
     // Otherwise report success without rows, which is what a write does.
     if *status == TransactionStatus::InTransaction {
         // Stay in the transaction.

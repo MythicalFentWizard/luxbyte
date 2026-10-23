@@ -9,7 +9,8 @@
 use std::time::Duration;
 
 use luxbyte_pool::{
-    ConnectionTarget, Credentials, Pool, PoolConfig, PoolError, PoolSet, Step, StepKind,
+    ConnectionTarget, Credentials, Pool, PoolConfig, PoolError, PoolSet, ResetPolicy, Step,
+    StepKind,
 };
 use luxbyte_proto::frontend;
 use luxbyte_testkit::{Backend, BackendConfig, Reply};
@@ -223,6 +224,105 @@ async fn a_failed_statement_inside_a_transaction_retires_the_connection() {
 }
 
 // ---------------------------------------------------------------- failures
+
+// --------------------------------------------------------------- resetting
+
+/// Waits for a connection to come back to the pool; a reset happens in the
+/// background, so it is not back the moment it is dropped.
+async fn idle_soon(pool: &Pool, wanted: usize) -> bool {
+    for _ in 0..200 {
+        if pool.stats().idle == wanted {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn a_connection_that_changed_the_session_is_reset_before_reuse() {
+    let backend = backend_with(BackendConfig::new("eu-west")).await;
+    let pool = pool(&backend);
+    pool.simple_query("SET search_path = tenant_7")
+        .await
+        .expect("set");
+    assert!(idle_soon(&pool, 1).await, "the connection should come back");
+    assert!(backend.saw("DISCARD ALL"));
+
+    // And it is reused, not reopened: resetting is cheaper than connecting.
+    pool.simple_query("SELECT 1").await.expect("select");
+    assert_eq!(backend.connections_accepted(), 1);
+    let statements = backend.statements();
+    assert_eq!(
+        statements,
+        ["SET search_path = tenant_7", "DISCARD ALL", "SELECT 1"]
+    );
+}
+
+#[tokio::test]
+async fn a_connection_that_changed_nothing_goes_straight_back() {
+    let backend = backend_with(BackendConfig::new("eu-west")).await;
+    let pool = pool(&backend);
+    pool.simple_query("SELECT 1").await.expect("select");
+    assert_eq!(pool.stats().idle, 1);
+    assert!(!backend.saw("DISCARD"));
+}
+
+#[tokio::test]
+async fn the_always_policy_resets_even_without_a_visible_change() {
+    // A temporary table leaves no tag that says the session changed.
+    let backend = backend_with(BackendConfig::new("eu-west")).await;
+    let pool = pool_with(
+        &backend,
+        PoolConfig {
+            reset: ResetPolicy::Always,
+            ..PoolConfig::default()
+        },
+    );
+    pool.simple_query("CREATE TEMP TABLE scratch (id int)")
+        .await
+        .expect("create");
+    assert!(idle_soon(&pool, 1).await);
+    assert!(backend.saw("DISCARD ALL"));
+}
+
+#[tokio::test]
+async fn a_connection_whose_reset_fails_is_retired_not_reused() {
+    let backend = backend_with(
+        BackendConfig::new("eu-west").reply_to("DISCARD", Reply::fail("XX000", "nope")),
+    )
+    .await;
+    let pool = pool(&backend);
+    pool.simple_query("SET work_mem = '1GB'")
+        .await
+        .expect("set");
+    for _ in 0..200 {
+        if pool.stats().discarded == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(pool.stats().discarded, 1);
+    assert_eq!(pool.stats().idle, 0);
+}
+
+#[tokio::test]
+async fn a_resetting_connection_still_counts_against_the_maximum() {
+    let backend =
+        backend_with(BackendConfig::new("eu-west").with_delay(Duration::from_millis(300))).await;
+    let pool = pool_with(
+        &backend,
+        PoolConfig {
+            max_size: 1,
+            ..PoolConfig::default()
+        },
+    );
+    pool.simple_query("SET a = 1").await.expect("set");
+    // The reset is still running, so the only slot is taken.
+    let waiting = tokio::time::timeout(Duration::from_millis(100), pool.acquire()).await;
+    assert!(waiting.is_err(), "a second connection must not be opened");
+    assert_eq!(backend.connections_accepted(), 1);
+}
 
 // ------------------------------------------------------- extended queries
 
