@@ -50,6 +50,17 @@ pub fn substitute(sql: &str, values: &[String]) -> Result<String, usize> {
     Ok(out)
 }
 
+/// The text inside each block comment, without its `/*` and `*/`, skipping
+/// anything that only looks like one, such as `'/* not a comment */'`.
+#[must_use]
+pub fn block_comments(sql: &str) -> Vec<&str> {
+    scan(sql)
+        .into_iter()
+        .filter(|(_, _, mark)| *mark == Mark::Comment)
+        .filter_map(|(start, end, _)| sql.get(start.saturating_add(2)..end.saturating_sub(2)))
+        .collect()
+}
+
 /// Something the lexer found that callers act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mark {
@@ -57,6 +68,8 @@ enum Mark {
     Separator,
     /// A placeholder, by number.
     Placeholder(usize),
+    /// A whole block comment, outermost only.
+    Comment,
 }
 
 /// Where the separators and placeholders are, as byte ranges, skipping
@@ -112,7 +125,9 @@ fn scan(sql: &str) -> Vec<(usize, usize, Mark)> {
                 }
             }
             Some(b'/') if at(next(index)) == Some(b'*') => {
+                let start = index;
                 let mut depth = 0_usize;
+                let mut closed = false;
                 while index < bytes.len() {
                     if at(index) == Some(b'/') && at(next(index)) == Some(b'*') {
                         depth = depth.saturating_add(1);
@@ -121,11 +136,16 @@ fn scan(sql: &str) -> Vec<(usize, usize, Mark)> {
                         depth = depth.saturating_sub(1);
                         index = next(next(index));
                         if depth == 0 {
+                            closed = true;
                             break;
                         }
                     } else {
                         index = next(index);
                     }
+                }
+                // An unclosed comment is no comment PostgreSQL would accept.
+                if closed {
+                    marks.push((start, index, Mark::Comment));
                 }
             }
             Some(b'$') => {

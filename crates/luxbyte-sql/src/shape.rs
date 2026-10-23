@@ -154,7 +154,18 @@ pub fn normalize(sql: &str) -> Shape {
             }
             b'/' if at(index.saturating_add(1)) == Some(b'*') => {
                 let end = skip_block_comment(bytes, index);
-                push_range(&mut normalized, sql, index, end);
+                // A routing hint is read from the original statement; left
+                // in the shape, every key it names would be a shape of its
+                // own.
+                let comment = sql.get(index..end).unwrap_or_default();
+                if comment
+                    .get(2..)
+                    .is_some_and(|body| body.trim_start().starts_with(crate::hint::MARKER))
+                {
+                    normalized.push(' ');
+                } else {
+                    push_range(&mut normalized, sql, index, end);
+                }
                 index = end;
             }
             b'$' => {
@@ -564,5 +575,18 @@ mod tests {
             ]
         );
         assert_eq!(s.first_placeholder, 1);
+    }
+
+    #[test]
+    fn a_routing_hint_is_not_part_of_the_shape() {
+        let alice = normalize("/* luxbyte: key=alice */ SELECT * FROM summary");
+        let bob = normalize("/* luxbyte: key=bob */ SELECT * FROM summary");
+        assert_eq!(alice.normalized, bob.normalized);
+        // Other comments are kept, as they are.
+        assert!(
+            normalize("/* a note */ SELECT 1")
+                .normalized
+                .contains("a note")
+        );
     }
 }
