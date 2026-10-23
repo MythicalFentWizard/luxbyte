@@ -262,10 +262,12 @@ caches the shape only if they agree. A bug in the normaliser costs a cache
 miss, never a wrong answer.
 
 Against shahrah, compiled into one process and run on one machine rather than
-compared across published figures: **3.4-4.0x faster cached**, and faster on
-all 23 statements cold. It also runs 19 of those 23 statements where shahrah
-runs 12. Method, variance, and the places shahrah is better:
-[docs/NUMBERS.md](docs/NUMBERS.md), reproducible via [`compare/`](compare).
+compared across published figures: **3.2-4.0x faster cached** on two machines,
+and faster on all 23 statements cold. It runs 22 of those 23 statements; shahrah
+runs 12, or 18 with its opt-in broadcast reads. Through the proxy end to end, a
+point read costs 21 µs over a direct connection on loopback. Method, variance,
+and the places shahrah is better: [docs/NUMBERS.md](docs/NUMBERS.md),
+reproducible via [`compare/`](compare) and `cargo bench`.
 
 ```bash
 cargo bench   # no database, no Docker, no testbed
@@ -351,19 +353,19 @@ effect:
 
 ### Tests
 
-321 tests, no database required, `cargo test` and nothing else:
+506 tests, no database required, `cargo test` and nothing else:
 
 ```
-luxbyte-proto    49   framing, truncation, bad lengths, SCRAM both directions
-luxbyte-sql      81   key extraction, the AND/OR lattice, merge safety, cache
-luxbyte-core     64   topology, relocation state machine, end-to-end routing
-luxbyte-pool     23   handshake, reuse, limits, lifetimes, lost connections
-luxbyte-txn      29   two-phase commit and recovery, including the crash cases
+luxbyte-proto    62   framing, truncation, bad lengths, SCRAM both directions
+luxbyte-sql     107   key extraction, the AND/OR lattice, combining, the cache
+luxbyte-core     67   topology, relocation state machine, end-to-end routing
+luxbyte-pool     38   handshake, reuse, resets, TLS, limits, lost connections
+luxbyte-txn      31   two-phase commit and recovery, including the crash cases
 luxbyte-testkit   3   the fake backend itself
-luxbyte          72   merging, splitting, config, and 30 through the proxy
+luxbyte         198   merging, splitting, config, health, and 131 through the proxy
 ```
 
-The last thirty are the proxy as a whole: a real client connects over TCP to a
+The last 131 are the proxy as a whole: a real client connects over TCP to a
 real proxy, which connects over TCP to real backends, and everything speaks
 the wire protocol. The only thing that is not PostgreSQL is the backends, and
 they are only pretending so that a participant can be made to refuse a prepare,
@@ -494,8 +496,8 @@ Alongside, not part of the proxy:
   arithmetic in it. Kept out of the workspace because shahrah needs `libclang`
   to build and Luxbyte does not.
 
-Benchmarks for the server will land with it. See
-[docs/NUMBERS.md](docs/NUMBERS.md) for what is measured today.
+See [docs/NUMBERS.md](docs/NUMBERS.md) for what is measured, how, and what
+is not measured yet.
 
 ## Licence
 

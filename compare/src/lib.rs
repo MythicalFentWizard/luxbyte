@@ -58,6 +58,16 @@ pub fn shahrah_policy() -> Policy {
         .with_replicated("currencies", "eu-west")
 }
 
+/// The same, with both sharded tables opted into shahrah's broadcast reads,
+/// which its proxy merges when they need no more than concatenation, a
+/// sort, a `LIMIT` or a `count(*)`.
+#[must_use]
+pub fn shahrah_broadcast_policy() -> Policy {
+    shahrah_policy()
+        .with_broadcast("users")
+        .with_broadcast("orders")
+}
+
 /// Luxbyte's router over the same deployment.
 #[must_use]
 pub fn luxbyte_router() -> Router {
@@ -79,16 +89,37 @@ pub fn luxbyte_router() -> Router {
 /// Ordered from "every router handles this" to "this is where routers
 /// differ", because the second half is the interesting part.
 pub const STATEMENTS: &[(&str, &str)] = &[
-    ("point read", "SELECT id, name FROM users WHERE tenant_id = 'alice'"),
-    ("point read, reversed", "SELECT id FROM users WHERE 'alice' = tenant_id"),
-    ("point write", "UPDATE users SET name = 'ada' WHERE tenant_id = 'alice'"),
-    ("insert", "INSERT INTO users (tenant_id, name) VALUES ('alice', 'ada')"),
+    (
+        "point read",
+        "SELECT id, name FROM users WHERE tenant_id = 'alice'",
+    ),
+    (
+        "point read, reversed",
+        "SELECT id FROM users WHERE 'alice' = tenant_id",
+    ),
+    (
+        "point write",
+        "UPDATE users SET name = 'ada' WHERE tenant_id = 'alice'",
+    ),
+    (
+        "insert",
+        "INSERT INTO users (tenant_id, name) VALUES ('alice', 'ada')",
+    ),
     ("delete", "DELETE FROM users WHERE tenant_id = 'alice'"),
-    ("aliased key", "SELECT u.id FROM users u WHERE u.tenant_id = 'alice'"),
-    ("cast key", "SELECT id FROM users WHERE tenant_id = 'alice'::text"),
+    (
+        "aliased key",
+        "SELECT u.id FROM users u WHERE u.tenant_id = 'alice'",
+    ),
+    (
+        "cast key",
+        "SELECT id FROM users WHERE tenant_id = 'alice'::text",
+    ),
     ("negative key", "SELECT id FROM users WHERE tenant_id = -1"),
     ("no key at all", "SELECT id FROM users WHERE name = 'ada'"),
-    ("key in an IN list", "SELECT id FROM users WHERE tenant_id IN ('alice', 'bob')"),
+    (
+        "key in an IN list",
+        "SELECT id FROM users WHERE tenant_id IN ('alice', 'bob')",
+    ),
     (
         "key under AND",
         "SELECT id FROM users WHERE name = 'ada' AND tenant_id = 'alice'",
@@ -106,7 +137,10 @@ pub const STATEMENTS: &[(&str, &str)] = &[
         "INSERT INTO users (tenant_id, name) VALUES ('alice', 'a'), ('bob', 'b')",
     ),
     ("count across regions", "SELECT count(*) FROM users"),
-    ("count within one region", "SELECT count(*) FROM users WHERE tenant_id = 'alice'"),
+    (
+        "count within one region",
+        "SELECT count(*) FROM users WHERE tenant_id = 'alice'",
+    ),
     ("sum across regions", "SELECT sum(id) FROM users"),
     ("distinct across regions", "SELECT DISTINCT name FROM users"),
     (
@@ -124,7 +158,10 @@ pub const STATEMENTS: &[(&str, &str)] = &[
          WHERE u.tenant_id = 'alice' AND o.tenant_id = 'bob'",
     ),
     ("replicated read", "SELECT * FROM currencies"),
-    ("replicated write", "UPDATE currencies SET rate = 1.1 WHERE code = 'EUR'"),
+    (
+        "replicated write",
+        "UPDATE currencies SET rate = 1.1 WHERE code = 'EUR'",
+    ),
 ];
 
 /// A routing decision, reduced to the part both projects can be compared on.
@@ -229,8 +266,19 @@ pub fn shahrah_decision(cache: &Cache, policy: &Policy, sql: &str) -> Decision {
                 Decision::Refused(format!("every shard, not mergeable: {what}"))
             }
         }
+        // shahrah's proxy, not its analyser, decides what happens here: a
+        // read of a table that opted into broadcast, when its analysis says
+        // the shards' answers can be merged, goes to every shard. This is
+        // the rule in `crates/proxy/src/session.rs` at the pinned revision.
         Routing::KeyMissing { table } => {
-            Decision::Refused(format!("no shard key for \"{table}\""))
+            if analysis.access == ShahrahAccess::Read
+                && policy.broadcasts(table)
+                && analysis.mergeable
+            {
+                Decision::FanOut
+            } else {
+                Decision::Refused(format!("no shard key for \"{table}\""))
+            }
         }
         Routing::Unsupported(why) => Decision::Refused((*why).to_owned()),
     }
