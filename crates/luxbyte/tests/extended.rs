@@ -339,6 +339,187 @@ async fn a_statement_bound_many_times_in_one_batch_is_parsed_once() {
 }
 
 #[tokio::test]
+async fn a_named_statement_is_parsed_once_per_backend_connection() {
+    let f = fixture().await;
+    let mut client = client(&f.proxy).await;
+    client
+        .pipeline(&[parse("by_tenant", SELECT_USER), sync()])
+        .await
+        .expect("prepare");
+
+    for _ in 0..5 {
+        let replies = client
+            .pipeline(&[bind("", "by_tenant", &["alice"]), execute("", 0), sync()])
+            .await
+            .expect("execute");
+        assert_eq!(tags(&replies), ["2", "C", "Z"]);
+    }
+    assert_eq!(f.eu.count_of(SELECT_USER), 5);
+    // Every batch borrowed the same pooled connection, which kept it.
+    assert_eq!(f.eu.connections_accepted(), 1);
+    assert_eq!(f.eu.parses(), 1);
+}
+
+#[tokio::test]
+async fn a_backend_copy_older_than_the_clients_statement_is_prepared_afresh() {
+    // A schema change between the two Parses must not reach the second
+    // client as a broken cached plan, so its statement gets a fresh copy;
+    // from then on both clients share it.
+    let f = fixture().await;
+    let mut first = client(&f.proxy).await;
+    let mut second = client(&f.proxy).await;
+    let run = [bind("", "q", &["alice"]), execute("", 0), sync()];
+
+    first
+        .pipeline(&[parse("q", SELECT_USER), sync()])
+        .await
+        .unwrap();
+    assert_eq!(tags(&first.pipeline(&run).await.unwrap()), ["2", "C", "Z"]);
+    assert_eq!(f.eu.parses(), 1);
+
+    second
+        .pipeline(&[parse("q", SELECT_USER), sync()])
+        .await
+        .unwrap();
+    assert_eq!(tags(&second.pipeline(&run).await.unwrap()), ["2", "C", "Z"]);
+    assert_eq!(f.eu.parses(), 2, "parsed after the second client's Parse");
+
+    for client in [&mut first, &mut second] {
+        assert_eq!(tags(&client.pipeline(&run).await.unwrap()), ["2", "C", "Z"]);
+    }
+    assert_eq!(f.eu.parses(), 2);
+    assert_eq!(f.eu.connections_accepted(), 1);
+}
+
+#[tokio::test]
+async fn an_unnamed_statement_stays_unnamed_and_is_parsed_each_time() {
+    // A client that did not name a statement asked for a one-off plan.
+    let f = fixture().await;
+    let mut client = client(&f.proxy).await;
+    for _ in 0..3 {
+        let replies = client
+            .pipeline(&[
+                parse("", SELECT_USER),
+                bind("", "", &["alice"]),
+                execute("", 0),
+                sync(),
+            ])
+            .await
+            .expect("execute");
+        assert_eq!(tags(&replies), ["1", "2", "C", "Z"]);
+    }
+    assert_eq!(f.eu.parses(), 3);
+}
+
+#[tokio::test]
+async fn a_broken_plan_fails_as_on_one_server_until_the_client_prepares_again() {
+    // PostgreSQL refuses a cached plan whose result type a schema change
+    // altered, every time, until the client prepares the statement again;
+    // drivers rely on that to know when to. The proxy neither hides the
+    // error nor clears it behind the client's back.
+    let f = fixture_with(
+        BackendConfig::new("eu-west").reply_to("boom", Reply::fail("0A000", "cached plan")),
+        BackendConfig::new("us-east"),
+        false,
+    )
+    .await;
+    let mut client = client(&f.proxy).await;
+    let sql = "SELECT id FROM users WHERE tenant_id = $1 AND name <> 'boom'";
+    let run = [bind("", "stale", &["alice"]), execute("", 0), sync()];
+    client
+        .pipeline(&[parse("stale", sql), sync()])
+        .await
+        .expect("prepare");
+
+    for _ in 0..2 {
+        let replies = client.pipeline(&run).await.expect("execute");
+        assert_eq!(error_code(&replies).as_deref(), Some("0A000"));
+        assert_eq!(f.eu.parses(), 1);
+    }
+
+    client
+        .pipeline(&[
+            Step::new(
+                StepKind::Close,
+                frontend::close(Target::Statement, "stale").unwrap(),
+            ),
+            parse("stale", sql),
+            sync(),
+        ])
+        .await
+        .expect("prepare again");
+    client.pipeline(&run).await.expect("execute");
+    assert_eq!(f.eu.parses(), 2, "prepared afresh for the new Parse");
+    assert_eq!(f.eu.connections_accepted(), 1);
+}
+
+#[tokio::test]
+async fn a_batch_never_sent_leaves_no_statement_behind() {
+    // The client hangs up before its Sync: nothing reached the backend, so
+    // the next session to bind the same statement must still prepare it.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let f = fixture().await;
+    let mut quitter = tokio::net::TcpStream::connect(("127.0.0.1", f.proxy.port()))
+        .await
+        .unwrap();
+    let mut startup = luxbyte_proto::startup::StartupParameters::new();
+    startup.set("user", "app").set("database", "shop");
+    quitter.write_all(&startup.encode().unwrap()).await.unwrap();
+    // Read up to the first ReadyForQuery.
+    loop {
+        let tag = quitter.read_u8().await.unwrap();
+        let length = quitter.read_i32().await.unwrap();
+        let mut body = vec![0_u8; usize::try_from(length - 4).unwrap()];
+        quitter.read_exact(&mut body).await.unwrap();
+        if tag == b'Z' {
+            break;
+        }
+    }
+    let mut batch = Vec::new();
+    for step in [
+        parse("q", SELECT_USER),
+        bind("", "q", &["alice"]),
+        execute("", 0),
+    ] {
+        batch.extend_from_slice(&step.message);
+    }
+    quitter.write_all(&batch).await.unwrap();
+    // The Bind borrowed a connection; wait for it to go back to the pool
+    // when the session ends, so the next session gets the same one.
+    while f.eu.connections_accepted() == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    drop(quitter);
+    let started = std::time::Instant::now();
+    while f
+        .proxy
+        .shared()
+        .pools
+        .stats()
+        .iter()
+        .all(|(_, stats)| stats.idle == 0)
+    {
+        assert!(started.elapsed() < Duration::from_secs(5), "never returned");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let mut client = client(&f.proxy).await;
+    let replies = client
+        .pipeline(&[
+            parse("q", SELECT_USER),
+            bind("", "q", &["alice"]),
+            execute("", 0),
+            sync(),
+        ])
+        .await
+        .expect("execute");
+    assert_eq!(tags(&replies), ["1", "2", "C", "Z"]);
+    assert_eq!(f.eu.connections_accepted(), 1);
+    assert_eq!(f.eu.parses(), 1);
+}
+
+#[tokio::test]
 async fn a_binary_key_routes_when_its_type_is_declared() {
     let f = fixture().await;
     let mut client = client(&f.proxy).await;

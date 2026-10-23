@@ -268,10 +268,13 @@ miss, never a wrong answer.
 Against shahrah, compiled into one process and run on one machine rather than
 compared across published figures: **3.2-4.0x faster cached** on two machines,
 and faster on all 23 statements cold. It runs 22 of those 23 statements; shahrah
-runs 12, or 18 with its opt-in broadcast reads. Through the proxy end to end, a
-point read costs 21 µs over a direct connection on loopback. Method, variance,
-and the places shahrah is better: [docs/NUMBERS.md](docs/NUMBERS.md),
-reproducible via [`compare/`](compare) and `cargo bench`.
+runs 12, or 18 with its opt-in broadcast reads. In front of real PostgreSQL
+16 under pgbench, on one machine, Luxbyte ran **1.15x to 1.23x** shahrah's
+transactions per second, simple and prepared, one client and sixteen. Through
+the proxy end to end, a point read costs 21 µs over a direct connection on
+loopback. Method, variance, and the places shahrah is better:
+[docs/NUMBERS.md](docs/NUMBERS.md), reproducible via [`compare/`](compare)
+and `cargo bench`.
 
 ```bash
 cargo bench   # no database, no Docker, no testbed
@@ -412,9 +415,13 @@ Done, tested, and working:
 The extended query protocol — what psycopg3, asyncpg and JDBC use by default —
 routes each statement on the key bound to it at `Bind`, including keys bound in
 binary once their type is declared or reported by a `Describe`. The proxy keeps
-prepared statements itself and re-parses them on whichever backend connection a
-`Bind` is routed to, so a statement prepared once runs in any region. An error
-discards the rest of the batch and rolls it back, as on one server.
+prepared statements itself and prepares them on whichever backend connection a
+`Bind` is routed to, so a statement prepared once runs in any region. A
+statement the client named stays prepared on each pooled connection it has
+run on, so binding it again costs no parse there; a copy older than the
+client's own `Parse` is never used, so a schema change behaves as it would on
+one server. An error discards the rest of the batch and rolls it back, as on
+one server.
 
 A prepared statement that spans regions — a read to combine, a write to commit
 in two phases, a multi-row `INSERT` to split by key — runs through the same

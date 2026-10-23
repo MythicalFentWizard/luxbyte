@@ -566,7 +566,12 @@ async fn probe_once(
         .rows
         .first()
         .ok_or_else(|| "the probe returned no row".to_owned())?;
-    let in_recovery = row.first().cloned().flatten().as_deref() == Some("t");
+    // `boolean::text` is `true` or `false`, not the `t` or `f` of the
+    // boolean's own output.
+    let in_recovery = matches!(
+        row.first().cloned().flatten().as_deref(),
+        Some("true" | "t")
+    );
     // A replica that has not replayed anything yet has no position.
     let position = row
         .get(1)

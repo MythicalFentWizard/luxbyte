@@ -220,14 +220,14 @@ aggregates across regions that it used to refuse.
 - **Sharding within a region.** shahrah hashes keys onto several shards inside
   each region, and `REBALANCE` moves rows between them. Luxbyte has one primary
   per region.
-- **Operating it.** shahrah's dashboard is live over a WebSocket, shows every
-  proxy in the group, and raises alert series; it has `DRAIN`, `TRACE`, warm
-  connections at start, and a comment to supply a key a view hides. Luxbyte's
-  admin port has metrics, a snapshot, key lookup and a static page.
-- **Measured against PostgreSQL.** shahrah reports end-to-end numbers from a
+- **Operating it.** shahrah's dashboard is live over a WebSocket and shows
+  every proxy in the group, and it has a comment to supply a key a view
+  hides. Luxbyte now has `DRAIN`, `ROUTE`, warm connections, `SHOW HEALTH`
+  and alerts, but its dashboard is a page that refreshes, for one proxy.
+- **Measured across regions.** shahrah reports end-to-end numbers from a
   three-region bed with real latencies, against pgbouncer, pgcat and PgDog.
-  Luxbyte's end-to-end figures below are against its in-process test backend
-  only.
+  Luxbyte's figures against PostgreSQL below are from one machine, over
+  loopback, against shahrah only.
 
 ## A note on cache correctness
 
@@ -275,11 +275,55 @@ result was decoded and re-encoded in the proxy: measured the same way on the
 same machine, it added **5.1 ms** (6.06 ms direct, 11.12 ms through the proxy).
 Point reads did not move outside noise.
 
+## Against PostgreSQL, through both proxies
+
+PostgreSQL 16.15 on the same 4-vCPU Linux VM: three clusters standing in for
+three regions, plus a streaming replica of one, all on loopback. Each proxy
+was given the same topology and authenticated clients with SCRAM; Luxbyte was
+also probing every backend twice a second. The statement is a one-row point
+read, `SELECT name FROM users WHERE tenant_id = 'alice'`, which both proxies
+send to the same primary, and *direct* is pgbench connected to that primary.
+pgbench 16.15, six seconds per run, `-j` equal to `-c`, with direct, Luxbyte
+and shahrah (`ac057a6`) taking turns in each of three rounds. Medians, in
+transactions per second, with the range across rounds:
+
+| | direct | Luxbyte | shahrah | Luxbyte / shahrah |
+|---|---|---|---|---|
+| simple, 1 client | 7 039 (7 035–7 119) | **4 266** (4 133–4 337) | 3 465 (3 358–3 953) | **1.23x** |
+| simple, 16 clients | 19 503 (18 288–19 662) | **15 008** (14 053–16 075) | 12 919 (12 450–13 177) | **1.16x** |
+| prepared, 1 client | 9 037 (8 783–9 502) | **5 305** (5 160–5 441) | 4 537 (4 484–4 811) | **1.17x** |
+| prepared, 16 clients | 21 032 (20 873–21 218) | **16 801** (16 481–17 475) | 14 604 (14 443–14 976) | **1.15x** |
+
+The first time this was run, Luxbyte **lost** on prepared statements: 4 347
+against 4 748 with one client, 15 030 against 15 364 with sixteen. It held
+every statement itself and parsed it again on the backend in every batch, so
+a prepared statement cost a parse it would not have cost against PostgreSQL.
+It now prepares a statement the client named on each pooled connection once,
+under a name derived from its text, and binds it there after that. A copy is
+only used if it was parsed after the client's own `Parse`, so a schema change
+reaches the client exactly as it would directly; that was checked against
+this PostgreSQL by altering the table under pgbench, which got the same
+`cached plan must not change result type` through Luxbyte as it did direct.
+
+Read these with their limits in mind:
+
+- pgbench, both proxies and every PostgreSQL shared four vCPUs, so each
+  figure includes contention a real deployment would not have, and neither
+  proxy was tuned beyond its defaults.
+- Loopback hides the network. What a region away costs is a round trip per
+  statement, the same through either proxy, and not measured here.
+- A proxy is a large share of a fast query's time on this machine: direct
+  PostgreSQL ran 1.25x to 1.7x the transactions it ran through Luxbyte, and
+  1.44x to 2.03x those through shahrah.
+
 ## What is not measured here
 
-- Anything against a real PostgreSQL, and anything across real regions.
-- Throughput under many concurrent clients, and CPU per transaction.
-- Two-phase commit and `RELOCATE` against real backends.
+- Anything across real regions, with real latency between them.
+- CPU per transaction, and throughput beyond sixteen clients.
+- How long two-phase commit and `RELOCATE` take against real backends. Both
+  were run against the PostgreSQL above to check they are correct — rows,
+  identity columns and the directory all moved, no prepared transaction left
+  behind — but not timed.
 
 Each of those needs a testbed this document does not yet have; until then it
 says nothing about them.

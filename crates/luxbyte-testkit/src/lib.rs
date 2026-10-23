@@ -1144,7 +1144,8 @@ async fn answer_probe(
     let position = observed.position.load(Ordering::SeqCst).to_string();
     framed.queue_raw(&build::row_description(&["in_recovery", "position"], 25)?);
     framed.queue_raw(&build::data_row(&[
-        Some(if replica { "t" } else { "f" }),
+        // As PostgreSQL renders `boolean::text`.
+        Some(if replica { "true" } else { "false" }),
         Some(position.as_str()),
     ])?);
     framed.queue_raw(&build::command_complete("SELECT 1")?);

@@ -133,12 +133,29 @@ pub struct Connection {
     /// a `SET`, a `LISTEN`, a named prepared statement — so the connection
     /// is reset before anyone else borrows it.
     needs_reset: bool,
+    /// Statements prepared on this connection under names the proxy chose,
+    /// so one bound again is not parsed again. Filled from `ParseComplete`,
+    /// so it never names a statement the server does not have, short of a
+    /// `DEALLOCATE` or `DISCARD` it was not told about.
+    statements: std::collections::HashMap<String, HeldStatement>,
     /// Set while extended-query messages have been sent without a `Sync`.
     ///
     /// `ReadyForQuery` only arrives after a `Sync`, so until then the last
     /// reported status is stale: the server may be holding an implicit
     /// transaction open, and the next borrower would inherit it.
     awaiting_sync: bool,
+}
+
+/// Most statements the proxy keeps prepared on one connection.
+const STATEMENT_LIMIT: usize = 256;
+
+/// A statement prepared on a connection under a name the proxy chose.
+#[derive(Debug)]
+struct HeldStatement {
+    sql: String,
+    types: Vec<i32>,
+    /// When the `Parse` was sent, so the server parsed it no earlier.
+    prepared_at: Instant,
 }
 
 impl Connection {
@@ -209,6 +226,7 @@ impl Connection {
             returned_at: Instant::now(),
             poisoned: false,
             needs_reset: false,
+            statements: std::collections::HashMap::new(),
             awaiting_sync: false,
         };
         connection.handshake(credentials, application_name).await?;
@@ -480,6 +498,7 @@ impl Connection {
     /// those steps come back empty. `Err` means the connection itself failed
     /// or answered out of turn, and it has been poisoned.
     pub async fn pipeline(&mut self, steps: &[Step]) -> Result<Vec<StepReply>, PoolError> {
+        let sent_at = Instant::now();
         for step in steps {
             self.framed.queue_raw(&step.message);
         }
@@ -541,6 +560,18 @@ impl Connection {
                         if let Ok(Backend::CommandComplete { tag }) = Backend::decode(&message) {
                             self.note(tag);
                         }
+                        if let Some(prepared) = &step.prepares {
+                            if self.can_prepare(&prepared.name) {
+                                self.statements.insert(
+                                    prepared.name.clone(),
+                                    HeldStatement {
+                                        sql: prepared.sql.clone(),
+                                        types: prepared.types.clone(),
+                                        prepared_at: sent_at,
+                                    },
+                                );
+                            }
+                        }
                         reply.messages.push(message);
                         break;
                     }
@@ -571,11 +602,44 @@ impl Connection {
     /// its own, such as a temporary table, needs `reset = always`.
     fn note(&mut self, tag: &str) {
         let verb = tag.split(' ').next().unwrap_or("");
+        // Either may have dropped statements prepared here.
+        if matches!(verb, "DISCARD" | "DEALLOCATE") {
+            self.statements.clear();
+        }
         let changes_session = matches!(
             verb,
             "SET" | "RESET" | "DISCARD" | "LISTEN" | "PREPARE" | "DECLARE"
         ) && tag != "PREPARE TRANSACTION";
         self.needs_reset |= changes_session;
+    }
+
+    /// Whether the statement prepared here as `name` holds this text with
+    /// these parameter types, parsed no earlier than `since`.
+    ///
+    /// `since` is when the client parsed its own statement. PostgreSQL fixes
+    /// a statement's result type when it is parsed, and refuses to run it
+    /// once a schema change alters that type; a backend statement older
+    /// than the client's would hand the client that refusal for a schema
+    /// change made before it ever prepared the statement.
+    #[must_use]
+    pub fn holds_statement(&self, name: &str, sql: &str, types: &[i32], since: Instant) -> bool {
+        self.statements
+            .get(name)
+            .is_some_and(|held| held.sql == sql && held.types == types && held.prepared_at >= since)
+    }
+
+    /// Whether this connection has room to remember one more statement as
+    /// `name`. When it has not, the statement is better left unnamed than
+    /// prepared and forgotten.
+    #[must_use]
+    pub fn can_prepare(&self, name: &str) -> bool {
+        self.statements.len() < STATEMENT_LIMIT || self.statements.contains_key(name)
+    }
+
+    /// Forgets the statement prepared here as `name`, as when the server
+    /// says it does not have it: the next use closes and prepares it again.
+    pub fn forget_statement(&mut self, name: &str) {
+        self.statements.remove(name);
     }
 
     /// Whether a statement left session state behind.
@@ -589,7 +653,9 @@ impl Connection {
         self.needs_reset = true;
     }
 
-    pub(crate) const fn reset_done(&mut self) {
+    pub(crate) fn reset_done(&mut self) {
+        // A reset may have dropped them; the next use prepares them again.
+        self.statements.clear();
         self.needs_reset = false;
     }
 
