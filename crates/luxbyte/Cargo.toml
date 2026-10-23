@@ -35,6 +35,11 @@ tokio = { workspace = true, features = ["full"] }
 [dev-dependencies]
 luxbyte-testkit.workspace = true
 luxbyte-pool.workspace = true
+criterion = { workspace = true, features = ["async_tokio"] }
+
+[[bench]]
+name = "proxy"
+harness = false
 
 [lints]
 workspace = true

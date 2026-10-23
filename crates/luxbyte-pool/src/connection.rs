@@ -7,7 +7,7 @@ use luxbyte_proto::auth::{ScramClient, ScramKeys, md5_password};
 use luxbyte_proto::backend::{Authentication, Backend, TransactionStatus};
 use luxbyte_proto::startup::StartupParameters;
 use luxbyte_proto::tag;
-use luxbyte_proto::{Framed, Peer, ProtocolError, Stream, frontend};
+use luxbyte_proto::{Framed, Peer, ProtocolError, RawMessage, Stream, frontend};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -345,6 +345,69 @@ impl Connection {
         self.collect_response().await
     }
 
+    /// Sends a simple query and returns without waiting, for a caller that
+    /// passes the answer on as it arrives with [`Connection::next_reply`].
+    ///
+    /// Until the answer has been read to its end the connection is not
+    /// reusable, so one abandoned halfway is retired rather than handed to
+    /// someone else with the rest of the answer still to come.
+    pub async fn send_query(&mut self, sql: &str) -> Result<(), PoolError> {
+        self.framed.queue_raw(&frontend::query(sql)?);
+        self.awaiting_sync = true;
+        if let Err(error) = self.framed.flush().await {
+            self.poisoned = true;
+            return Err(PoolError::from(error));
+        }
+        Ok(())
+    }
+
+    /// The next message of a simple query's answer, as the server sent it,
+    /// or `None` once the server is ready for the next query.
+    ///
+    /// An error is part of the answer, not an `Err`; `Err` means the
+    /// connection failed, and it has been poisoned. Parameter changes and
+    /// notifications are not part of any answer and are left out. A
+    /// `COPY ... FROM STDIN` is refused on the caller's behalf, since the
+    /// data would have to come through a relay that does not carry it; the
+    /// server's error is then the answer.
+    pub async fn next_reply(&mut self) -> Result<Option<RawMessage>, PoolError> {
+        loop {
+            let message = match self.framed.read_message().await {
+                Ok(message) => message,
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(PoolError::from(error));
+                }
+            };
+            match message.tag.unwrap_or(0) {
+                tag::READY_FOR_QUERY => {
+                    if let Backend::ReadyForQuery { status } = Backend::decode(&message)? {
+                        self.status = status;
+                    }
+                    self.awaiting_sync = false;
+                    return Ok(None);
+                }
+                tag::CLOSE_OR_COMMAND_COMPLETE => {
+                    if let Ok(Backend::CommandComplete { tag }) = Backend::decode(&message) {
+                        self.note(tag);
+                    }
+                    return Ok(Some(message));
+                }
+                tag::SYNC_OR_PARAMETER_STATUS | tag::NOTIFICATION_RESPONSE => {}
+                tag::COPY_IN_RESPONSE | tag::COPY_BOTH_RESPONSE => {
+                    self.framed.queue_raw(&frontend::copy_fail(
+                        "COPY FROM STDIN is not supported through the proxy",
+                    )?);
+                    if let Err(error) = self.framed.flush().await {
+                        self.poisoned = true;
+                        return Err(PoolError::from(error));
+                    }
+                }
+                _ => return Ok(Some(message)),
+            }
+        }
+    }
+
     async fn collect_response(&mut self) -> Result<QueryResult, PoolError> {
         let mut result = QueryResult::default();
         let mut failure: Option<ProtocolError> = None;
@@ -379,6 +442,16 @@ impl Connection {
                 }
                 Backend::EmptyQueryResponse => result.tags.push(String::new()),
                 Backend::Error(notice) => failure = Some(notice.to_error()),
+                // The server would wait for rows nobody is going to send.
+                _ if message.is(tag::COPY_IN_RESPONSE) || message.is(tag::COPY_BOTH_RESPONSE) => {
+                    self.framed.queue_raw(&frontend::copy_fail(
+                        "COPY FROM STDIN is not supported through the proxy",
+                    )?);
+                    if let Err(error) = self.framed.flush().await {
+                        self.poisoned = true;
+                        return Err(PoolError::from(error));
+                    }
+                }
                 Backend::ReadyForQuery { status } => {
                     self.status = status;
                     result.status = status;

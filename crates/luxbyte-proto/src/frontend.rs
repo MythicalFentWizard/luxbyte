@@ -393,6 +393,13 @@ pub fn flush() -> Result<Bytes, ProtocolError> {
     Writer::tagged(tag::FLUSH).finish()
 }
 
+/// Builds a `CopyFail`, which ends a `COPY ... FROM STDIN` with an error.
+pub fn copy_fail(message: &str) -> Result<Bytes, ProtocolError> {
+    let mut w = Writer::tagged(tag::COPY_FAIL);
+    w.cstr(message);
+    w.finish()
+}
+
 /// Builds a `Sync`.
 pub fn sync() -> Result<Bytes, ProtocolError> {
     Writer::tagged(tag::SYNC_OR_PARAMETER_STATUS).finish()
