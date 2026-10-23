@@ -133,7 +133,7 @@ fn show_peers(shared: &Shared) -> QueryResult {
                 peer.node,
                 role.to_owned(),
                 peer.heartbeat_age_ms.to_string(),
-                String::new(),
+                peer.summary,
             ]
         })
         .collect();

@@ -155,6 +155,8 @@ pub struct Admin {
     /// SHA-256 of the password; never the password itself.
     password: Option<[u8; 32]>,
     lockout: Lockout,
+    /// `/events` streams open now.
+    streams: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for Admin {
@@ -184,6 +186,7 @@ impl Admin {
             tls,
             password: password.map(digest),
             lockout: Lockout::default(),
+            streams: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -295,7 +298,13 @@ struct Response {
     content_type: &'static str,
     extra: Vec<(&'static str, String)>,
     body: String,
+    /// A `Content-Security-Policy` other than [`POLICY`].
+    policy: Option<String>,
 }
+
+/// What every page may load: nothing but its own inline styles, and forms
+/// that submit to the admin port itself.
+const POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'";
 
 impl Response {
     fn new(status: &'static str, content_type: &'static str, body: String) -> Self {
@@ -304,6 +313,7 @@ impl Response {
             content_type,
             extra: Vec::new(),
             body,
+            policy: None,
         }
     }
 
@@ -365,6 +375,9 @@ async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         admin.lockout.succeeded(address);
     }
 
+    if request.path == "/events" {
+        return stream_events(&mut stream, admin).await;
+    }
     let response = route(admin, &request);
     write(&mut stream, &response).await
 }
@@ -378,7 +391,11 @@ fn route(admin: &Admin, request: &Request) -> Response {
             shared.metrics.render(&gauges(shared)),
         ),
         "/snapshot" => Response::json(&snapshot(shared)),
-        "/" => Response::new("200 OK", "text/html; charset=utf-8", dashboard(shared)),
+        "/" => {
+            let mut page = Response::new("200 OK", "text/html; charset=utf-8", dashboard(shared));
+            page.policy = Some(dashboard_policy());
+            page
+        }
         "/key" => {
             let table = query_value(&request.query, "table").unwrap_or_default();
             let key = query_value(&request.query, "key").unwrap_or_default();
@@ -399,11 +416,11 @@ async fn write<S: AsyncWrite + Unpin>(stream: &mut S, response: &Response) -> st
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\
          Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\
          X-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n\
-         Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; \
-         form-action 'self'\r\n",
+         Content-Security-Policy: {}\r\n",
         response.status,
         response.content_type,
-        response.body.len()
+        response.body.len(),
+        response.policy.as_deref().unwrap_or(POLICY)
     );
     for (name, value) in &response.extra {
         head.push_str(name);
@@ -710,24 +727,66 @@ fn html_table(result: &QueryResult) -> String {
     out
 }
 
-/// One page, rendered on the server, refreshing itself: no script, no
-/// fonts, nothing fetched from anywhere.
+/// The parts of the dashboard that change, by element id, rendered on the
+/// server: the page shows them, and `/events` sends them again each second.
+fn sections(shared: &Shared) -> Vec<(&'static str, String)> {
+    let counters =
+        shared
+            .metrics
+            .summary()
+            .into_iter()
+            .fold(String::new(), |mut out, (name, value)| {
+                use std::fmt::Write as _;
+                let _ = write!(
+                    out,
+                    "<div class=\"tile\"><b>{value}</b><span>{}</span></div>",
+                    escape_html(&name.replace('_', " "))
+                );
+                out
+            });
+    vec![
+        (
+            "uptime",
+            format!("up {}s", shared.metrics.uptime().as_secs()),
+        ),
+        ("tiles", counters),
+        ("alerts", html_table(&console(shared, "SHOW ALERTS"))),
+        ("health", html_table(&console(shared, "SHOW HEALTH"))),
+        ("peers", html_table(&console(shared, "SHOW PEERS"))),
+        ("regions", html_table(&console(shared, "SHOW REGIONS"))),
+        ("pools", html_table(&console(shared, "SHOW POOLS"))),
+        ("in_doubt", html_table(&console(shared, "SHOW IN DOUBT"))),
+    ]
+}
+
+/// The dashboard's only script: it swaps in the sections `/events` sends.
+/// The server renders and escapes them; the script only places them.
+const LIVE_SCRIPT: &str = "const live=document.getElementById('live');\
+const events=new EventSource('/events');\
+events.onmessage=(event)=>{const parts=JSON.parse(event.data);\
+for(const id in parts){const node=document.getElementById(id);if(node){node.innerHTML=parts[id];}}\
+live.textContent='live';};\
+events.onerror=()=>{live.textContent='reconnecting';};";
+
+/// The policy for the dashboard: the policy every page has, plus exactly
+/// the one script above, by its hash, and the event stream it reads.
+fn dashboard_policy() -> String {
+    use base64::Engine as _;
+    let hash = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(LIVE_SCRIPT));
+    format!("{POLICY}; script-src 'sha256-{hash}'; connect-src 'self'")
+}
+
+/// One page, rendered on the server. With script it stays live over
+/// `/events`; without, it reloads itself every five seconds. No fonts,
+/// nothing fetched from anywhere else.
 fn dashboard(shared: &Shared) -> String {
-    let counters: Vec<String> = shared
-        .metrics
-        .summary()
-        .into_iter()
-        .map(|(name, value)| {
-            format!(
-                "<div class=\"tile\"><b>{value}</b><span>{}</span></div>",
-                escape_html(&name.replace('_', " "))
-            )
-        })
-        .collect();
+    let parts: HashMap<&str, String> = sections(shared).into_iter().collect();
+    let part = |id: &str| parts.get(id).cloned().unwrap_or_default();
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <meta http-equiv=\"refresh\" content=\"5\"><title>Luxbyte</title><style>\
+         <noscript><meta http-equiv=\"refresh\" content=\"5\"></noscript>\
+         <title>Luxbyte</title><style>\
          :root{{color-scheme:light dark;--fg:#1d1d1f;--bg:#fafafa;--line:#ddd;--dim:#666}}\
          @media (prefers-color-scheme:dark){{:root{{--fg:#eee;--bg:#161618;--line:#333;--dim:#999}}}}\
          body{{font:14px/1.45 system-ui,sans-serif;margin:0 auto;padding:16px;max-width:1100px;\
@@ -739,24 +798,94 @@ fn dashboard(shared: &Shared) -> String {
          border-bottom:1px solid var(--line);white-space:nowrap}}.none{{color:var(--dim)}}\
          form{{display:flex;gap:8px;flex-wrap:wrap}}input{{padding:4px}}\
          </style></head><body><h1>Luxbyte · home region {home}</h1>\
-         <p class=\"none\">up {uptime}s · refreshes every 5s</p>\
-         <div class=\"tiles\">{counters}</div>\
+         <p class=\"none\"><span id=\"uptime\">{uptime}</span> · \
+         <span id=\"live\">refreshes every 5s</span></p>\
+         <div class=\"tiles\" id=\"tiles\">{tiles}</div>\
          <h2>Where is a key?</h2><form action=\"/key\" method=\"get\">\
          <input name=\"table\" placeholder=\"table\" required>\
          <input name=\"key\" placeholder=\"key\" required><button>Look up</button></form>\
-         <h2>Alerts</h2>{alerts}<h2>Health</h2>{health}<h2>Proxies</h2>{peers}\
-         <h2>Regions</h2>{regions}<h2>Pools</h2>{pools}\
-         <h2>In-doubt transactions</h2>{in_doubt}</body></html>",
+         <h2>Alerts</h2><div id=\"alerts\">{alerts}</div>\
+         <h2>Health</h2><div id=\"health\">{health}</div>\
+         <h2>Proxies</h2><div id=\"peers\">{peers}</div>\
+         <h2>Regions</h2><div id=\"regions\">{regions}</div>\
+         <h2>Pools</h2><div id=\"pools\">{pools}</div>\
+         <h2>In-doubt transactions</h2><div id=\"in_doubt\">{in_doubt}</div>\
+         <script>{script}</script></body></html>",
         home = escape_html(&shared.router.topology().home_region),
-        uptime = shared.metrics.uptime().as_secs(),
-        counters = counters.join(""),
-        alerts = html_table(&console(shared, "SHOW ALERTS")),
-        health = html_table(&console(shared, "SHOW HEALTH")),
-        peers = html_table(&console(shared, "SHOW PEERS")),
-        regions = html_table(&console(shared, "SHOW REGIONS")),
-        pools = html_table(&console(shared, "SHOW POOLS")),
-        in_doubt = html_table(&console(shared, "SHOW IN DOUBT")),
+        uptime = part("uptime"),
+        tiles = part("tiles"),
+        alerts = part("alerts"),
+        health = part("health"),
+        peers = part("peers"),
+        regions = part("regions"),
+        pools = part("pools"),
+        in_doubt = part("in_doubt"),
+        script = LIVE_SCRIPT,
     )
+}
+
+/// Most `/events` streams open at once: each holds a task and renders the
+/// dashboard every second.
+const MAX_STREAMS: usize = 16;
+
+/// How long one `/events` stream lasts before the browser is made to
+/// reconnect, which it does by itself.
+const STREAM_FOR: Duration = Duration::from_secs(3600);
+
+/// Sends the dashboard's sections once a second as server-sent events,
+/// until the client goes away.
+async fn stream_events<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    admin: &Admin,
+) -> std::io::Result<()> {
+    let open = admin
+        .streams
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let _slot = StreamSlot(&admin.streams);
+    if open >= MAX_STREAMS {
+        return write(
+            stream,
+            &Response::text("503 Service Unavailable", "too many dashboards are open"),
+        )
+        .await;
+    }
+    stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\n\
+              Connection: close\r\nX-Content-Type-Options: nosniff\r\n\r\nretry: 2000\n\n",
+        )
+        .await?;
+    // The client sends nothing more, so anything read means it hung up:
+    // its place is given back then, not at the next write that fails.
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut ignored = [0_u8; 64];
+    let started = Instant::now();
+    while started.elapsed() < STREAM_FOR {
+        let parts: Map<String, Value> = sections(&admin.shared)
+            .into_iter()
+            .map(|(id, html)| (id.to_owned(), Value::String(html)))
+            .collect();
+        // One line: JSON escapes every newline inside it.
+        let line = serde_json::to_string(&parts).unwrap_or_default();
+        writer
+            .write_all(format!("data: {line}\n\n").as_bytes())
+            .await?;
+        writer.flush().await?;
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+            _ = reader.read(&mut ignored) => return Ok(()),
+        }
+    }
+    writer.shutdown().await
+}
+
+/// Gives back a stream's place when it ends, however it ends.
+struct StreamSlot<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for StreamSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
