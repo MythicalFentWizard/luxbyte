@@ -19,11 +19,13 @@
 //! a transaction — with its locks and its snapshot — which the next
 //! borrower would inherit. Those connections are closed instead.
 
+pub mod cancel;
 pub mod connection;
 pub mod error;
 pub mod pipeline;
 pub mod pool;
 
+pub use cancel::{CancelScope, CancelTarget, send_cancel};
 pub use connection::{Connection, ConnectionTarget, Credentials, QueryResult};
 pub use error::PoolError;
 pub use pipeline::{Step, StepKind, StepReply};

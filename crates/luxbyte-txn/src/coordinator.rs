@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use luxbyte_pool::{Pool, PoolError, PooledConnection, QueryResult};
+use luxbyte_pool::{CancelScope, Pool, PoolError, PooledConnection, QueryResult};
 
 use crate::error::TxnError;
 use crate::log::{CommitLog, CommitRecord};
@@ -155,6 +155,7 @@ impl Coordinator {
             log: Arc::clone(&self.log),
             participants: Vec::new(),
             finished: None,
+            scope: None,
         }
     }
 
@@ -259,6 +260,8 @@ pub struct Transaction {
     log: Arc<dyn CommitLog>,
     participants: Vec<Participant>,
     finished: Option<&'static str>,
+    /// Where a client's cancel finds this transaction's connections.
+    scope: Option<CancelScope>,
 }
 
 // The commit log is deliberately left out: it is shared with every other
@@ -283,6 +286,15 @@ impl std::fmt::Debug for Transaction {
 }
 
 impl Transaction {
+    /// Makes every participant, present and future, reachable by a cancel
+    /// on `scope`.
+    pub fn cancel_with(&mut self, scope: &CancelScope) {
+        for participant in &mut self.participants {
+            participant.connection.join(scope);
+        }
+        self.scope = Some(scope.clone());
+    }
+
     /// The identifier used for `PREPARE TRANSACTION`.
     #[must_use]
     pub fn gid(&self) -> &str {
@@ -327,6 +339,9 @@ impl Transaction {
             return Ok(());
         }
         let mut connection = pool.acquire().await?;
+        if let Some(scope) = &self.scope {
+            connection.join(scope);
+        }
         connection.simple_query("BEGIN").await?;
         self.participants.push(Participant {
             region: region.to_owned(),
@@ -421,7 +436,13 @@ impl Transaction {
             .map_err(|_| TxnError::LogTaskFailed)??;
 
         // Phase two. Failures here delay the transaction; they cannot undo
-        // it, because the decision is already durable.
+        // it, because the decision is already durable. That includes a
+        // client's cancel, which from here on would only leave a committed
+        // transaction prepared until the next recovery, so it is no longer
+        // allowed to reach the participants.
+        for participant in &mut self.participants {
+            participant.connection.leave_scope();
+        }
         let commit = format!("COMMIT PREPARED '{}'", self.gid);
         let mut committed = Vec::new();
         let mut unresolved = Vec::new();

@@ -640,7 +640,10 @@ impl Session {
             Step::new(StepKind::Sync, frontend::sync()?),
         ];
         let replies = match pool.acquire().await {
-            Ok(mut connection) => connection.pipeline(&steps).await,
+            Ok(mut connection) => {
+                connection.join(&self.cancel);
+                connection.pipeline(&steps).await
+            }
             Err(error) => Err(error),
         };
         let replies = match replies {
@@ -1019,10 +1022,11 @@ impl Session {
         let Some(pool) = self.pool_for(region, access, self.reads) else {
             return Ok(Err(unconfigured(region)));
         };
-        let connection = match pool.acquire().await {
+        let mut connection = match pool.acquire().await {
             Ok(connection) => connection,
             Err(error) => return Ok(Err(to_refusal(&error))),
         };
+        connection.join(&self.cancel);
         let mut lane = Lane::new(id.clone(), Some(connection));
         lane.writes = primary;
         self.extended.lanes.push(lane);

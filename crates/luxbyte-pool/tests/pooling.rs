@@ -70,7 +70,8 @@ async fn the_startup_handshake_is_completed_before_any_query() {
         inner.parameter("server_version"),
         Some("18.0 (luxbyte-testkit)")
     );
-    assert_eq!(inner.backend_key(), (4_242, 2_424));
+    // The first connection the backend accepted gets its first key.
+    assert_eq!(inner.backend_key(), (0x3e8, 0x3e8 ^ 0x5a5a_5a5a));
 }
 
 #[tokio::test]

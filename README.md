@@ -368,10 +368,16 @@ roles fail exactly as a wrong password does, so a login attempt does not
 reveal which roles exist. Left unconfigured, the proxy trusts every client
 and refuses to listen beyond loopback until told that is intended.
 
+A `CancelRequest` reaches every backend connection the client is using at
+that moment: each region of a scatter-gather read, each participant of a
+transaction. Every connection a cancel was aimed at is retired rather than
+pooled, so a cancel that arrives late can never stop another client's query
+on a reused connection. Once a two-phase commit's decision is durable, cancels
+no longer reach its participants, so a cancel cannot leave a committed
+transaction prepared.
+
 Not written yet:
 
-- **Query cancellation.** A `CancelRequest` arrives on its own connection and
-  needs a key registry to route; it is accepted and dropped.
 - Metrics, and TLS to the client.
 
 Alongside, not part of the proxy:

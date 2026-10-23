@@ -102,6 +102,7 @@ impl Server {
             backend_user: config.backend.user.clone(),
             backend_database: config.backend.database.clone(),
             auth,
+            cancels: crate::cancel::CancelRegistry::new(),
         });
 
         let listener = TcpListener::bind(&config.server.listen)
