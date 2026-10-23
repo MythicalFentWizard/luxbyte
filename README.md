@@ -331,10 +331,27 @@ refused at startup.
 
 What it costs: a small query to the authority every `poll_ms` from each
 proxy, a round trip there on the first write of each new key, and holds up
-to two polls longer while a key moves. What it does not cover: a write a
-proxy sent before its lease ran out that reaches its region more than
-`lease_ms / 2` later can land after a move it never heard of. That window is
-the price of leases instead of consensus.
+to two polls longer while a key moves. What leases alone do not cover: a
+write a proxy sent before its lease ran out that reaches its region more than
+`lease_ms / 2` later can land after a move it never heard of. Consensus
+between proxies does not close that either, since the write is already on
+its way to the database; the database can. With `guard = true` every region
+gets a trigger on each geo-partitioned table that refuses a write for a key
+its own directory places elsewhere — and a move leaves every region's
+directory saying where the key went — so such a write is refused by
+PostgreSQL (`40001`, which clients retry) instead of stranded where no read
+will look:
+
+```
+ERROR:  key alice of orders lives in eu-west, not in us-east
+HINT:  the key has moved; retry, and the proxy sends it where it is
+```
+
+The move itself is let through by a setting only its own transaction turns
+on. Guards cost one index lookup per written row: on single-row updates over
+loopback, the worst case, 24% of throughput with one client and 34% with
+four (PostgreSQL 16, vacuum between runs, three interleaved rounds). They
+are off by default, and need the backend role to own the tables.
 
 Against PostgreSQL 16 (two proxies, three clusters), a move through one
 proxy while the other ran pgbench incrementing the moving key's rows lost

@@ -80,6 +80,9 @@ listen = "127.0.0.1:9187"
 # lock_timeout_ms = 5000
 # Record a key the first time it is written, so its reads go to one region.
 # record_new_keys = true
+# Have PostgreSQL itself refuse a write for a key in a region the key has
+# left (a trigger per geo-partitioned table; the backend role must own them).
+# guard = false
 # Several proxies share this directory: moves are agreed with every live
 # proxy, new keys are claimed, and a proxy that cannot reach the others
 # stops routing on the directory. Every proxy needs its own server.node.

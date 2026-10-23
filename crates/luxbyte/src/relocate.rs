@@ -866,7 +866,12 @@ async fn copy(
             .filter(|region| *region != to && !sources.contains(*region))
             .map(ToOwned::to_owned),
     );
-    let set_timeout = format!("SET LOCAL lock_timeout = '{}ms'", store.lock_timeout_ms);
+    // The move itself writes rows where the directory does not yet place
+    // them, which the guards let through only for it.
+    let set_timeout = format!(
+        "SET LOCAL lock_timeout = '{}ms'; SET LOCAL {MOVING} = 'on'",
+        store.lock_timeout_ms
+    );
     for region in &order {
         let pool = shared
             .pool_for(region, Access::ReadWrite, 0)
@@ -1311,6 +1316,93 @@ pub async fn record(shared: &Shared, keys: &[(String, String)]) -> Result<(), Re
     Ok(())
 }
 
+/// The setting a move's transaction turns on, which the guards let through.
+const MOVING: &str = "luxbyte.moving";
+
+/// The SQLSTATE a guard refuses with: `serialization_failure`, which client
+/// libraries retry, by when the proxy routes the key where it now is.
+const GUARD_SQLSTATE: &str = "40001";
+
+/// Installs, in every region, a trigger on each geo-partitioned table that
+/// refuses a write for a key this region's directory places elsewhere.
+///
+/// A move changes the directory in every region in its own transaction, so
+/// once it commits the region a key left says where it went, and a write
+/// that still arrives there — delayed in the network past the move, or sent
+/// by something that never heard of it — is refused by PostgreSQL itself
+/// rather than stranded where no read will look. Keys the directory does not
+/// list are not checked: nothing is known about them.
+///
+/// Best effort: a region that cannot be reached, or whose tables the backend
+/// role does not own, is reported and left unguarded.
+async fn guard(shared: &Shared, store: &DirectoryStore) {
+    let directory = store_table(store);
+    let topology = shared.router.topology();
+    for region in topology.region_ids() {
+        let Some(pool) = shared.pool_for(region, Access::ReadWrite, 0) else {
+            continue;
+        };
+        for policy in &topology.tables {
+            let Placement::GeoPartitioned { key } = &policy.placement else {
+                continue;
+            };
+            let sql = guard_sql(&directory, &policy.schema, &policy.table, key, region);
+            match pool.simple_query(&sql).await {
+                Ok(_) => tracing::debug!(%region, table = %policy.table, "guarded"),
+                Err(error) => tracing::warn!(
+                    %region,
+                    table = %policy.table,
+                    %error,
+                    "could not install the move guard; writes there are not checked"
+                ),
+            }
+        }
+    }
+}
+
+/// The function and trigger that guard one table in one region, replaced
+/// in one transaction so that the table is never left half-guarded.
+fn guard_sql(directory: &str, schema: &str, table: &str, key: &str, region: &str) -> String {
+    let function = format!(
+        "{}.{}",
+        ident(schema),
+        ident(&format!("luxbyte_guard_{table}"))
+    );
+    let qualified = format!("{}.{}", ident(schema), ident(table));
+    let column = ident(key);
+    let check = |row: &str| {
+        format!(
+            "SELECT region INTO placed FROM {directory} WHERE table_name = {name} \
+             AND shard_key = {row}.{column}::text; \
+             IF placed IS NOT NULL AND placed <> {here} THEN \
+             RAISE EXCEPTION USING ERRCODE = '{GUARD_SQLSTATE}', \
+             MESSAGE = format('key %s of %s lives in %s, not in %s', \
+             {row}.{column}, {name}, placed, {here}), \
+             HINT = 'the key has moved; retry, and the proxy sends it where it is'; \
+             END IF;",
+            name = literal(table),
+            here = literal(region),
+        )
+    };
+    format!(
+        "BEGIN; SET LOCAL lock_timeout = '5s'; \
+         CREATE OR REPLACE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $luxbyte$ \
+         DECLARE placed text; BEGIN \
+         IF coalesce(current_setting('{MOVING}', true), '') = 'on' THEN \
+         RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END; END IF; \
+         IF TG_OP = 'DELETE' OR (TG_OP = 'UPDATE' AND OLD.{column} IS DISTINCT FROM NEW.{column}) \
+         THEN {old} END IF; \
+         IF TG_OP IN ('INSERT', 'UPDATE') THEN {new} END IF; \
+         RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END; \
+         END $luxbyte$; \
+         CREATE OR REPLACE TRIGGER luxbyte_guard BEFORE INSERT OR UPDATE OR DELETE ON {qualified} \
+         FOR EACH ROW EXECUTE FUNCTION {function}(); \
+         COMMIT",
+        old = check("OLD"),
+        new = check("NEW"),
+    )
+}
+
 /// Creates the directory table where it is missing and loads it from the
 /// home region. Returns how many keys it holds.
 ///
@@ -1343,6 +1435,9 @@ pub async fn load(shared: &Shared) -> Result<usize, String> {
             }
             tracing::warn!(%region, %error, "could not create the directory table");
         }
+    }
+    if store.guard {
+        guard(shared, store).await;
     }
     // Shared, the authority region's copy is the one read, when the proxy
     // joins the others.
