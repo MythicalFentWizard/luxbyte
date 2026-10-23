@@ -497,6 +497,7 @@ dependencies = [
 name = "luxbyte-sql"
 version = "0.1.0"
 dependencies = [
+ "pg_query",
  "serde",
  "sqlparser",
  "thiserror 2.0.21",
