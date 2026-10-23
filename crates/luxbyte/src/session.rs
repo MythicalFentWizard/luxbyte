@@ -48,6 +48,8 @@ pub struct Shared {
     pub auth: crate::auth::Authenticator,
     /// The cancel key of every live session.
     pub cancels: crate::cancel::CancelRegistry,
+    /// What the proxy has been doing.
+    pub metrics: crate::metrics::Metrics,
     /// The aggregate functions the database lists, and when they were read.
     pub aggregates: parking_lot::Mutex<Option<(std::time::Instant, Arc<Aggregates>)>>,
 }
@@ -124,6 +126,8 @@ impl Drop for Session {
 impl Session {
     /// Serves one client until it disconnects.
     pub async fn run(shared: Arc<Shared>, stream: TcpStream) -> Result<(), SessionError> {
+        let counted = Arc::clone(&shared);
+        let _session = counted.metrics.session();
         stream.set_nodelay(true)?;
         let mut session = Self {
             client: Framed::new(stream, Peer::Frontend),
@@ -202,6 +206,7 @@ impl Session {
             StartupRequest::Cancel(request) => {
                 if let Some(scope) = self.shared.cancels.lookup(request) {
                     let delivered = scope.cancel(CANCEL_TIMEOUT).await;
+                    self.shared.metrics.cancelled(delivered);
                     tracing::debug!(delivered, "relayed a cancel");
                 }
                 Ok(false)
@@ -255,6 +260,7 @@ impl Session {
 
         let mut server = ScramServer::new(verifier);
         let Ok(server_first) = server.server_first(&client_first) else {
+            self.shared.metrics.auth_failed();
             self.fatal("28P01", &failed).await?;
             return Ok(false);
         };
@@ -266,6 +272,7 @@ impl Session {
         let response = self.client.read_message().await?;
         let client_final = String::from_utf8_lossy(&response.body).into_owned();
         let Ok(server_final) = server.server_final(&client_final) else {
+            self.shared.metrics.auth_failed();
             self.fatal("28P01", &failed).await?;
             return Ok(false);
         };
@@ -279,6 +286,31 @@ impl Session {
             }
         }
         Ok(true)
+    }
+
+    /// Commits, counting how the transaction ended.
+    async fn commit(
+        &self,
+        transaction: Transaction,
+    ) -> Result<luxbyte_txn::CommitOutcome, luxbyte_txn::TxnError> {
+        use luxbyte_txn::CommitOutcome;
+        let outcome = transaction.commit().await;
+        self.shared.metrics.transaction(match &outcome {
+            Ok(CommitOutcome::SinglePhase { .. }) => "committed_one_phase",
+            Ok(CommitOutcome::Committed { .. }) => "committed_two_phase",
+            Ok(CommitOutcome::CommittedPendingAcknowledgement { .. }) => {
+                "committed_pending_acknowledgement"
+            }
+            Ok(_) => "committed_empty",
+            Err(_) => "failed",
+        });
+        outcome
+    }
+
+    /// Rolls back, counting it.
+    async fn rollback(&self, transaction: Transaction) {
+        let _ = transaction.rollback().await;
+        self.shared.metrics.transaction("rolled_back");
     }
 
     /// The pool for a region, as this session's backend role.
@@ -396,7 +428,11 @@ impl Session {
             }
 
             let plan = self.shared.router.plan(analysis, Some(&parameters));
-            if let Err(refusal) = self.execute(analysis, text, plan).await? {
+            let kind = plan_kind(&plan);
+            let started = std::time::Instant::now();
+            let outcome = self.execute(analysis, text, plan).await?;
+            self.shared.metrics.statement(kind, started.elapsed());
+            if let Err(refusal) = outcome {
                 self.error(&refusal)?;
                 failed = true;
                 // A failed statement inside a transaction poisons it, as it
@@ -413,8 +449,8 @@ impl Session {
             if let Some(transaction) = self.transaction.take() {
                 self.extended.end_transaction();
                 if failed {
-                    let _ = transaction.rollback().await;
-                } else if let Err(error) = transaction.commit().await {
+                    self.rollback(transaction).await;
+                } else if let Err(error) = self.commit(transaction).await {
                     self.error(&txn_refusal(&error))?;
                 }
             }
@@ -535,12 +571,12 @@ impl Session {
                 // statements that ran before a refusal the client was told
                 // had aborted the block.
                 if self.status == TransactionStatus::Failed {
-                    let _ = transaction.rollback().await;
+                    self.rollback(transaction).await;
                     self.status = TransactionStatus::Idle;
                     self.command_complete("ROLLBACK")?;
                     return Ok(Ok(()));
                 }
-                let outcome = transaction.commit().await;
+                let outcome = self.commit(transaction).await;
                 self.status = TransactionStatus::Idle;
                 match outcome {
                     Ok(_) => {
@@ -560,7 +596,7 @@ impl Session {
             TransactionOp::Rollback => {
                 if let Some(transaction) = self.transaction.take() {
                     self.extended.end_transaction();
-                    let _ = transaction.rollback().await;
+                    self.rollback(transaction).await;
                 }
                 self.status = TransactionStatus::Idle;
                 self.command_complete("ROLLBACK")?;
@@ -602,6 +638,8 @@ impl Session {
         } else {
             access
         };
+        let remote = region != self.shared.router.topology().home_region;
+        self.shared.metrics.sent(region, remote);
         let pool = self
             .pool_for(region, access, self.reads)
             .ok_or_else(|| PoolError::Auth(format!("region {region} is not configured")))?;
@@ -718,6 +756,8 @@ impl Session {
                     retryable: false,
                 }));
             };
+            let remote = *region != self.shared.router.topology().home_region;
+            self.shared.metrics.sent(region, remote);
             let region = region.clone();
             let statement = statement.clone();
             let scope = self.cancel.clone();
@@ -771,6 +811,11 @@ impl Session {
                 merge::sorted(&answers, &order)
             };
             if let Some(rows) = rows {
+                self.shared.metrics.combined(if order.is_empty() {
+                    "concatenated"
+                } else {
+                    "merged_in_proxy"
+                });
                 return Ok(Ok(merge::finish_rows(
                     columns,
                     type_oids,
@@ -785,6 +830,7 @@ impl Session {
             Ok(source) => source,
             Err(refusal) => return Ok(Err(refusal)),
         };
+        self.shared.metrics.combined("finished_in_postgres");
         match finish.query(&columns, &source) {
             Ok(sql) => self.finish_in_home(&sql).await,
             Err(reason) => Ok(Err(cannot_combine(answers.len(), &reason.0))),
@@ -818,6 +864,7 @@ impl Session {
             Ok(source) => source,
             Err(refusal) => return Ok(Err(refusal)),
         };
+        self.shared.metrics.combined("aggregated_in_postgres");
         match finish.query(&types, &source) {
             Ok(sql) => self.finish_in_home(&sql).await,
             Err(reason) => Ok(Err(cannot_combine(answers.len(), &reason.0))),
@@ -930,23 +977,31 @@ impl Session {
         let mut affected = 0_usize;
         for part in &per_region {
             let Some(pool) = self.pool_for(&part.region, Access::ReadWrite, 0) else {
-                continue;
+                // Leaving a region out would commit the rest of the write
+                // without it.
+                self.rollback(transaction).await;
+                return Ok(Err(Refusal {
+                    sqlstate: "08000".to_owned(),
+                    message: format!("region {} is not configured", part.region),
+                    hint: None,
+                    retryable: false,
+                }));
             };
             let statement = self.with_settings(&part.sql);
             if let Err(error) = transaction.enlist(&part.region, &pool).await {
-                let _ = transaction.rollback().await;
+                self.rollback(transaction).await;
                 return Ok(Err(txn_refusal(&error)));
             }
             match transaction.execute(&part.region, &statement).await {
                 Ok(result) => affected = affected.saturating_add(rows_affected(&result)),
                 Err(error) => {
-                    let _ = transaction.rollback().await;
+                    self.rollback(transaction).await;
                     return Ok(Err(txn_refusal(&error)));
                 }
             }
         }
 
-        match transaction.commit().await {
+        match self.commit(transaction).await {
             Ok(_) => {
                 let tag = command_tag(analysis, affected);
                 self.command_complete(&tag)?;
@@ -1034,6 +1089,7 @@ impl Session {
     }
 
     fn error(&mut self, refusal: &Refusal) -> Result<(), SessionError> {
+        self.shared.metrics.error(&refusal.sqlstate);
         let mut builder = build::ErrorBuilder::error(&refusal.sqlstate, refusal.message.clone());
         if let Some(hint) = &refusal.hint {
             builder = builder.hint(hint.clone());
@@ -1062,6 +1118,18 @@ fn is_request(message: &luxbyte_proto::RawMessage, code: i32) -> bool {
         .get(..4)
         .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
         .is_some_and(|bytes| i32::from_be_bytes(bytes) == code)
+}
+
+/// The label a plan is counted under.
+const fn plan_kind(plan: &Plan) -> &'static str {
+    match plan {
+        Plan::Local(_) => "local",
+        Plan::Single { .. } => "single",
+        Plan::ScatterGather { .. } => "scatter",
+        Plan::Distributed { .. } => "distributed",
+        Plan::NeedsParameters { .. } => "deferred",
+        Plan::Refuse(_) => "refused",
+    }
 }
 
 /// Why a read across `regions` regions could not be combined.

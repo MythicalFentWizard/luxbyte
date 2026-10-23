@@ -40,6 +40,12 @@ passthrough = true
 # name = "app"
 # verifier = "SCRAM-SHA-256$4096:<salt>$<StoredKey>:<ServerKey>"
 
+# Prometheus metrics, a JSON snapshot, key lookup and a dashboard. Off unless
+# listen is set; refuses to listen beyond loopback without a password.
+[admin]
+listen = "127.0.0.1:9187"
+# password_env = "LUXBYTE_ADMIN_PASSWORD"
+
 [topology]
 home_region = "eu-west"
 

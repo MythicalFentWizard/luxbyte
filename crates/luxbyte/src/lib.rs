@@ -5,11 +5,13 @@
 //! It is a library so the proxy can be driven from an integration test
 //! without a process boundary.
 
+pub mod admin;
 pub mod auth;
 pub mod cancel;
 pub mod config;
 pub mod console;
 pub mod merge;
+pub mod metrics;
 pub mod server;
 pub mod session;
 pub mod split;
