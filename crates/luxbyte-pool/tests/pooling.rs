@@ -8,7 +8,10 @@
 
 use std::time::Duration;
 
-use luxbyte_pool::{ConnectionTarget, Credentials, Pool, PoolConfig, PoolError, PoolSet};
+use luxbyte_pool::{
+    ConnectionTarget, Credentials, Pool, PoolConfig, PoolError, PoolSet, Step, StepKind,
+};
+use luxbyte_proto::frontend;
 use luxbyte_testkit::{Backend, BackendConfig, Reply};
 
 fn target(backend: &Backend) -> ConnectionTarget {
@@ -219,6 +222,100 @@ async fn a_failed_statement_inside_a_transaction_retires_the_connection() {
 }
 
 // ---------------------------------------------------------------- failures
+
+// ------------------------------------------------------- extended queries
+
+fn extended_select(sync: bool) -> Vec<Step> {
+    let mut steps = vec![
+        Step::new(
+            StepKind::Parse,
+            frontend::parse("", "SELECT id FROM users", &[]).unwrap(),
+        ),
+        Step::new(
+            StepKind::Bind,
+            frontend::bind("", "", &[], &[], &[]).unwrap(),
+        ),
+        Step::new(StepKind::Execute, frontend::execute("", 0).unwrap()),
+    ];
+    if sync {
+        steps.push(Step::new(StepKind::Sync, frontend::sync().unwrap()));
+    }
+    steps
+}
+
+#[tokio::test]
+async fn each_pipelined_step_gets_its_own_answer() {
+    let backend = backend_with(
+        BackendConfig::new("eu-west").reply_to("SELECT", Reply::rows(&["id"], &[&["1"], &["2"]])),
+    )
+    .await;
+    let pool = pool(&backend);
+    let mut connection = pool.acquire().await.expect("acquire");
+
+    let replies = connection
+        .pipeline(&extended_select(true))
+        .await
+        .expect("pipeline");
+    let counts: Vec<usize> = replies.iter().map(|reply| reply.messages.len()).collect();
+    // ParseComplete; BindComplete; two rows and CommandComplete; ReadyForQuery.
+    assert_eq!(counts, [1, 1, 3, 1]);
+    assert!(replies.iter().all(|reply| !reply.failed));
+}
+
+#[tokio::test]
+async fn a_connection_mid_batch_is_not_returned_to_the_pool() {
+    // Without a Sync the server may be holding an implicit transaction, and
+    // the next borrower would inherit it.
+    let backend = backend_with(BackendConfig::new("eu-west")).await;
+    let pool = pool(&backend);
+    {
+        let mut connection = pool.acquire().await.expect("acquire");
+        connection
+            .pipeline(&extended_select(false))
+            .await
+            .expect("pipeline");
+    }
+    assert_eq!(pool.stats().idle, 0);
+    assert_eq!(pool.stats().discarded, 1);
+
+    {
+        let mut connection = pool.acquire().await.expect("acquire");
+        connection
+            .pipeline(&extended_select(true))
+            .await
+            .expect("pipeline");
+    }
+    assert_eq!(pool.stats().idle, 1);
+}
+
+#[tokio::test]
+async fn steps_after_an_error_come_back_empty_until_the_sync() {
+    let backend = backend_with(
+        BackendConfig::new("eu-west").reply_to("SELECT", Reply::fail("42P01", "no such table")),
+    )
+    .await;
+    let pool = pool(&backend);
+    let mut connection = pool.acquire().await.expect("acquire");
+
+    let mut steps = extended_select(false);
+    steps.push(Step::new(
+        StepKind::Execute,
+        frontend::execute("", 0).unwrap(),
+    ));
+    steps.push(Step::new(StepKind::Sync, frontend::sync().unwrap()));
+    let replies = connection.pipeline(&steps).await.expect("pipeline");
+
+    let failed: Vec<bool> = replies.iter().map(|reply| reply.failed).collect();
+    assert_eq!(failed, [false, false, true, false, false]);
+    assert!(
+        replies
+            .get(3)
+            .is_some_and(|reply| reply.messages.is_empty())
+    );
+    // The Sync brought the connection back, so it can be pooled again.
+    drop(connection);
+    assert_eq!(pool.stats().idle, 1);
+}
 
 #[tokio::test]
 async fn a_server_error_is_reported_with_its_sqlstate() {

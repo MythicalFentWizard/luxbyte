@@ -21,8 +21,10 @@
 
 pub mod connection;
 pub mod error;
+pub mod pipeline;
 pub mod pool;
 
 pub use connection::{Connection, ConnectionTarget, Credentials, QueryResult};
 pub use error::PoolError;
+pub use pipeline::{Step, StepKind, StepReply};
 pub use pool::{Pool, PoolConfig, PoolSet, PoolStats, PooledConnection};

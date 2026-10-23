@@ -9,6 +9,7 @@ authors.workspace = true
 default-run = "luxbyte"
 
 [dependencies]
+bytes.workspace = true
 luxbyte-core.workspace = true
 luxbyte-pool.workspace = true
 luxbyte-proto.workspace = true

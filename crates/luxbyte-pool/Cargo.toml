@@ -8,6 +8,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+bytes.workspace = true
 luxbyte-core.workspace = true
 luxbyte-proto.workspace = true
 parking_lot.workspace = true

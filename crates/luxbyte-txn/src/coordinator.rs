@@ -347,6 +347,20 @@ impl Transaction {
         Ok(participant.connection.simple_query(sql).await?)
     }
 
+    /// The connection a participant's work runs on.
+    ///
+    /// For callers that speak to the participant directly, such as a relay
+    /// of the extended query protocol. Whatever they send is part of this
+    /// transaction and is committed or rolled back with it.
+    pub fn connection(&mut self, region: &str) -> Result<&mut PooledConnection, TxnError> {
+        self.check_open()?;
+        self.participants
+            .iter_mut()
+            .find(|p| p.region == region)
+            .map(|participant| &mut participant.connection)
+            .ok_or_else(|| TxnError::UnknownRegion(region.to_owned()))
+    }
+
     /// Commits.
     ///
     /// With one participant this is an ordinary `COMMIT`. With more, it is

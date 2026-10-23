@@ -9,10 +9,10 @@ where the user is, and keeps a directory so it can be moved later when they
 move. A read in your home region is a local round trip. The same read against a
 single distant cluster is the speed of light and back.
 
-**Status: it runs.** `luxbyte serve` accepts PostgreSQL clients, routes their
-statements, merges scattered reads and commits across regions in two phases.
-The extended query protocol and client authentication are the notable gaps —
-see [Where it stands](#where-it-stands).
+**Status: it runs.** `luxbyte serve` accepts PostgreSQL clients over both the
+simple and the extended query protocol, routes their statements, merges
+scattered reads and commits across regions in two phases. Client
+authentication is the notable gap — see [Where it stands](#where-it-stands).
 
 ---
 
@@ -345,13 +345,22 @@ Done, tested, and working:
   execution with sorted merge, statement splitting, the operator console, and
   the `explain` command.
 
+The extended query protocol — what psycopg3, asyncpg and JDBC use by default —
+routes each statement on the key bound to it at `Bind`, including keys bound in
+binary once their type is declared or reported by a `Describe`. The proxy keeps
+prepared statements itself and re-parses them on whichever backend connection a
+`Bind` is routed to, so a statement prepared once runs in any region. An error
+discards the rest of the batch and rolls it back, as on one server. What it
+refuses, it refuses with a reason:
+
+- a single statement whose plan spans regions (scatter-gather and split writes
+  are simple-protocol only for now);
+- a batch that writes to two regions outside a transaction, which could not
+  commit atomically — inside `BEGIN`/`COMMIT` it commits in two phases;
+- `COPY`.
+
 Not written yet:
 
-- **The extended query protocol.** `Parse`/`Bind`/`Execute` are refused with a
-  clear error rather than left to hang, so a client that uses prepared
-  statements by default must be told to use simple query mode. The planner
-  already defers routing until `Bind`, so the machinery exists; the session
-  does not use it yet.
 - **Client authentication.** The proxy authenticates *to* backends with SCRAM
   or MD5, but accepts any client. Do not expose the listener anywhere the
   backends are not already reachable from.

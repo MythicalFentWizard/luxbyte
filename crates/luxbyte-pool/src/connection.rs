@@ -6,10 +6,12 @@ use luxbyte_core::topology::Endpoint;
 use luxbyte_proto::auth::{ScramClient, md5_password};
 use luxbyte_proto::backend::{Authentication, Backend, TransactionStatus};
 use luxbyte_proto::startup::StartupParameters;
+use luxbyte_proto::tag;
 use luxbyte_proto::{Framed, Peer, ProtocolError, frontend};
 use tokio::net::TcpStream;
 
 use crate::error::PoolError;
+use crate::pipeline::{Step, StepKind, StepReply};
 
 /// How a connection authenticates.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +111,12 @@ pub struct Connection {
     /// Set when the connection is known to be unusable, so it is retired
     /// rather than handed to someone else.
     poisoned: bool,
+    /// Set while extended-query messages have been sent without a `Sync`.
+    ///
+    /// `ReadyForQuery` only arrives after a `Sync`, so until then the last
+    /// reported status is stale: the server may be holding an implicit
+    /// transaction open, and the next borrower would inherit it.
+    awaiting_sync: bool,
 }
 
 impl Connection {
@@ -142,6 +150,7 @@ impl Connection {
             opened_at: Instant::now(),
             returned_at: Instant::now(),
             poisoned: false,
+            awaiting_sync: false,
         };
         connection.handshake(credentials).await?;
         Ok(connection)
@@ -310,6 +319,99 @@ impl Connection {
         }
     }
 
+    /// Sends extended-query messages in one write and reads the answer to
+    /// each.
+    ///
+    /// Unless the last step is a `Sync`, a `Flush` is appended so the server
+    /// answers what it has without ending the implicit transaction. That is
+    /// what lets a caller hold a portal open across several exchanges; it is
+    /// also why the connection is not reusable until a later `Sync`.
+    ///
+    /// Returns one [`StepReply`] per step. An error answer is a reply, not an
+    /// `Err`: the server skips everything after it up to the next `Sync`, and
+    /// those steps come back empty. `Err` means the connection itself failed
+    /// or answered out of turn, and it has been poisoned.
+    pub async fn pipeline(&mut self, steps: &[Step]) -> Result<Vec<StepReply>, PoolError> {
+        for step in steps {
+            self.framed.queue_raw(&step.message);
+        }
+        if steps.last().is_none_or(|step| step.kind != StepKind::Sync) {
+            self.framed.queue_raw(&frontend::flush()?);
+        }
+        self.awaiting_sync = true;
+        if let Err(error) = self.framed.flush().await {
+            self.poisoned = true;
+            return Err(PoolError::from(error));
+        }
+
+        let mut replies = Vec::with_capacity(steps.len());
+        let mut skipping = false;
+        for step in steps {
+            let mut reply = StepReply::default();
+            if skipping && step.kind != StepKind::Sync {
+                replies.push(reply);
+                continue;
+            }
+            loop {
+                let message = match self.framed.read_message().await {
+                    Ok(message) => message,
+                    Err(error) => {
+                        self.poisoned = true;
+                        return Err(PoolError::from(error));
+                    }
+                };
+                let kind = message.tag.unwrap_or(0);
+                match kind {
+                    // A notice belongs to whatever caused it, so it travels
+                    // with that step's answer.
+                    tag::NOTICE_RESPONSE => reply.messages.push(message),
+                    // Asynchronous and not the client's business here: the
+                    // proxy reports its own parameters, and LISTEN is not
+                    // relayed.
+                    tag::SYNC_OR_PARAMETER_STATUS | tag::NOTIFICATION_RESPONSE => {}
+                    tag::EXECUTE_OR_ERROR => {
+                        reply.failed = true;
+                        reply.messages.push(message);
+                        // A `Sync` can fail too — a deferred constraint is
+                        // checked when the implicit transaction commits — and
+                        // `ReadyForQuery` still follows.
+                        if step.kind != StepKind::Sync {
+                            skipping = true;
+                            break;
+                        }
+                    }
+                    tag::READY_FOR_QUERY if step.kind == StepKind::Sync => {
+                        if let Backend::ReadyForQuery { status } = Backend::decode(&message)? {
+                            self.status = status;
+                        }
+                        self.awaiting_sync = false;
+                        skipping = false;
+                        reply.messages.push(message);
+                        break;
+                    }
+                    other if step.kind.ends_with(other) => {
+                        reply.messages.push(message);
+                        break;
+                    }
+                    other if step.kind.continues_with(other) => reply.messages.push(message),
+                    // Anything else — `CopyInResponse` from an Execute, a
+                    // stray `ReadyForQuery` — means the two sides disagree
+                    // about where they are, and nothing read after this could
+                    // be trusted.
+                    other => {
+                        self.poisoned = true;
+                        return Err(PoolError::Protocol(ProtocolError::UnexpectedTag {
+                            tag: char::from(other),
+                            peer: Peer::Backend,
+                        }));
+                    }
+                }
+            }
+            replies.push(reply);
+        }
+        Ok(replies)
+    }
+
     /// The transaction state last reported by the server.
     #[must_use]
     pub const fn status(&self) -> TransactionStatus {
@@ -349,7 +451,7 @@ impl Connection {
     /// whoever borrows it next.
     #[must_use]
     pub const fn is_reusable(&self) -> bool {
-        !self.poisoned && self.status.is_poolable()
+        !self.poisoned && !self.awaiting_sync && self.status.is_poolable()
     }
 
     /// How long since the connection was opened.

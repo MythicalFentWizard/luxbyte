@@ -668,51 +668,6 @@ async fn assigning_to_the_shard_key_is_refused() {
     assert!(!f.eu.saw("UPDATE users"));
 }
 
-#[tokio::test]
-async fn the_extended_query_protocol_is_refused_clearly_rather_than_hanging() {
-    // A client that waits forever for a reply looks like a hung database,
-    // which is a much worse first impression than an error.
-    let f = fixture(&placed()).await;
-    let mut stream = tokio::net::TcpStream::connect(f.proxy.addr())
-        .await
-        .expect("connect");
-    {
-        use tokio::io::AsyncWriteExt as _;
-        let mut parameters = luxbyte_proto::startup::StartupParameters::new();
-        parameters.set("user", "app").set("database", "shop");
-        stream
-            .write_all(&parameters.encode().expect("encode"))
-            .await
-            .expect("startup");
-        stream
-            .write_all(&luxbyte_proto::frontend::parse("s1", "SELECT 1", &[]).expect("parse"))
-            .await
-            .expect("send parse");
-        stream
-            .write_all(&luxbyte_proto::frontend::sync().expect("sync"))
-            .await
-            .expect("send sync");
-    }
-
-    let mut framed = luxbyte_proto::Framed::new(stream, luxbyte_proto::Peer::Backend);
-    let mut saw_error = false;
-    for _ in 0..20 {
-        let message = tokio::time::timeout(Duration::from_secs(2), framed.read_message())
-            .await
-            .expect("must not hang")
-            .expect("should read");
-        if let Ok(luxbyte_proto::backend::Backend::Error(notice)) =
-            luxbyte_proto::backend::Backend::decode(&message)
-        {
-            assert_eq!(notice.code(), "0A000");
-            assert!(notice.message().contains("extended query"));
-            saw_error = true;
-            break;
-        }
-    }
-    assert!(saw_error, "the proxy should say it cannot do this yet");
-}
-
 // ------------------------------------------------------------- pooling
 
 #[tokio::test]
