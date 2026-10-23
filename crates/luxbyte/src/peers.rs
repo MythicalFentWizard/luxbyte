@@ -97,6 +97,8 @@ pub struct Peer {
     pub node: String,
     /// Milliseconds since its last heartbeat.
     pub heartbeat_age_ms: u64,
+    /// What it said of itself with that heartbeat.
+    pub summary: String,
 }
 
 /// What one visit to the authority region learned.
@@ -344,7 +346,7 @@ impl Peers {
             );
         }
         let started = Instant::now();
-        let visit = self.visit(shared).await?;
+        let visit = self.visit(shared, &self.summary(shared)).await?;
         if !visit.current {
             return Err(format!(
                 "another proxy took the name \"{}\" while this one started",
@@ -373,7 +375,7 @@ impl Peers {
     /// go of keys whose moves are over.
     pub async fn round(&self, shared: &Shared) {
         let started = Instant::now();
-        let visit = match self.visit(shared).await {
+        let visit = match self.visit(shared, &self.summary(shared)).await {
             Ok(visit) => visit,
             Err(error) => {
                 tracing::warn!(%error, "could not reach the shared directory");
@@ -410,6 +412,27 @@ impl Peers {
         self.follow(shared, &visit.moves).await;
         self.renewed(started, visit.peers);
         shared.moves.announce();
+    }
+
+    /// What this proxy says of itself with each heartbeat, for the others'
+    /// `SHOW PEERS` and dashboards. Only counters already kept: it is sent
+    /// every `poll_ms`.
+    fn summary(&self, shared: &Shared) -> String {
+        let counters = shared.metrics.summary();
+        let statements: u64 = counters
+            .iter()
+            .filter(|(name, _)| name.starts_with("statements_"))
+            .map(|(_, count)| *count)
+            .fold(0, u64::saturating_add);
+        let held = counters.get("held_statements_total").copied().unwrap_or(0);
+        let following = self.state.lock().following.len();
+        format!(
+            "{} sessions, {statements} statements, {held} held, holding {following} keys for \
+             moves{}, home {}",
+            shared.metrics.active_sessions(),
+            if self.fenced() { ", fenced" } else { "" },
+            shared.router.topology().home_region
+        )
     }
 
     fn renewed(&self, started: Instant, peers: Vec<Peer>) {
@@ -869,13 +892,14 @@ impl Peers {
         }
     }
 
-    async fn visit(&self, shared: &Shared) -> Result<Visit, String> {
+    async fn visit(&self, shared: &Shared, summary: &str) -> Result<Visit, String> {
         match &self.store {
             Store::Postgres(tables) => {
                 let result = self
                     .pool(shared)?
                     .simple_query(&format!(
-                        "WITH beat AS (UPDATE {proxies} SET heartbeat_at = clock_timestamp() \
+                        "WITH beat AS (UPDATE {proxies} SET heartbeat_at = clock_timestamp(), \
+                         summary = {summary} \
                          WHERE node = {node} AND instance = {instance} RETURNING 1) \
                          SELECT 'beat'::text, (SELECT count(*) FROM beat)::text, NULL::text, \
                          NULL::text, NULL::text, NULL::text \
@@ -883,17 +907,18 @@ impl Peers {
                          FROM {moves} \
                          UNION ALL SELECT 'peer', node, \
                          (extract(epoch FROM clock_timestamp() - heartbeat_at) * 1000)::bigint::text, \
-                         NULL, NULL, NULL FROM {proxies}",
+                         coalesce(summary, ''), NULL, NULL FROM {proxies}",
                         proxies = tables.proxies,
                         moves = tables.moves,
                         node = literal(&self.node),
-                        instance = literal(&self.instance)
+                        instance = literal(&self.instance),
+                        summary = literal(summary)
                     ))
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok(read_visit(&result))
             }
-            Store::Memory(memory) => memory.visit(&self.node, &self.instance),
+            Store::Memory(memory) => memory.visit(&self.node, &self.instance, summary),
         }
     }
 
@@ -1123,6 +1148,7 @@ fn read_visit(result: &QueryResult) -> Visit {
                         heartbeat_age_ms: field(2)
                             .and_then(|age| age.parse::<i64>().ok())
                             .map_or(0, |age| u64::try_from(age).unwrap_or(0)),
+                        summary: field(3).unwrap_or_default(),
                     });
                 }
             }
@@ -1160,6 +1186,11 @@ async fn create(pool: &Pool, tables: &Tables) -> Result<(), String> {
              text NOT NULL, PRIMARY KEY (move_id, node, phase))",
             tables.acks
         ),
+        // Added after the table first shipped.
+        format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS summary text",
+            tables.proxies
+        ),
     ];
     for statement in &statements {
         // Two proxies starting together can race to create the same table;
@@ -1196,7 +1227,7 @@ pub struct MemoryPeers {
 
 #[derive(Debug, Default)]
 struct MemoryState {
-    proxies: BTreeMap<String, (String, Instant)>,
+    proxies: BTreeMap<String, (String, Instant, String)>,
     moves: BTreeMap<i64, Announced>,
     confirmations: BTreeSet<(i64, String, Phase)>,
     directory: BTreeMap<(String, String), String>,
@@ -1255,22 +1286,24 @@ impl MemoryPeers {
 
     fn register(&self, node: &str, instance: &str, window: Duration) -> Result<bool, String> {
         let mut state = self.reach(node)?;
-        if let Some((other, beat)) = state.proxies.get(node) {
+        if let Some((other, beat, _)) = state.proxies.get(node) {
             if other != instance && beat.elapsed() < window {
                 return Ok(false);
             }
         }
-        state
-            .proxies
-            .insert(node.to_owned(), (instance.to_owned(), Instant::now()));
+        state.proxies.insert(
+            node.to_owned(),
+            (instance.to_owned(), Instant::now(), String::new()),
+        );
         Ok(true)
     }
 
-    fn visit(&self, node: &str, instance: &str) -> Result<Visit, String> {
+    fn visit(&self, node: &str, instance: &str, summary: &str) -> Result<Visit, String> {
         let mut state = self.reach(node)?;
         let current = match state.proxies.get_mut(node) {
-            Some((held, beat)) if held == instance => {
+            Some((held, beat, said)) if held == instance => {
                 *beat = Instant::now();
+                summary.clone_into(said);
                 true
             }
             _ => false,
@@ -1281,9 +1314,10 @@ impl MemoryPeers {
             peers: state
                 .proxies
                 .iter()
-                .map(|(node, (_, beat))| Peer {
+                .map(|(node, (_, beat, said))| Peer {
                     node: node.clone(),
                     heartbeat_age_ms: u64::try_from(beat.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    summary: said.clone(),
                 })
                 .collect(),
         })
@@ -1346,7 +1380,7 @@ impl MemoryPeers {
         Ok(state
             .proxies
             .iter()
-            .filter(|(other, (_, beat))| *other != node && beat.elapsed() < window)
+            .filter(|(other, (_, beat, _))| *other != node && beat.elapsed() < window)
             .filter(|(other, _)| !state.confirmations.contains(&(id, (*other).clone(), phase)))
             .map(|(other, _)| other.clone())
             .collect())
@@ -1450,7 +1484,8 @@ mod tests {
             visit.peers,
             [Peer {
                 node: "proxy-b".to_owned(),
-                heartbeat_age_ms: 120
+                heartbeat_age_ms: 120,
+                summary: String::new(),
             }]
         );
     }
@@ -1479,7 +1514,7 @@ mod tests {
         assert_eq!(memory.register("a", "two", window), Ok(false));
         assert_eq!(memory.register("a", "one", window), Ok(true));
         assert_eq!(memory.register("a", "two", Duration::ZERO), Ok(true));
-        let visit = memory.visit("a", "one").unwrap();
+        let visit = memory.visit("a", "one", "").unwrap();
         assert!(!visit.current, "the second process took the name");
     }
 

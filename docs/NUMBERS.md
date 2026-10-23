@@ -228,11 +228,11 @@ aggregates across regions that it used to refuse.
   hash, and its `REBALANCE` moves keys one atomic `RELOCATE` at a time. Per
   key is finer and keeps a key's tables together; per range moves many keys
   in fewer steps, and a range's keys never need a directory entry each.
-- **Operating it.** shahrah's dashboard is live over a WebSocket and shows
-  every proxy in the group in detail. Luxbyte has `DRAIN`, `ROUTE`, warm
-  connections, `SHOW HEALTH`, `SHOW PEERS`, alerts, and `key=`/`region=`
-  hints as shahrah has `key=`/`shard=`, but its dashboard is a page that
-  refreshes, and shows other proxies only by name and heartbeat.
+- **Operating it.** Close to even now. Both have live dashboards (shahrah
+  over a WebSocket, Luxbyte over server-sent events) that list every proxy,
+  operator verbs (`DRAIN`, `REBALANCE`; Luxbyte also `ROUTE` and `RELOCATE`),
+  warm connections, alerts, and routing hints. shahrah's dashboard shows
+  more about each other proxy than the summary Luxbyte's heartbeat carries.
 - **Measured across regions.** shahrah reports end-to-end numbers from a
   three-region bed with real latencies, against pgbouncer, pgcat and PgDog.
   Luxbyte's figures against PostgreSQL below are from one machine, over

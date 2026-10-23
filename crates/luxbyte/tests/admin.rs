@@ -197,7 +197,6 @@ async fn the_snapshot_and_dashboard_describe_the_proxy() {
     assert_eq!(status, 200);
     assert!(head.contains("Content-Security-Policy: default-src 'none'"));
     assert!(body.contains("home region eu-west"));
-    assert!(!body.contains("<script"));
 }
 
 #[tokio::test]
@@ -212,4 +211,110 @@ async fn an_unprotected_admin_port_beyond_loopback_is_refused() {
             .await
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn the_dashboard_may_run_its_own_script_and_nothing_else() {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
+    let (eu, us) = backends().await;
+    let proxy = proxy(&eu, &us, "listen = \"127.0.0.1:0\"").await;
+    let (status, head, body) = get(proxy.admin_addr().unwrap(), "/", None).await;
+    assert_eq!(status, 200);
+    let script = body
+        .split_once("<script>")
+        .and_then(|(_, rest)| rest.split_once("</script>"))
+        .map(|(script, _)| script)
+        .expect("a script");
+    let hash =
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(script.as_bytes()));
+    let policy = head
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Security-Policy: "))
+        .expect("a policy");
+    assert!(
+        policy.contains(&format!("script-src 'sha256-{hash}'")),
+        "{policy}"
+    );
+    assert!(policy.starts_with("default-src 'none'"), "{policy}");
+    // Without script, it still refreshes itself.
+    assert!(body.contains("<noscript><meta http-equiv=\"refresh\""));
+    // Every other page allows no script at all.
+    let (_, head, _) = get(proxy.admin_addr().unwrap(), "/key/users/bob", None).await;
+    assert!(!head.contains("script-src"), "{head}");
+}
+
+/// Opens `/events` and returns the stream once its headers have arrived.
+async fn events(addr: SocketAddr) -> (tokio::net::TcpStream, String) {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"GET /events HTTP/1.1\r\nHost: test\r\n\r\n")
+        .await
+        .unwrap();
+    let mut seen = String::new();
+    let mut chunk = [0_u8; 4096];
+    while !seen.contains("\r\n\r\n") {
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(read > 0, "closed after {seen:?}");
+        seen.push_str(&String::from_utf8_lossy(
+            chunk.get(..read).unwrap_or_default(),
+        ));
+    }
+    (stream, seen)
+}
+
+#[tokio::test]
+async fn events_stream_the_dashboard_sections_each_second() {
+    let (eu, us) = backends().await;
+    let proxy = proxy(&eu, &us, "listen = \"127.0.0.1:0\"").await;
+    let (mut stream, mut seen) = events(proxy.admin_addr().unwrap()).await;
+    assert!(seen.starts_with("HTTP/1.1 200 OK"), "{seen}");
+    assert!(seen.contains("Content-Type: text/event-stream"), "{seen}");
+    let mut chunk = vec![0_u8; 65536];
+    while seen.matches("\ndata: ").count() < 2 {
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(read > 0);
+        seen.push_str(&String::from_utf8_lossy(
+            chunk.get(..read).unwrap_or_default(),
+        ));
+    }
+    let data = seen
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .unwrap();
+    let parts: serde_json::Value = serde_json::from_str(data).unwrap();
+    for id in ["tiles", "alerts", "health", "regions", "pools"] {
+        assert!(parts.get(id).is_some(), "{id} missing from {data}");
+    }
+}
+
+#[tokio::test]
+async fn only_so_many_event_streams_are_open_at_once() {
+    let (eu, us) = backends().await;
+    let proxy = proxy(&eu, &us, "listen = \"127.0.0.1:0\"").await;
+    let addr = proxy.admin_addr().unwrap();
+    let mut open = Vec::new();
+    for _ in 0..16 {
+        open.push(events(addr).await.0);
+    }
+    let (status, _, _) = get(addr, "/events", None).await;
+    assert_eq!(status, 503);
+    // A closed stream gives its place back as soon as the client hangs up.
+    drop(open.pop());
+    let started = std::time::Instant::now();
+    loop {
+        let (_, seen) = events(addr).await;
+        if seen.starts_with("HTTP/1.1 200 OK") {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_millis(500), "{seen}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

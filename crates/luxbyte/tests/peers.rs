@@ -431,5 +431,10 @@ async fn show_peers_lists_every_proxy() {
         rows.iter()
             .any(|row| row[0] == "proxy-b" && row[1] == "peer"),
         "{rows:?}"
+    ); // Each says how it is doing with its heartbeat.
+    assert!(
+        rows.iter()
+            .any(|row| row[0] == "proxy-b" && row[3].contains("home us-east")),
+        "{rows:?}"
     );
 }

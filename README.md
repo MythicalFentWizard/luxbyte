@@ -576,8 +576,14 @@ An admin port, off unless configured, serves Prometheus metrics at
 `/metrics` — statement latency by plan, errors by SQLSTATE, statements per
 region and how many left the home region, how each cross-region read was
 finished, transaction outcomes, pool occupancy — plus a JSON `/snapshot`,
-`/key/<table>/<key>` to say which region holds a user's rows, a dashboard at
-`/` that needs no JavaScript, and `/healthz`. It refuses to listen beyond
+`/key/<table>/<key>` to say which region holds a user's rows, `/healthz`, and
+a dashboard at `/`: rendered on the server, live each second over
+server-sent events (`/events`, at most 16 open at once), and reloading
+itself every five seconds where script is off. Its one inline script is
+allowed by its hash in the Content-Security-Policy, and every other page
+allows none. With a shared directory it lists every proxy and what each says
+of itself with its heartbeat: sessions, statements, holds, moves followed,
+whether it is fenced. It refuses to listen beyond
 loopback without a password; the password is compared in constant time, and
 repeated wrong answers lock an address out for longer each time.
 
