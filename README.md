@@ -460,7 +460,9 @@ gives PostgreSQL's answer 46 times and shahrah 22; neither gives a wrong one. In
 16 under pgbench, on one machine, Luxbyte ran **1.15x to 1.23x** shahrah's
 transactions per second, simple and prepared, one client and sixteen. Through
 the proxy end to end, a point read costs 21 µs over a direct connection on
-loopback. Method, variance, and the places shahrah is better:
+loopback. With three regions 75 and 110 ms apart, Luxbyte reads and writes at
+home 1.08–1.23x as fast as shahrah, matches it across a region, counts over
+every region in 113 ms to its 190, and inserts new keys it refuses. Method, variance, and the places shahrah is better:
 [docs/NUMBERS.md](docs/NUMBERS.md), reproducible via [`compare/`](compare)
 and `cargo bench`.
 
@@ -708,6 +710,9 @@ Alongside, not part of the proxy:
   compiled into one process, for a head-to-head with no cross-machine
   arithmetic in it. Kept out of the workspace so that a plain `cargo test`
   never has to fetch and build shahrah.
+- **[`compare/geo`](compare/geo)** — three regions a real round trip apart
+  on one machine, a Luxbyte and a shahrah proxy in each, pgbench latency
+  percentiles per workload.
 - **[`compare/fidelity`](compare/fidelity)** — 51 statements run through
   proxies on real data split across three PostgreSQL databases, each answer
   graded against one database holding every row.
