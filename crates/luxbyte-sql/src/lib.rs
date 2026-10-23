@@ -19,6 +19,7 @@ pub mod cache;
 pub mod key;
 pub mod merge;
 pub mod shape;
+pub mod statements;
 
 pub use cache::{AnalysisCache, CacheStats, Prepared};
 pub use key::{ColumnRef, KeyConstraints, KeyValue};

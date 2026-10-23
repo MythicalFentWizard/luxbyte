@@ -345,10 +345,41 @@ impl Session {
             }
         };
 
+        // Each statement is routed on its own and must be *sent* on its own:
+        // sending the whole batch to each statement's region would run the
+        // other statements there too.
+        let texts = luxbyte_sql::statements::split(sql);
+        if texts.len() != prepared.analyses.len() {
+            // The splitter and the parser disagree about where statements
+            // end. Guessing could send a statement to the wrong region.
+            self.error(&Refusal {
+                sqlstate: "0A000".to_owned(),
+                message: "the statements in this query could not be told apart reliably".to_owned(),
+                hint: Some("send the statements one at a time".to_owned()),
+                retryable: false,
+            })?;
+            return self.ready().await;
+        }
+
+        // PostgreSQL runs a batch of several statements as one implicit
+        // transaction: if the third fails, the first two never happened. The
+        // proxy keeps that promise with a transaction of its own, which
+        // commits in two phases if the batch crossed regions.
+        let implicit = prepared.analyses.len() > 1
+            && self.transaction.is_none()
+            && !prepared
+                .analyses
+                .iter()
+                .any(StatementAnalysis::is_transaction_control);
+        if implicit {
+            let mut transaction = self.shared.coordinator.begin();
+            transaction.cancel_with(&self.cancel);
+            self.transaction = Some(transaction);
+        }
+
         let parameters = ParameterValues::from_prepared(&prepared, &[]);
-        // Each statement in a batch is routed on its own, because a batch
-        // may well touch more than one region.
-        for analysis in prepared.analyses.iter() {
+        let mut failed = false;
+        for (analysis, text) in prepared.analyses.iter().zip(texts) {
             if self.blocked_by_failed_transaction(analysis) {
                 self.error(&Refusal {
                     sqlstate: "25P02".to_owned(),
@@ -362,14 +393,27 @@ impl Session {
             }
 
             let plan = self.shared.router.plan(analysis, Some(&parameters));
-            if let Err(refusal) = self.execute(analysis, sql, plan).await? {
+            if let Err(refusal) = self.execute(analysis, text, plan).await? {
                 self.error(&refusal)?;
+                failed = true;
                 // A failed statement inside a transaction poisons it, as it
                 // would on a single server.
                 if self.transaction.is_some() {
                     self.status = TransactionStatus::Failed;
                 }
                 break;
+            }
+        }
+
+        if implicit {
+            self.status = TransactionStatus::Idle;
+            if let Some(transaction) = self.transaction.take() {
+                self.extended.end_transaction();
+                if failed {
+                    let _ = transaction.rollback().await;
+                } else if let Err(error) = transaction.commit().await {
+                    self.error(&txn_refusal(&error))?;
+                }
             }
         }
 
@@ -667,15 +711,18 @@ impl Session {
 
         // Inside an explicit transaction the client decides when to commit.
         if self.transaction.is_some() {
+            let mut affected = 0_usize;
             for part in &per_region {
-                if let Err(error) = self
+                match self
                     .run_on(&part.region, Access::ReadWrite, &part.sql)
                     .await
                 {
-                    return Ok(Err(to_refusal(&error)));
+                    Ok(result) => affected = affected.saturating_add(rows_affected(&result)),
+                    Err(error) => return Ok(Err(to_refusal(&error))),
                 }
             }
-            self.command_complete("INSERT 0 0")?;
+            let tag = command_tag(analysis, affected);
+            self.command_complete(&tag)?;
             return Ok(Ok(()));
         }
 
