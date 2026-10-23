@@ -5,10 +5,12 @@ use std::sync::Arc;
 use luxbyte_core::directory::MemoryDirectory;
 use luxbyte_core::topology::Endpoint;
 use luxbyte_core::{LocalIntent, ParameterValues, Plan, Refusal, Router};
-use luxbyte_pool::{ConnectionTarget, Credentials, Pool, PoolError, PoolSet, QueryResult};
+use luxbyte_pool::{
+    CancelScope, ConnectionTarget, Credentials, Pool, PoolError, PoolSet, QueryResult,
+};
 use luxbyte_proto::backend::{TransactionStatus, build};
 use luxbyte_proto::frontend::Frontend;
-use luxbyte_proto::startup::{SSL_REQUEST_CODE, StartupRequest};
+use luxbyte_proto::startup::{CancelRequest, SSL_REQUEST_CODE, StartupRequest};
 use luxbyte_proto::{Framed, Peer, ProtocolError};
 use luxbyte_sql::{Access, AnalysisCache, MergeStrategy, StatementAnalysis, TransactionOp};
 use luxbyte_txn::{Coordinator, Transaction};
@@ -18,6 +20,9 @@ use crate::merge::{RegionResult, merge};
 use crate::split::{SplitError, split_insert};
 
 mod extended;
+
+/// How long to spend delivering one cancel to a backend.
+const CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Everything shared between all sessions.
 #[derive(Debug)]
@@ -40,6 +45,8 @@ pub struct Shared {
     pub backend_database: String,
     /// How clients authenticate.
     pub auth: crate::auth::Authenticator,
+    /// The cancel key of every live session.
+    pub cancels: crate::cancel::CancelRegistry,
 }
 
 impl Shared {
@@ -97,6 +104,18 @@ pub struct Session {
     /// passthrough, or the proxy's.
     backend_user: String,
     credentials: Credentials,
+    /// Every backend connection this session is using, for a cancel.
+    cancel: CancelScope,
+    /// The cancel key this session was given, once it has one.
+    key: Option<CancelRequest>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.shared.cancels.forget(key);
+        }
+    }
 }
 
 impl Session {
@@ -112,6 +131,8 @@ impl Session {
             extended: extended::State::default(),
             backend_user: shared.backend_user.clone(),
             credentials: shared.credentials.clone(),
+            cancel: CancelScope::new(),
+            key: None,
             shared,
         };
         if session.startup().await? {
@@ -162,16 +183,26 @@ impl Session {
                 }
                 // The proxy's own key, not a backend's: a cancel request
                 // arrives on a new connection and has to be routed, which
-                // needs a key this proxy issued.
-                self.client.queue_raw(&build::backend_key_data(0, 0)?);
+                // needs a key this proxy issued — and the work it cancels
+                // may be running in several regions at once.
+                let key = self.shared.cancels.register(self.cancel.clone());
+                self.key = Some(key);
+                self.client
+                    .queue_raw(&build::backend_key_data(key.process_id, key.secret_key)?);
                 self.ready().await?;
                 Ok(true)
             }
             // A cancel arrives on its own connection and carries no
-            // credentials. Routing one needs a key registry this proxy does
-            // not keep yet, so it is accepted and dropped rather than
-            // forwarded to a guess.
-            StartupRequest::Cancel(_) => Ok(false),
+            // credentials; the key is the credential. One that matches no
+            // session is dropped, as PostgreSQL drops it, without a reply
+            // that would confirm or deny anything.
+            StartupRequest::Cancel(request) => {
+                if let Some(scope) = self.shared.cancels.lookup(request) {
+                    let delivered = scope.cancel(CANCEL_TIMEOUT).await;
+                    tracing::debug!(delivered, "relayed a cancel");
+                }
+                Ok(false)
+            }
             StartupRequest::GssEnc | StartupRequest::Ssl => {
                 self.fatal("0A000", "GSSAPI encryption is not supported")
                     .await?;
@@ -435,7 +466,9 @@ impl Session {
         match op {
             TransactionOp::Begin => {
                 if self.transaction.is_none() {
-                    self.transaction = Some(self.shared.coordinator.begin());
+                    let mut transaction = self.shared.coordinator.begin();
+                    transaction.cancel_with(&self.cancel);
+                    self.transaction = Some(transaction);
                     self.status = TransactionStatus::InTransaction;
                 }
                 self.command_complete("BEGIN")?;
@@ -530,13 +563,13 @@ impl Session {
             transaction
                 .enlist(region, &pool)
                 .await
-                .map_err(|error| PoolError::Auth(error.to_string()))?;
+                .map_err(backend_error)?;
             return transaction
                 .execute(region, &statement)
                 .await
-                .map_err(|error| PoolError::Auth(error.to_string()));
+                .map_err(backend_error);
         }
-        pool.simple_query(&statement).await
+        pool.simple_query_in(&statement, &self.cancel).await
     }
 
     /// Prefixes the session's settings so a freshly borrowed connection
@@ -569,10 +602,11 @@ impl Session {
             };
             let region = region.clone();
             let statement = statement.clone();
+            let scope = self.cancel.clone();
             // Every region is queried at once: the whole point is to pay
             // the latency of the slowest region, not the sum of them all.
             tasks.spawn(async move {
-                let outcome = pool.simple_query(&statement).await;
+                let outcome = pool.simple_query_in(&statement, &scope).await;
                 (region, outcome)
             });
         }
@@ -647,6 +681,7 @@ impl Session {
 
         // Otherwise the statement is its own transaction.
         let mut transaction = self.shared.coordinator.begin();
+        transaction.cancel_with(&self.cancel);
         let mut affected = 0_usize;
         for part in &per_region {
             let Some(pool) = self.pool_for(&part.region, Access::ReadWrite, 0) else {
@@ -792,6 +827,20 @@ fn to_refusal(error: &PoolError) -> Refusal {
         message: error.to_string(),
         hint: None,
         retryable: error.retryable(),
+    }
+}
+
+/// A transaction's failure as the backend error it usually is, so its
+/// SQLSTATE — a cancel's `57014`, a deadlock's `40P01` — reaches the client
+/// rather than being flattened into a generic connection failure.
+fn backend_error(error: luxbyte_txn::TxnError) -> PoolError {
+    match error {
+        luxbyte_txn::TxnError::Pool(error) => error,
+        other => PoolError::Server {
+            severity: "ERROR".to_owned(),
+            code: "XX000".to_owned(),
+            message: other.to_string(),
+        },
     }
 }
 

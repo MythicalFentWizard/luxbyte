@@ -207,6 +207,10 @@ struct Observed {
     parses: AtomicU64,
     /// The role each accepted connection authenticated as.
     users: Mutex<Vec<String>>,
+    /// Wakes a connection's slow statement when a cancel names its key.
+    cancel_waiters: Mutex<HashMap<(i32, i32), Arc<tokio::sync::Notify>>>,
+    cancels: AtomicU64,
+    next_process: AtomicU64,
     prepared: Mutex<BTreeMap<String, PreparedOutcome>>,
     connections: AtomicU64,
     live: AtomicU64,
@@ -225,6 +229,9 @@ impl Default for Observed {
             abandoned: Mutex::new(Vec::new()),
             parses: AtomicU64::new(0),
             users: Mutex::new(Vec::new()),
+            cancel_waiters: Mutex::new(HashMap::new()),
+            cancels: AtomicU64::new(0),
+            next_process: AtomicU64::new(1_000),
             prepared: Mutex::new(BTreeMap::new()),
             connections: AtomicU64::new(0),
             live: AtomicU64::new(0),
@@ -354,6 +361,12 @@ impl Backend {
         self.observed.abandoned.lock().clone()
     }
 
+    /// How many `CancelRequest`s have arrived.
+    #[must_use]
+    pub fn cancels(&self) -> u64 {
+        self.observed.cancels.load(Ordering::SeqCst)
+    }
+
     /// The role every accepted connection logged in as, in order.
     #[must_use]
     pub fn users(&self) -> Vec<String> {
@@ -426,10 +439,27 @@ async fn session(
 ) -> Result<(), ProtocolError> {
     stream.set_nodelay(true)?;
     let mut framed = Framed::new(stream, Peer::Frontend);
-    if !startup(&mut framed, config, observed).await? {
+    let Some((key, cancelled)) = startup(&mut framed, config, observed).await? else {
         return Ok(());
+    };
+    let outcome = serve(&mut framed, config, observed, &cancelled).await;
+    observed.cancel_waiters.lock().remove(&key);
+    if outcome? {
+        // Vanish mid-statement, with no reply at all.
+        let mut stream = framed.into_inner();
+        let _ = stream.shutdown().await;
     }
+    Ok(())
+}
 
+/// Serves statements until the client goes. Returns `true` when the backend
+/// is meant to vanish mid-statement instead.
+async fn serve(
+    framed: &mut Framed<TcpStream>,
+    config: &BackendConfig,
+    observed: &Observed,
+    cancelled: &tokio::sync::Notify,
+) -> Result<bool, ProtocolError> {
     let mut status = TransactionStatus::Idle;
     let mut extended = Extended::default();
     let mut kill = observed.kill.subscribe();
@@ -440,7 +470,7 @@ async fn session(
             // connection is being abandoned either way.
             _ = kill.recv() => {
                 extended.abandon(observed);
-                return Ok(());
+                return Ok(false);
             }
         };
         let message = match read {
@@ -449,7 +479,7 @@ async fn session(
             // normally retired.
             Err(ProtocolError::Closed(_)) => {
                 extended.abandon(observed);
-                return Ok(());
+                return Ok(false);
             }
             Err(error) => return Err(error),
         };
@@ -457,14 +487,11 @@ async fn session(
         match Frontend::decode(&message)? {
             Frontend::Query { sql } => {
                 observed.statements.lock().push(sql.to_owned());
-                if delay_or_vanish(sql, config).await {
-                    // Vanish mid-statement, with no reply at all.
-                    let mut stream = framed.into_inner();
-                    let _ = stream.shutdown().await;
-                    return Ok(());
-                }
-
-                let replies = answer(sql, config, observed, &mut status)?;
+                let replies = match pace(sql, config, cancelled).await {
+                    Pace::Vanish => return Ok(true),
+                    Pace::Cancelled => vec![canceled(&mut status)?],
+                    Pace::Go => answer(sql, config, observed, &mut status)?,
+                };
                 for reply in replies {
                     framed.queue_raw(&reply);
                 }
@@ -473,7 +500,7 @@ async fn session(
             }
             Frontend::Terminate => {
                 extended.abandon(observed);
-                return Ok(());
+                return Ok(false);
             }
             Frontend::Sync => {
                 extended.sync(status);
@@ -491,18 +518,25 @@ async fn session(
             Frontend::Execute { portal, max_rows } => {
                 let Some(sql) = extended.portals.get(portal).map(|p| p.sql.clone()) else {
                     extended.fail(
-                        &mut framed,
+                        framed,
                         "34000",
                         &format!("portal \"{portal}\" does not exist"),
                     )?;
                     continue;
                 };
-                if delay_or_vanish(&sql, config).await {
-                    observed.statements.lock().push(sql);
-                    extended.abandon(observed);
-                    let mut stream = framed.into_inner();
-                    let _ = stream.shutdown().await;
-                    return Ok(());
+                match pace(&sql, config, cancelled).await {
+                    Pace::Vanish => {
+                        observed.statements.lock().push(sql);
+                        extended.abandon(observed);
+                        return Ok(true);
+                    }
+                    Pace::Cancelled => {
+                        observed.statements.lock().push(sql);
+                        extended.skipping = true;
+                        framed.queue_raw(&canceled(&mut status)?);
+                        continue;
+                    }
+                    Pace::Go => {}
                 }
                 for reply in extended.execute(portal, max_rows, config, observed, &mut status)? {
                     framed.queue_raw(&reply);
@@ -527,12 +561,48 @@ async fn session(
     }
 }
 
-/// Runs the startup phase. Returns whether the client went on to a session.
+/// What to do with a statement once any configured delay is over.
+enum Pace {
+    Go,
+    Vanish,
+    Cancelled,
+}
+
+/// Applies the configured delay, during which a cancel can interrupt it, then
+/// says whether this statement is the one to hang up on.
+async fn pace(sql: &str, config: &BackendConfig, cancelled: &tokio::sync::Notify) -> Pace {
+    if let Some(delay) = config.delay {
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            () = cancelled.notified() => return Pace::Cancelled,
+        }
+    }
+    if config
+        .disconnect_on
+        .as_ref()
+        .is_some_and(|pattern| sql.contains(pattern))
+    {
+        Pace::Vanish
+    } else {
+        Pace::Go
+    }
+}
+
+/// The error PostgreSQL reports for a cancelled statement.
+fn canceled(status: &mut TransactionStatus) -> Result<Bytes, ProtocolError> {
+    if *status == TransactionStatus::InTransaction {
+        *status = TransactionStatus::Failed;
+    }
+    build::ErrorBuilder::error("57014", "canceling statement due to user request").build()
+}
+
+/// Runs the startup phase. Returns the connection's cancel key and what a
+/// cancel wakes, when the client went on to a session.
 async fn startup(
     framed: &mut Framed<TcpStream>,
     config: &BackendConfig,
     observed: &Observed,
-) -> Result<bool, ProtocolError> {
+) -> Result<Option<((i32, i32), Arc<tokio::sync::Notify>)>, ProtocolError> {
     // The startup phase, including a possible TLS request first.
     let mut startup = framed.read_untagged().await?;
     if is_ssl_request(&startup) {
@@ -542,8 +612,19 @@ async fn startup(
         framed.flush().await?;
         startup = framed.read_untagged().await?;
     }
-    let StartupRequest::Startup(parameters) = StartupRequest::decode(&startup)? else {
-        return Ok(false);
+    let parameters = match StartupRequest::decode(&startup)? {
+        StartupRequest::Startup(parameters) => parameters,
+        // A cancel names a connection by the key it was given, and wakes
+        // whatever slow statement that connection is running.
+        StartupRequest::Cancel(request) => {
+            observed.cancels.fetch_add(1, Ordering::SeqCst);
+            let key = (request.process_id, request.secret_key);
+            if let Some(waiter) = observed.cancel_waiters.lock().get(&key) {
+                waiter.notify_waiters();
+            }
+            return Ok(None);
+        }
+        _ => return Ok(None),
     };
 
     if config.refuse_auth {
@@ -551,7 +632,7 @@ async fn startup(
             build::ErrorBuilder::fatal("28P01", "password authentication failed").build()?;
         framed.queue_raw(&error);
         framed.flush().await?;
-        return Ok(false);
+        return Ok(None);
     }
 
     let user = parameters.get("user").unwrap_or("").to_owned();
@@ -573,7 +654,7 @@ async fn startup(
             .build()?;
             framed.queue_raw(&error);
             framed.flush().await?;
-            return Ok(false);
+            return Ok(None);
         }
     }
     observed.users.lock().push(user);
@@ -594,10 +675,20 @@ async fn startup(
     ] {
         framed.queue_raw(&build::parameter_status(name, value)?);
     }
-    framed.queue_raw(&build::backend_key_data(4_242, 2_424)?);
+    // A key of its own per connection, as PostgreSQL gives, so a cancel
+    // reaches exactly one of them.
+    let process = observed.next_process.fetch_add(1, Ordering::SeqCst);
+    let process_id = i32::try_from(process).unwrap_or(i32::MAX);
+    let key = (process_id, process_id ^ 0x5a5a_5a5a);
+    let waiter = Arc::new(tokio::sync::Notify::new());
+    observed
+        .cancel_waiters
+        .lock()
+        .insert(key, Arc::clone(&waiter));
+    framed.queue_raw(&build::backend_key_data(key.0, key.1)?);
     framed.queue_raw(&build::ready_for_query(TransactionStatus::Idle)?);
     framed.flush().await?;
-    Ok(true)
+    Ok(Some((key, waiter)))
 }
 
 /// Runs the server side of a SCRAM-SHA-256 exchange. Returns whether the
@@ -634,18 +725,6 @@ async fn scram(
         }
         Err(_) => Ok(false),
     }
-}
-
-/// Applies the configured delay, then says whether this statement is the
-/// one to hang up on.
-async fn delay_or_vanish(sql: &str, config: &BackendConfig) -> bool {
-    if let Some(delay) = config.delay {
-        tokio::time::sleep(delay).await;
-    }
-    config
-        .disconnect_on
-        .as_ref()
-        .is_some_and(|pattern| sql.contains(pattern))
 }
 
 fn observed_parse(message: &luxbyte_proto::RawMessage, observed: &Observed) {

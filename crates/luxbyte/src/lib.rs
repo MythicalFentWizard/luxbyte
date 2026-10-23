@@ -6,6 +6,7 @@
 //! without a process boundary.
 
 pub mod auth;
+pub mod cancel;
 pub mod config;
 pub mod console;
 pub mod merge;

@@ -8,6 +8,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::cancel::{CancelScope, CancelTarget, Membership};
 use crate::connection::{Connection, ConnectionTarget, Credentials, QueryResult};
 use crate::error::PoolError;
 use crate::pipeline::{Step, StepReply};
@@ -185,6 +186,7 @@ impl Pool {
                 connection: Some(connection),
                 permit: Some(permit),
                 from_pool: true,
+                membership: None,
             });
         }
 
@@ -200,12 +202,25 @@ impl Pool {
             connection: Some(connection),
             permit: Some(permit),
             from_pool: false,
+            membership: None,
         })
     }
 
     /// Borrows a connection and runs one statement on it.
     pub async fn simple_query(&self, sql: &str) -> Result<QueryResult, PoolError> {
         let mut connection = self.acquire().await?;
+        connection.simple_query(sql).await
+    }
+
+    /// Borrows a connection that a cancel on `scope` can reach while it is
+    /// borrowed, and runs one statement on it.
+    pub async fn simple_query_in(
+        &self,
+        sql: &str,
+        scope: &CancelScope,
+    ) -> Result<QueryResult, PoolError> {
+        let mut connection = self.acquire().await?;
+        connection.join(scope);
         connection.simple_query(sql).await
     }
 
@@ -258,9 +273,39 @@ pub struct PooledConnection {
     connection: Option<Connection>,
     permit: Option<OwnedSemaphorePermit>,
     from_pool: bool,
+    membership: Option<Membership>,
 }
 
 impl PooledConnection {
+    /// Makes this connection reachable by a cancel on `scope` until it is
+    /// returned. Joining a second scope leaves the first.
+    pub fn join(&mut self, scope: &CancelScope) {
+        let Some(connection) = self.connection.as_ref() else {
+            return;
+        };
+        let (process_id, secret_key) = connection.backend_key();
+        let target = CancelTarget {
+            host: connection.target().host.clone(),
+            port: connection.target().port,
+            key: luxbyte_proto::startup::CancelRequest {
+                process_id,
+                secret_key,
+            },
+        };
+        if let Some(previous) = self.membership.replace(scope.join(target)) {
+            if previous.leave() {
+                self.poison();
+            }
+        }
+    }
+
+    /// Makes this connection unreachable by cancels from here on.
+    pub fn leave_scope(&mut self) {
+        if self.membership.take().is_some_and(Membership::leave) {
+            self.poison();
+        }
+    }
+
     /// Whether this came from the idle list rather than being opened now.
     #[must_use]
     pub const fn came_from_pool(&self) -> bool {
@@ -310,6 +355,11 @@ impl PooledConnection {
 
 impl Drop for PooledConnection {
     fn drop(&mut self) {
+        // A cancel aimed at this connection may still be on its way; handed
+        // to someone else, it would cancel their query instead.
+        if self.membership.take().is_some_and(Membership::leave) {
+            self.poison();
+        }
         if let Some(connection) = self.connection.take() {
             self.shared.give_back(connection);
         }
