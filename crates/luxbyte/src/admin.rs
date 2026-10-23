@@ -485,6 +485,7 @@ fn snapshot(shared: &Shared) -> Value {
         "regions": rows_as_json(&console(shared, "SHOW REGIONS")),
         "pools": rows_as_json(&console(shared, "SHOW POOLS")),
         "in_doubt": rows_as_json(&console(shared, "SHOW IN DOUBT")),
+        "health": rows_as_json(&console(shared, "SHOW HEALTH")),
         "directory_keys": shared.directory.snapshot().len(),
         "statement_cache": {
             "hits": cache.hits,
@@ -561,7 +562,64 @@ fn gauges(shared: &Shared) -> Vec<Gauge> {
             "Two-phase commits decided but not yet acknowledged everywhere.",
             u64::try_from(console(shared, "SHOW IN DOUBT").rows.len()).unwrap_or(u64::MAX),
         ),
+        single(
+            "luxbyte_reads_kept_off_replicas",
+            "Reads sent to a primary because no replica was up, close enough, and caught up \
+             with the session's writes.",
+            shared.health.kept_off_replicas(),
+        ),
+        single(
+            "luxbyte_read_failovers",
+            "Reads that went to a primary after their replica could not be reached.",
+            shared.health.failovers(),
+        ),
+        health_gauge(
+            shared,
+            "luxbyte_endpoint_up",
+            "Whether each backend is up (1) or not (0).",
+            |status, _| Some(u64::from(status.state == crate::health::State::Up)),
+        ),
+        health_gauge(
+            shared,
+            "luxbyte_replica_lag_bytes",
+            "How far each replica is behind its primary, in bytes of WAL.",
+            |status, lag| lag.filter(|_| status.replica),
+        ),
     ]
+}
+
+/// A gauge with one value per backend.
+fn health_gauge(
+    shared: &Shared,
+    name: &'static str,
+    help: &'static str,
+    value: fn(&crate::health::Status, Option<u64>) -> Option<u64>,
+) -> Gauge {
+    let topology = shared.router.topology();
+    let values = shared
+        .health
+        .snapshot()
+        .iter()
+        .filter_map(|status| {
+            let lag = topology.region(&status.region).and_then(|region| {
+                let replica = region
+                    .replicas
+                    .iter()
+                    .find(|replica| crate::health::key(replica) == status.endpoint)?;
+                shared.health.lag(region, replica)
+            });
+            let labels = vec![
+                ("endpoint", status.endpoint.clone()),
+                ("region", status.region.clone()),
+                (
+                    "role",
+                    if status.replica { "replica" } else { "primary" }.to_owned(),
+                ),
+            ];
+            value(status, lag).map(|value| (labels, value))
+        })
+        .collect();
+    Gauge { name, help, values }
 }
 
 fn key_page(shared: &Shared, table: &str, key: &str) -> Response {

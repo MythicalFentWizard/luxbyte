@@ -378,7 +378,13 @@ async fn rows_returned_by_a_write_across_regions_reach_the_client() {
             },
         )
     };
-    let f = fixture_with(returning("alice"), returning("bob"), returning("carol"), &placed()).await;
+    let f = fixture_with(
+        returning("alice"),
+        returning("bob"),
+        returning("carol"),
+        &placed(),
+    )
+    .await;
     let mut client = client(&f.proxy).await;
     let result = client
         .simple_query("UPDATE users SET name = 'x' RETURNING tenant_id")

@@ -10,6 +10,7 @@ pub mod auth;
 pub mod cancel;
 pub mod config;
 pub mod console;
+pub mod health;
 pub mod merge;
 pub mod metrics;
 pub mod relocate;

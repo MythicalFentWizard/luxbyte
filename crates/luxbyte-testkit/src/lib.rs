@@ -322,6 +322,14 @@ struct Observed {
     connections: AtomicU64,
     live: AtomicU64,
     stopped: AtomicBool,
+    /// What a health probe is told: whether this server is a replica, and
+    /// its WAL position.
+    in_recovery: AtomicBool,
+    position: AtomicU64,
+    /// Health probes answered, and the connections they came on, which are
+    /// kept out of every other count and log.
+    probes: AtomicU64,
+    probe_connections: AtomicU64,
     /// Broadcast to every live session to make it hang up at once, which is
     /// how a server restart looks to a pool holding idle connections.
     kill: broadcast::Sender<()>,
@@ -344,6 +352,10 @@ impl Default for Observed {
             connections: AtomicU64::new(0),
             live: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
+            in_recovery: AtomicBool::new(false),
+            position: AtomicU64::new(0),
+            probes: AtomicU64::new(0),
+            probe_connections: AtomicU64::new(0),
             kill,
         }
     }
@@ -535,6 +547,23 @@ impl Backend {
         self.observed.stopped.store(true, Ordering::SeqCst);
     }
 
+    /// Says to health probes that this server is a replica, or a primary.
+    pub fn set_in_recovery(&self, replica: bool) {
+        self.observed.in_recovery.store(replica, Ordering::SeqCst);
+    }
+
+    /// Sets the WAL position health probes are told: a primary's write
+    /// position, a replica's replay position.
+    pub fn set_position(&self, position: u64) {
+        self.observed.position.store(position, Ordering::SeqCst);
+    }
+
+    /// How many health probes this backend has answered.
+    #[must_use]
+    pub fn probes(&self) -> u64 {
+        self.observed.probes.load(Ordering::SeqCst)
+    }
+
     /// Hangs up on every open connection, without warning.
     ///
     /// What a pool sees when the server restarts, or when a firewall drops
@@ -620,6 +649,9 @@ async fn serve(
         };
 
         match Frontend::decode(&message)? {
+            Frontend::Query { sql } if sql.contains(PROBE_MARK) => {
+                answer_probe(framed, observed, status).await?;
+            }
             Frontend::Query { sql } => {
                 observed.statements.lock().push(sql.to_owned());
                 let replies = match pace(sql, config, cancelled).await {
@@ -766,6 +798,17 @@ async fn startup(
         return Ok(None);
     }
 
+    // A health probe's connection is not traffic: kept out of the counts
+    // and logs tests assert on, as an operator would filter it out of
+    // `pg_stat_activity`.
+    let probe = parameters.get("application_name") == Some(PROBE_APPLICATION);
+    if probe {
+        observed.connections.fetch_sub(1, Ordering::SeqCst);
+        if framed.get_ref().is_encrypted() {
+            observed.tls_connections.fetch_sub(1, Ordering::SeqCst);
+        }
+        observed.probe_connections.fetch_add(1, Ordering::SeqCst);
+    }
     let user = parameters.get("user").unwrap_or("").to_owned();
     if !config.scram_users.is_empty() {
         let verifier = config
@@ -788,7 +831,9 @@ async fn startup(
             return Ok(None);
         }
     }
-    observed.users.lock().push(user);
+    if !probe {
+        observed.users.lock().push(user);
+    }
 
     // Otherwise trust authentication: enough to exercise the pool's
     // handshake without making every test carry a password.
@@ -1086,6 +1131,32 @@ fn describe_rows(sql: &str, config: &BackendConfig) -> Result<Bytes, ProtocolErr
         _ => build::no_data(),
     }
 }
+
+/// Answers a health probe from what the test set: in recovery or not, and
+/// the WAL position.
+async fn answer_probe(
+    framed: &mut Framed<Stream>,
+    observed: &Observed,
+    status: TransactionStatus,
+) -> Result<(), ProtocolError> {
+    observed.probes.fetch_add(1, Ordering::SeqCst);
+    let replica = observed.in_recovery.load(Ordering::SeqCst);
+    let position = observed.position.load(Ordering::SeqCst).to_string();
+    framed.queue_raw(&build::row_description(&["in_recovery", "position"], 25)?);
+    framed.queue_raw(&build::data_row(&[
+        Some(if replica { "t" } else { "f" }),
+        Some(position.as_str()),
+    ])?);
+    framed.queue_raw(&build::command_complete("SELECT 1")?);
+    framed.queue_raw(&build::ready_for_query(status)?);
+    framed.flush().await
+}
+
+/// The `application_name` the proxy's health probes connect with.
+const PROBE_APPLICATION: &str = "luxbyte health";
+
+/// What only a health probe's query contains.
+const PROBE_MARK: &str = "pg_is_in_recovery()";
 
 /// How the proxy's parameter-rendering query begins.
 const RENDER_PREFIX: &str = "SELECT $1::text, pg_catalog.pg_typeof($1)::text";

@@ -506,6 +506,11 @@ impl Session {
         let parameters = ParameterValues::from_prepared(prepared, &values);
         let (plan, write) = self.route(analysis, &parameters).await;
         self.extended.writes.extend(write);
+        if let (Plan::Single { region, access }, true) = (&plan, self.transaction.is_some()) {
+            if access.needs_primary() {
+                self.txn_wrote.lock().insert(region.clone());
+            }
+        }
         let (region, access) = match plan {
             Plan::Single { region, access } => (region, access),
             // SHOW is answered by a backend like any read.
@@ -676,13 +681,6 @@ impl Session {
         statement: &Statement,
         region: &str,
     ) -> Result<(), SessionError> {
-        self.reads = self.reads.wrapping_add(1);
-        let Some(pool) = self.pool_for(region, Access::ReadOnly, self.reads) else {
-            return self.refuse(
-                sequence,
-                &plain("08000", format!("region {region} is not configured")),
-            );
-        };
         let steps = [
             Step::new(
                 StepKind::Parse,
@@ -694,11 +692,8 @@ impl Session {
             ),
             Step::new(StepKind::Sync, frontend::sync()?),
         ];
-        let replies = match pool.acquire().await {
-            Ok(mut connection) => {
-                connection.join(&self.cancel);
-                connection.pipeline(&steps).await
-            }
+        let replies = match self.borrow(region, Access::ReadOnly).await {
+            Ok(mut connection) => connection.pipeline(&steps).await,
             Err(error) => Err(error),
         };
         let replies = match replies {
@@ -961,6 +956,14 @@ impl Session {
 
         let failed = self.extended.batch_failed;
         let lanes = std::mem::take(&mut self.extended.lanes);
+        // Outside a transaction a lane's writes commit at its `Sync`.
+        let committing: Vec<String> = lanes
+            .iter()
+            .filter_map(|lane| match &lane.id {
+                LaneId::Implicit { region, .. } if lane.writes => Some(region.clone()),
+                _ => None,
+            })
+            .collect();
         for mut lane in lanes {
             let participant = matches!(lane.id, LaneId::Participant(_));
             if lane.backlog != Backlog::Clean {
@@ -1011,6 +1014,9 @@ impl Session {
             // to the pool if it is clean and retires it if not.
         }
 
+        if !self.extended.batch_failed {
+            self.wrote_in(committing.iter().map(String::as_str));
+        }
         if self.extended.implicit {
             self.end_implicit().await?;
         }
@@ -1111,14 +1117,10 @@ impl Session {
             return Ok(Ok(statement.sql().to_owned()));
         }
         let home = self.shared.router.topology().home_region.clone();
-        let Some(pool) = self.pool_for(&home, Access::ReadOnly, 0) else {
-            return Ok(Err(unconfigured(&home)));
-        };
-        let mut connection = match pool.acquire().await {
+        let mut connection = match self.borrow(&home, Access::ReadOnly).await {
             Ok(connection) => connection,
             Err(error) => return Ok(Err(to_refusal(&error))),
         };
-        connection.join(&self.cancel);
 
         let types = match self
             .parameter_types(&mut connection, statement, count)
@@ -1255,9 +1257,6 @@ impl Session {
         spread: &Spread,
     ) -> Result<(), SessionError> {
         let home = self.shared.router.topology().home_region.clone();
-        let Some(pool) = self.pool_for(&home, Access::ReadOnly, 0) else {
-            return self.refuse(sequence, &unconfigured(&home));
-        };
         let steps = [
             Step::new(StepKind::Parse, frontend::parse("", &spread.sql, &[])?),
             Step::new(
@@ -1270,11 +1269,8 @@ impl Session {
             ),
             Step::new(StepKind::Sync, frontend::sync()?),
         ];
-        let replies = match pool.acquire().await {
-            Ok(mut connection) => {
-                connection.join(&self.cancel);
-                connection.pipeline(&steps).await
-            }
+        let replies = match self.borrow(&home, Access::ReadOnly).await {
+            Ok(mut connection) => connection.pipeline(&steps).await,
             Err(error) => Err(error),
         };
         let replies = match replies {
@@ -1328,6 +1324,9 @@ impl Session {
             let Some(analysis) = analysis else {
                 return self.refuse(sequence, &plain("XX000", "the portal lost its statement"));
             };
+            if spread.write {
+                self.txn_wrote.lock().extend(spread.regions.iter().cloned());
+            }
             let started = std::time::Instant::now();
             let outcome = if spread.write {
                 self.distributed_result(&analysis, &spread.sql, &spread.regions)
@@ -1449,20 +1448,14 @@ impl Session {
             luxbyte_sql::combine::ordered_source(&columns)
         );
         let home = self.shared.router.topology().home_region.clone();
-        let Some(pool) = self.pool_for(&home, Access::ReadOnly, 0) else {
-            return Ok(Err(unconfigured(&home)));
-        };
         let steps = [
             Step::new(StepKind::Parse, frontend::parse("", &sql, &[])?),
             Step::new(StepKind::Bind, frontend::bind("", "", &[], &[], formats)?),
             Step::new(StepKind::Execute, frontend::execute("", 0)?),
             Step::new(StepKind::Sync, frontend::sync()?),
         ];
-        let replies = match pool.acquire().await {
-            Ok(mut connection) => {
-                connection.join(&self.cancel);
-                connection.pipeline(&steps).await
-            }
+        let replies = match self.borrow(&home, Access::ReadOnly).await {
+            Ok(mut connection) => connection.pipeline(&steps).await,
             Err(error) => Err(error),
         };
         let replies = match replies {
@@ -1562,15 +1555,10 @@ impl Session {
             }));
         }
 
-        self.reads = self.reads.wrapping_add(1);
-        let Some(pool) = self.pool_for(region, access, self.reads) else {
-            return Ok(Err(unconfigured(region)));
-        };
-        let mut connection = match pool.acquire().await {
+        let connection = match self.borrow(region, access).await {
             Ok(connection) => connection,
             Err(error) => return Ok(Err(to_refusal(&error))),
         };
-        connection.join(&self.cancel);
         let mut lane = Lane::new(id.clone(), Some(connection));
         lane.writes = primary;
         self.extended.lanes.push(lane);

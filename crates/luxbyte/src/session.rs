@@ -58,21 +58,33 @@ pub struct Shared {
     pub aggregates: parking_lot::Mutex<Option<(std::time::Instant, Arc<Aggregates>)>>,
     /// Keys moving between regions, and the writes a move waits for.
     pub moves: crate::relocate::Moves,
+    /// Which backends are up, and how far replicas lag.
+    pub health: crate::health::Health,
 }
 
 impl Shared {
     /// The pool for a region, as the proxy's own backend role, choosing a
     /// replica for reads where one exists.
     pub fn pool_for(&self, region: &str, access: Access, nth: usize) -> Option<Pool> {
-        self.pool_as(region, access, nth, &self.backend_user, &self.credentials)
+        self.pool_as(
+            region,
+            access,
+            nth,
+            None,
+            &self.backend_user,
+            &self.credentials,
+        )
     }
 
-    /// The pool for a region, as a given role.
+    /// The pool for a region, as a given role. A read goes to a replica
+    /// that is up, not too far behind, and — after `wrote` — has replayed
+    /// the session's last write there; otherwise to the primary.
     pub fn pool_as(
         &self,
         region: &str,
         access: Access,
         nth: usize,
+        wrote: Option<&mut crate::health::Wrote>,
         user: &str,
         credentials: &Credentials,
     ) -> Option<Pool> {
@@ -80,11 +92,42 @@ impl Shared {
         let endpoint: &Endpoint = if access.needs_primary() {
             &region.primary
         } else {
-            region.read_endpoint(nth)
+            self.health.read_endpoint(region, nth, wrote)
         };
         let target = ConnectionTarget::new(endpoint, &self.backend_database, user);
         Some(self.pools.pool(&target, credentials))
     }
+
+    /// Borrows a connection from `pool`. A read whose replica cannot be
+    /// reached goes to `primary` instead, which has the same rows; nothing
+    /// was sent, so nothing can have run twice. An endpoint that could not
+    /// be reached is marked down either way.
+    pub async fn acquire(
+        &self,
+        pool: &Pool,
+        primary: Option<&Pool>,
+    ) -> Result<luxbyte_pool::PooledConnection, PoolError> {
+        let error = match pool.acquire().await {
+            Ok(connection) => return Ok(connection),
+            Err(error) => error,
+        };
+        if error.connection_lost() || matches!(error, PoolError::Protocol(_)) {
+            self.health.failed(&endpoint_key(pool.target()), &error);
+        }
+        match primary.filter(|primary| primary.target() != pool.target()) {
+            Some(primary) => {
+                self.health.failed_over();
+                tracing::debug!(%error, "a replica could not be reached; reading from the primary");
+                primary.acquire().await
+            }
+            None => Err(error),
+        }
+    }
+}
+
+/// The health key of the endpoint a pool connects to.
+fn endpoint_key(target: &ConnectionTarget) -> String {
+    format!("{}:{}", target.host, target.port)
 }
 
 /// What ended a session.
@@ -121,6 +164,12 @@ pub struct Session {
     key: Option<CancelRequest>,
     /// The role the client logged in as.
     user: String,
+    /// When this session last wrote in each region, so that its reads there
+    /// see what it wrote.
+    wrote: parking_lot::Mutex<std::collections::BTreeMap<String, crate::health::Wrote>>,
+    /// Regions the open transaction has written in, which count as written
+    /// once it commits.
+    txn_wrote: parking_lot::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl Drop for Session {
@@ -152,6 +201,8 @@ impl Session {
             cancel: CancelScope::new(),
             key: None,
             user: String::new(),
+            wrote: parking_lot::Mutex::default(),
+            txn_wrote: parking_lot::Mutex::default(),
             shared,
         };
         if session.startup(&first).await? {
@@ -309,6 +360,10 @@ impl Session {
     ) -> Result<luxbyte_txn::CommitOutcome, luxbyte_txn::TxnError> {
         use luxbyte_txn::CommitOutcome;
         let outcome = transaction.commit().await;
+        let written = std::mem::take(&mut *self.txn_wrote.lock());
+        if outcome.is_ok() {
+            self.wrote_in(written.iter().map(String::as_str));
+        }
         self.shared.metrics.transaction(match &outcome {
             Ok(CommitOutcome::SinglePhase { .. }) => "committed_one_phase",
             Ok(CommitOutcome::Committed { .. }) => "committed_two_phase",
@@ -324,13 +379,41 @@ impl Session {
     /// Rolls back, counting it.
     async fn rollback(&self, transaction: Transaction) {
         let _ = transaction.rollback().await;
+        self.txn_wrote.lock().clear();
         self.shared.metrics.transaction("rolled_back");
     }
 
     /// The pool for a region, as this session's backend role.
     fn pool_for(&self, region: &str, access: Access, nth: usize) -> Option<Pool> {
-        self.shared
-            .pool_as(region, access, nth, &self.backend_user, &self.credentials)
+        let mut wrote = self.wrote.lock();
+        self.shared.pool_as(
+            region,
+            access,
+            nth,
+            wrote.get_mut(region),
+            &self.backend_user,
+            &self.credentials,
+        )
+    }
+
+    /// Records writes that have just succeeded: committed already outside a
+    /// transaction, or once the open one commits.
+    fn note_writes<'a>(&self, regions: impl IntoIterator<Item = &'a str>) {
+        if self.transaction.is_some() {
+            self.txn_wrote
+                .lock()
+                .extend(regions.into_iter().map(ToOwned::to_owned));
+        } else {
+            self.wrote_in(regions);
+        }
+    }
+
+    /// Records that this session's writes in `regions` have committed.
+    fn wrote_in<'a>(&self, regions: impl IntoIterator<Item = &'a str>) {
+        let mut wrote = self.wrote.lock();
+        for region in regions {
+            wrote.insert(region.to_owned(), crate::health::Wrote::now());
+        }
     }
 
     async fn serve(&mut self) -> Result<(), SessionError> {
@@ -452,8 +535,16 @@ impl Session {
             let started = std::time::Instant::now();
             let (plan, _write) = self.route(analysis, &parameters).await;
             let kind = plan_kind(&plan);
+            let writes: Vec<String> = if analysis.access.needs_primary() {
+                plan.regions().into_iter().map(ToOwned::to_owned).collect()
+            } else {
+                Vec::new()
+            };
             let outcome = self.execute(analysis, text, plan).await?;
             self.shared.metrics.statement(kind, started.elapsed());
+            if outcome.is_ok() {
+                self.note_writes(writes.iter().map(String::as_str));
+            }
             if let Err(refusal) = outcome {
                 self.error(&refusal)?;
                 failed = true;
@@ -772,7 +863,36 @@ impl Session {
                 .await
                 .map_err(backend_error);
         }
-        pool.simple_query_in(&statement, &self.cancel).await
+        let primary = if access.needs_primary() {
+            None
+        } else {
+            self.pool_for(region, Access::ReadWrite, 0)
+        };
+        let mut connection = self.shared.acquire(&pool, primary.as_ref()).await?;
+        connection.join(&self.cancel);
+        connection.simple_query(&statement).await
+    }
+
+    /// Borrows a connection for `region`, outside any transaction: for a
+    /// read, from a replica that qualifies, or the primary if that replica
+    /// cannot be reached.
+    async fn borrow(
+        &mut self,
+        region: &str,
+        access: Access,
+    ) -> Result<luxbyte_pool::PooledConnection, PoolError> {
+        self.reads = self.reads.wrapping_add(1);
+        let pool = self
+            .pool_for(region, access, self.reads)
+            .ok_or_else(|| PoolError::Auth(format!("region {region} is not configured")))?;
+        let primary = if access.needs_primary() {
+            None
+        } else {
+            self.pool_for(region, Access::ReadWrite, 0)
+        };
+        let mut connection = self.shared.acquire(&pool, primary.as_ref()).await?;
+        connection.join(&self.cancel);
+        Ok(connection)
     }
 
     /// Prefixes the session's settings so a freshly borrowed connection
@@ -882,15 +1002,23 @@ impl Session {
                     retryable: false,
                 }));
             };
+            let primary = self.pool_for(region, Access::ReadWrite, 0);
             let remote = *region != self.shared.router.topology().home_region;
             self.shared.metrics.sent(region, remote);
             let region = region.clone();
             let statement = statement.clone();
             let scope = self.cancel.clone();
+            let shared = Arc::clone(&self.shared);
             // Every region is queried at once: the whole point is to pay
             // the latency of the slowest region, not the sum of them all.
             tasks.spawn(async move {
-                let outcome = pool.simple_query_in(&statement, &scope).await;
+                let outcome = match shared.acquire(&pool, primary.as_ref()).await {
+                    Ok(mut connection) => {
+                        connection.join(&scope);
+                        connection.simple_query(&statement).await
+                    }
+                    Err(error) => Err(error),
+                };
                 (region, outcome)
             });
         }
@@ -1015,7 +1143,7 @@ impl Session {
     ///
     /// The read is part of the client's statement, so the client's cancel
     /// reaches it, and a cancelled read cancels the statement.
-    async fn aggregate_names(&self) -> Result<Arc<Aggregates>, PoolError> {
+    async fn aggregate_names(&mut self) -> Result<Arc<Aggregates>, PoolError> {
         const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(60);
         if let Some((at, names)) = self.shared.aggregates.lock().as_ref() {
             if at.elapsed() < FRESH_FOR {
@@ -1023,16 +1151,15 @@ impl Session {
             }
         }
         let home = self.shared.router.topology().home_region.clone();
-        let read = match self.shared.pool_for(&home, Access::ReadOnly, 0) {
-            Some(pool) => {
-                pool.simple_query_in(
-                    "SELECT DISTINCT proname::text FROM pg_catalog.pg_proc WHERE prokind = 'a'",
-                    &self.cancel,
-                )
-                .await
-            }
-            None => return Ok(Arc::new(Aggregates::default())),
-        };
+        let read =
+            match self.borrow(&home, Access::ReadOnly).await {
+                Ok(mut connection) => connection
+                    .simple_query(
+                        "SELECT DISTINCT proname::text FROM pg_catalog.pg_proc WHERE prokind = 'a'",
+                    )
+                    .await,
+                Err(error) => Err(error),
+            };
         match read {
             Err(error) if error.sqlstate() == Some("57014") => Err(error),
             Ok(result) => {

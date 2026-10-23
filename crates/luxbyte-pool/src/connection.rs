@@ -164,6 +164,20 @@ impl Connection {
         connect_timeout: Duration,
         tls: &BackendTls,
     ) -> Result<Self, PoolError> {
+        Self::connect_named(target, credentials, connect_timeout, tls, "luxbyte").await
+    }
+
+    /// Like [`Connection::connect_with`], naming the connection's
+    /// `application_name`, so that an operator looking at
+    /// `pg_stat_activity` can tell what each of the proxy's connections is
+    /// for.
+    pub async fn connect_named(
+        target: &ConnectionTarget,
+        credentials: &Credentials,
+        connect_timeout: Duration,
+        tls: &BackendTls,
+        application_name: &str,
+    ) -> Result<Self, PoolError> {
         let address = format!("{}:{}", target.host, target.port);
         let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(&address))
             .await
@@ -197,16 +211,20 @@ impl Connection {
             needs_reset: false,
             awaiting_sync: false,
         };
-        connection.handshake(credentials).await?;
+        connection.handshake(credentials, application_name).await?;
         Ok(connection)
     }
 
-    async fn handshake(&mut self, credentials: &Credentials) -> Result<(), PoolError> {
+    async fn handshake(
+        &mut self,
+        credentials: &Credentials,
+        application_name: &str,
+    ) -> Result<(), PoolError> {
         let mut parameters = StartupParameters::new();
         parameters
             .set("user", &self.target.user)
             .set("database", &self.target.database)
-            .set("application_name", "luxbyte");
+            .set("application_name", application_name);
         self.framed.queue_raw(&parameters.encode()?);
         self.framed.flush().await?;
 

@@ -53,6 +53,7 @@ pub fn handle(shared: &Shared, sql: &str) -> Option<QueryResult> {
         "SHOW POOLS" => Some(show_pools(shared)),
         "SHOW DIRECTORY" => Some(show_directory(shared)),
         "SHOW IN DOUBT" => Some(show_in_doubt(shared)),
+        "SHOW HEALTH" => Some(show_health(shared)),
         _ => {
             // `WHERE IS <table> <key>` takes arguments, so it cannot be
             // matched as a whole string.
@@ -177,6 +178,59 @@ pub(crate) fn describe(state: &KeyState) -> (String, String) {
             },
         ),
     }
+}
+
+fn show_health(shared: &Shared) -> QueryResult {
+    let topology = shared.router.topology();
+    let rows = shared
+        .health
+        .snapshot()
+        .into_iter()
+        .map(|status| {
+            let lag = topology
+                .region(&status.region)
+                .zip(status.replica.then_some(()))
+                .and_then(|(region, ())| {
+                    let endpoint = region
+                        .replicas
+                        .iter()
+                        .find(|replica| crate::health::key(replica) == status.endpoint)?;
+                    shared.health.lag(region, endpoint)
+                })
+                .map(|lag| lag.to_string())
+                .unwrap_or_default();
+            let role = match (status.replica, status.role_matches()) {
+                (true, true) => "replica",
+                (false, true) => "primary",
+                (true, false) => "replica, but not in recovery",
+                (false, false) => "primary, but in recovery",
+            };
+            vec![
+                status.region.clone(),
+                status.endpoint.clone(),
+                role.to_owned(),
+                status.state.name().to_owned(),
+                lag,
+                status
+                    .probe_time
+                    .map(|took| format!("{:.1}", took.as_secs_f64() * 1000.0))
+                    .unwrap_or_default(),
+                status.last_error.unwrap_or_default(),
+            ]
+        })
+        .collect();
+    table(
+        &[
+            "region",
+            "endpoint",
+            "role",
+            "state",
+            "lag_bytes",
+            "probe_ms",
+            "last_error",
+        ],
+        rows,
+    )
 }
 
 fn show_in_doubt(shared: &Shared) -> QueryResult {

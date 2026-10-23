@@ -25,6 +25,13 @@ tls = "prefer"
 # key_file = "/etc/luxbyte/server.key"
 # required = true
 
+# Probing backends. A replica further behind than this serves no reads, and
+# a session's reads wait for a replica that has replayed its writes.
+[health]
+interval_ms = 2000
+timeout_ms = 2000
+max_replica_lag_bytes = 16777216
+
 [pool]
 max_size = 16
 # Connections are shared between clients, so one that ran a SET, LISTEN or
