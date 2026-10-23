@@ -214,6 +214,25 @@ fn table_factor(factor: &TableFactor, out: &mut Vec<TableRef>) {
     }
 }
 
+/// The tables each branch of a set operation reads, one list per branch.
+/// Empty for anything that is not a set operation.
+///
+/// A `UNION` reads its branches independently, so two tables in different
+/// branches are not a join, and each region can answer its part.
+fn branches_of(body: &SetExpr, out: &mut Vec<Vec<TableRef>>) {
+    if let SetExpr::SetOperation { left, right, .. } = body {
+        for side in [left, right] {
+            if matches!(side.as_ref(), SetExpr::SetOperation { .. }) {
+                branches_of(side, out);
+            } else {
+                let mut tables = Vec::new();
+                tables_of_set_expr(side, &mut tables);
+                out.push(tables);
+            }
+        }
+    }
+}
+
 fn tables_of_query(query: &Query, out: &mut Vec<TableRef>) {
     tables_of_set_expr(&query.body, out);
 }
@@ -351,6 +370,7 @@ fn post_processing_of(query: &Query) -> PostProcessing {
         None => {}
     }
 
+    post.set_operation = matches!(query.body.as_ref(), SetExpr::SetOperation { .. });
     if let SetExpr::Select(select) = query.body.as_ref() {
         post.distinct = select.distinct.is_some();
         let grouped = match &select.group_by {
@@ -378,10 +398,12 @@ fn analyze_statement(statement: &Statement, highest_parameter: u16) -> Statement
     let mut constraints = KeyConstraints::unconstrained();
     let mut assigned_columns = Vec::new();
     let mut post_processing = PostProcessing::default();
+    let mut branches = Vec::new();
 
     let (kind, access) = match statement {
         Statement::Query(query) => {
             tables_of_query(query, &mut tables);
+            branches_of(&query.body, &mut branches);
             if let Some(selection) = selection_of_query(query) {
                 constraints = constraints_of(selection);
             }
@@ -491,6 +513,7 @@ fn analyze_statement(statement: &Statement, highest_parameter: u16) -> Statement
         assigned_columns,
         highest_parameter,
         post_processing,
+        branches,
     }
 }
 
@@ -880,17 +903,17 @@ mod tests {
         assert!(analysis.post_processing.is_trivial());
         assert_eq!(
             analysis.post_processing.merge_strategy(),
-            Ok(crate::MergeStrategy::Concatenate)
+            crate::MergeStrategy::Concatenate
         );
     }
 
     #[test]
-    fn an_aggregate_in_the_projection_blocks_a_merge() {
+    fn an_aggregate_in_the_projection_needs_combining() {
         let analysis = one("SELECT count(*) FROM users");
         assert!(analysis.post_processing.aggregates);
         assert_eq!(
             analysis.post_processing.merge_strategy(),
-            Err(crate::MergeObstacle::Aggregate)
+            crate::MergeStrategy::Combine
         );
     }
 
@@ -911,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn group_by_and_having_block_a_merge() {
+    fn group_by_and_having_are_aggregation() {
         assert!(
             one("SELECT region FROM users GROUP BY region")
                 .post_processing
@@ -925,12 +948,17 @@ mod tests {
     }
 
     #[test]
-    fn distinct_blocks_a_merge() {
-        let analysis = one("SELECT DISTINCT region FROM users");
-        assert_eq!(
-            analysis.post_processing.merge_strategy(),
-            Err(crate::MergeObstacle::Distinct)
-        );
+    fn distinct_and_set_operations_need_combining() {
+        for sql in [
+            "SELECT DISTINCT region FROM users",
+            "SELECT id FROM users UNION SELECT id FROM orders",
+        ] {
+            assert_eq!(
+                one(sql).post_processing.merge_strategy(),
+                crate::MergeStrategy::Combine,
+                "{sql}"
+            );
+        }
     }
 
     #[test]
@@ -942,12 +970,13 @@ mod tests {
     }
 
     #[test]
-    fn order_by_becomes_a_sorted_merge_with_direction_preserved() {
+    fn order_by_is_recorded_with_direction_preserved() {
         let analysis = one("SELECT id FROM users ORDER BY created_at DESC, id");
-        let Ok(crate::MergeStrategy::SortedMerge(keys)) = analysis.post_processing.merge_strategy()
-        else {
-            panic!("expected a sorted merge");
-        };
+        assert_eq!(
+            analysis.post_processing.merge_strategy(),
+            crate::MergeStrategy::Combine
+        );
+        let keys = &analysis.post_processing.order_by;
         assert_eq!(keys.len(), 2);
         assert_eq!(
             keys.first().map(|k| k.expression.as_str()),
@@ -958,12 +987,22 @@ mod tests {
     }
 
     #[test]
-    fn a_limit_is_recorded_but_still_mergeable() {
+    fn each_branch_of_a_union_has_its_own_tables() {
+        let analysis =
+            one("SELECT id FROM users UNION SELECT u.id FROM users u JOIN orders o ON true");
+        let counts: Vec<usize> = analysis.branches.iter().map(Vec::len).collect();
+        assert_eq!(counts, [1, 2]);
+        assert!(one("SELECT id FROM users").branches.is_empty());
+    }
+
+    #[test]
+    fn a_limit_has_to_be_applied_again_after_merging() {
+        // Each region returns up to ten rows; the answer is ten in all.
         let analysis = one("SELECT id FROM users LIMIT 10");
         assert!(analysis.post_processing.limited);
         assert_eq!(
             analysis.post_processing.merge_strategy(),
-            Ok(crate::MergeStrategy::Concatenate)
+            crate::MergeStrategy::Combine
         );
     }
 

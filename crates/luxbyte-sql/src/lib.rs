@@ -16,6 +16,7 @@
 
 mod analyze;
 pub mod cache;
+pub mod combine;
 pub mod key;
 pub mod merge;
 pub mod shape;
@@ -23,7 +24,7 @@ pub mod statements;
 
 pub use cache::{AnalysisCache, CacheStats, Prepared};
 pub use key::{ColumnRef, KeyConstraints, KeyValue};
-pub use merge::{MergeObstacle, MergeStrategy, PostProcessing, SortKey};
+pub use merge::{MergeStrategy, PostProcessing, SortKey};
 pub use shape::{Literal, Shape, normalize};
 
 /// Parsing failures.
@@ -138,6 +139,11 @@ pub struct StatementAnalysis {
     /// What the statement does to its rows after collecting them, which
     /// decides whether a result can be assembled from several regions.
     pub post_processing: PostProcessing,
+    /// For a set operation, the tables each branch reads; empty otherwise.
+    ///
+    /// Branches are read independently, so tables in different branches are
+    /// not joined — only tables within one branch are.
+    pub branches: Vec<Vec<TableRef>>,
 }
 
 impl StatementAnalysis {

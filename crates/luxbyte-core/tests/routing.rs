@@ -179,30 +179,25 @@ fn an_in_list_within_one_region_is_not_a_scatter() {
 }
 
 #[test]
-fn an_ordered_scatter_becomes_a_sorted_merge() {
+fn an_ordered_scatter_is_combined_rather_than_concatenated() {
+    // Each region's order holds only within that region.
     let Plan::ScatterGather { merge, .. } =
         plan("SELECT * FROM users WHERE name = 'ada' ORDER BY created_at DESC")
     else {
         panic!("expected a scatter-gather plan");
     };
-    let MergeStrategy::SortedMerge(keys) = merge else {
-        panic!("expected a sorted merge");
-    };
-    assert_eq!(keys.len(), 1);
-    assert!(keys.first().is_some_and(|key| key.descending));
+    assert_eq!(merge, MergeStrategy::Combine);
 }
 
 #[test]
-fn an_aggregate_across_regions_is_refused_rather_than_answered_wrongly() {
+fn an_aggregate_across_regions_is_combined_rather_than_concatenated() {
     // Concatenating three partial counts would return three rows, each
-    // wrong. Returning an error is the only honest option short of
-    // implementing per-aggregate combine steps.
-    let Plan::Refuse(refusal) = plan("SELECT count(*) FROM users") else {
-        panic!("expected a refusal");
+    // wrong; the counts are combined into one instead.
+    let Plan::ScatterGather { regions, merge } = plan("SELECT count(*) FROM users") else {
+        panic!("expected a scatter-gather plan");
     };
-    assert_eq!(refusal.sqlstate, "0A000");
-    assert!(refusal.message.contains("aggregat"));
-    assert!(refusal.hint.is_some());
+    assert_eq!(regions.len(), 3);
+    assert_eq!(merge, MergeStrategy::Combine);
 }
 
 #[test]
@@ -214,11 +209,11 @@ fn an_aggregate_within_one_region_is_fine() {
 }
 
 #[test]
-fn distinct_across_regions_is_refused() {
-    let Plan::Refuse(refusal) = plan("SELECT DISTINCT name FROM users") else {
-        panic!("expected a refusal");
+fn distinct_across_regions_is_combined() {
+    let Plan::ScatterGather { merge, .. } = plan("SELECT DISTINCT name FROM users") else {
+        panic!("expected a scatter-gather plan");
     };
-    assert!(refusal.message.contains("DISTINCT"));
+    assert_eq!(merge, MergeStrategy::Combine);
 }
 
 // --------------------------------------------------------------------- writes

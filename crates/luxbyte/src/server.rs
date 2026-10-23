@@ -103,6 +103,7 @@ impl Server {
             backend_database: config.backend.database.clone(),
             auth,
             cancels: crate::cancel::CancelRegistry::new(),
+            aggregates: parking_lot::Mutex::new(None),
         });
 
         let listener = TcpListener::bind(&config.server.listen)

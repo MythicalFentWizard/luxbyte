@@ -12,11 +12,12 @@ use luxbyte_proto::backend::{TransactionStatus, build};
 use luxbyte_proto::frontend::Frontend;
 use luxbyte_proto::startup::{CancelRequest, SSL_REQUEST_CODE, StartupRequest};
 use luxbyte_proto::{Framed, Peer, ProtocolError};
-use luxbyte_sql::{Access, AnalysisCache, MergeStrategy, StatementAnalysis, TransactionOp};
+use luxbyte_sql::combine::{AggregateFinish, Aggregates, Finish, RowsFinish};
+use luxbyte_sql::{Access, AnalysisCache, StatementAnalysis, TransactionOp};
 use luxbyte_txn::{Coordinator, Transaction};
 use tokio::net::TcpStream;
 
-use crate::merge::{RegionResult, merge};
+use crate::merge::{self, RegionResult};
 use crate::split::{SplitError, split_insert};
 
 mod extended;
@@ -47,6 +48,8 @@ pub struct Shared {
     pub auth: crate::auth::Authenticator,
     /// The cancel key of every live session.
     pub cancels: crate::cancel::CancelRegistry,
+    /// The aggregate functions the database lists, and when they were read.
+    pub aggregates: parking_lot::Mutex<Option<(std::time::Instant, Arc<Aggregates>)>>,
 }
 
 impl Shared {
@@ -459,7 +462,7 @@ impl Session {
                 }
                 Err(error) => Ok(Err(to_refusal(&error))),
             },
-            Plan::ScatterGather { regions, merge } => self.scatter(&regions, sql, &merge).await,
+            Plan::ScatterGather { regions, .. } => self.scatter(&regions, sql).await,
             Plan::Distributed { regions } => self.distributed(analysis, sql, &regions).await,
         }
     }
@@ -633,16 +636,87 @@ impl Session {
         &mut self,
         regions: &[String],
         sql: &str,
-        strategy: &MergeStrategy,
     ) -> Result<Result<(), Refusal>, SessionError> {
+        // Always planned, even when the analysis saw nothing to combine: a
+        // function it did not recognise may be an aggregate the database
+        // knows about, and computing that per region returns each region's
+        // answer as if it were the whole.
+        let aggregates = match self.aggregate_names().await {
+            Ok(aggregates) => aggregates,
+            Err(error) => return Ok(Err(to_refusal(&error))),
+        };
+        let plan = match luxbyte_sql::combine::plan(sql, &aggregates) {
+            Ok(plan) => plan,
+            Err(reason) => return Ok(Err(cannot_combine(regions.len(), &reason.0))),
+        };
+        // A plain union of rows needs nothing done afterwards, so it is sent
+        // exactly as the client wrote it.
+        let untouched = matches!(
+            &plan.finish,
+            Finish::Rows(rows) if rows.order.is_empty()
+                && !rows.distinct
+                && rows.hidden == 0
+                && rows.limit.is_none()
+                && rows.offset == 0
+        );
+        let region_sql = if untouched { sql } else { &plan.region_sql };
+
+        let answers = match self.gather(regions, region_sql).await? {
+            Ok(answers) => answers,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        let finished = match &plan.finish {
+            Finish::Rows(finish) => self.finish_rows(answers, finish).await?,
+            Finish::Aggregate(finish) => self.finish_aggregates(&answers, finish).await?,
+        };
+        match finished {
+            Ok(result) => {
+                self.respond(&result)?;
+                Ok(Ok(()))
+            }
+            Err(refusal) => Ok(Err(refusal)),
+        }
+    }
+
+    /// Runs one statement in every region and collects the answers, in
+    /// region order.
+    async fn gather(
+        &mut self,
+        regions: &[String],
+        sql: &str,
+    ) -> Result<Result<Vec<RegionResult>, Refusal>, SessionError> {
+        let mut answers = Vec::with_capacity(regions.len());
+
+        // Inside a transaction the read goes through its participants, so it
+        // sees what the transaction has written; one region at a time, as
+        // each participant is a single connection.
+        if self.transaction.is_some() {
+            for region in regions {
+                match self.run_on(region, Access::ReadOnly, sql).await {
+                    Ok(result) => answers.push(RegionResult {
+                        region: region.clone(),
+                        result,
+                    }),
+                    Err(error) => return Ok(Err(region_failed(region, &error))),
+                }
+            }
+            return Ok(Ok(answers));
+        }
+
         let statement = self.with_settings(sql);
         let mut tasks = tokio::task::JoinSet::new();
-
         for (index, region) in regions.iter().enumerate() {
             let Some(pool) =
                 self.pool_for(region, Access::ReadOnly, self.reads.wrapping_add(index))
             else {
-                continue;
+                // A region left out makes a result that looks whole and is
+                // not, which is worse than no result.
+                return Ok(Err(Refusal {
+                    sqlstate: "08000".to_owned(),
+                    message: format!("region {region} is not configured"),
+                    hint: None,
+                    retryable: false,
+                }));
             };
             let region = region.clone();
             let statement = statement.clone();
@@ -656,32 +730,156 @@ impl Session {
         }
         self.reads = self.reads.wrapping_add(regions.len());
 
-        let mut answers = Vec::new();
         while let Some(joined) = tasks.join_next().await {
             let Ok((region, outcome)) = joined else {
-                continue;
+                return Ok(Err(Refusal {
+                    sqlstate: "XX000".to_owned(),
+                    message: "a region's read was lost".to_owned(),
+                    hint: None,
+                    retryable: true,
+                }));
             };
             match outcome {
                 Ok(result) => answers.push(RegionResult { region, result }),
                 // One region failing makes the result incomplete, and an
                 // incomplete result that looks whole is worse than an error.
-                Err(error) => {
-                    return Ok(Err(Refusal {
-                        sqlstate: error.sqlstate().unwrap_or("08000").to_owned(),
-                        message: format!("{region} did not answer: {error}"),
-                        hint: None,
-                        retryable: error.retryable(),
-                    }));
-                }
+                Err(error) => return Ok(Err(region_failed(&region, &error))),
             }
         }
-
-        // Regions answer in whatever order they finish; the merge has to
-        // see them in a stable order or an equal-keyed row could move.
+        // Regions answer in whatever order they finish; a merge has to see
+        // them in a stable order or an equal-keyed row could move.
         answers.sort_by(|left, right| left.region.cmp(&right.region));
-        let merged = merge(answers, strategy);
-        self.respond(&merged)?;
-        Ok(Ok(()))
+        Ok(Ok(answers))
+    }
+
+    /// Orders, deduplicates and limits rows that came from several regions:
+    /// here when that can be done exactly, otherwise in the home region.
+    async fn finish_rows(
+        &mut self,
+        answers: Vec<RegionResult>,
+        finish: &RowsFinish,
+    ) -> Result<Result<QueryResult, Refusal>, SessionError> {
+        let (columns, type_oids) = merge::columns_of(&answers);
+        let order = match finish.resolve(&columns) {
+            Ok(order) => order,
+            Err(reason) => return Ok(Err(cannot_combine(answers.len(), &reason.0))),
+        };
+        if !finish.distinct {
+            let rows = if order.is_empty() {
+                Some(merge::concatenate(answers.clone()).rows)
+            } else {
+                merge::sorted(&answers, &order)
+            };
+            if let Some(rows) = rows {
+                return Ok(Ok(merge::finish_rows(
+                    columns,
+                    type_oids,
+                    rows,
+                    finish.offset,
+                    finish.limit,
+                    finish.hidden,
+                )));
+            }
+        }
+        let source = match carried(&answers, &type_oids) {
+            Ok(source) => source,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        match finish.query(&columns, &source) {
+            Ok(sql) => self.finish_in_home(&sql).await,
+            Err(reason) => Ok(Err(cannot_combine(answers.len(), &reason.0))),
+        }
+    }
+
+    /// Regroups partial aggregates in the home region.
+    async fn finish_aggregates(
+        &mut self,
+        answers: &[RegionResult],
+        finish: &AggregateFinish,
+    ) -> Result<Result<QueryResult, Refusal>, SessionError> {
+        let (columns, type_oids) = merge::columns_of(answers);
+        if columns.len() != finish.columns {
+            return Ok(Err(Refusal {
+                sqlstate: "XX000".to_owned(),
+                message: format!(
+                    "the regions returned {} partial columns where {} were expected",
+                    columns.len(),
+                    finish.columns
+                ),
+                hint: None,
+                retryable: false,
+            }));
+        }
+        let types: Vec<String> = match type_names(&type_oids) {
+            Ok(types) => types,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        let source = match carried(answers, &type_oids) {
+            Ok(source) => source,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        match finish.query(&types, &source) {
+            Ok(sql) => self.finish_in_home(&sql).await,
+            Err(reason) => Ok(Err(cannot_combine(answers.len(), &reason.0))),
+        }
+    }
+
+    /// Runs a finishing statement in the home region: nearby, and any
+    /// region computes the same answer from the same partial results.
+    async fn finish_in_home(
+        &mut self,
+        sql: &str,
+    ) -> Result<Result<QueryResult, Refusal>, SessionError> {
+        let home = self.shared.router.topology().home_region.clone();
+        Ok(self
+            .run_on(&home, Access::ReadOnly, sql)
+            .await
+            .map_err(|error| to_refusal(&error)))
+    }
+
+    /// The names the database lists as aggregates, read from the home
+    /// region and remembered for a minute.
+    ///
+    /// The read is part of the client's statement, so the client's cancel
+    /// reaches it, and a cancelled read cancels the statement.
+    async fn aggregate_names(&self) -> Result<Arc<Aggregates>, PoolError> {
+        const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+        if let Some((at, names)) = self.shared.aggregates.lock().as_ref() {
+            if at.elapsed() < FRESH_FOR {
+                return Ok(Arc::clone(names));
+            }
+        }
+        let home = self.shared.router.topology().home_region.clone();
+        let read = match self.shared.pool_for(&home, Access::ReadOnly, 0) {
+            Some(pool) => {
+                pool.simple_query_in(
+                    "SELECT DISTINCT proname::text FROM pg_catalog.pg_proc WHERE prokind = 'a'",
+                    &self.cancel,
+                )
+                .await
+            }
+            None => return Ok(Arc::new(Aggregates::default())),
+        };
+        match read {
+            Err(error) if error.sqlstate() == Some("57014") => Err(error),
+            Ok(result) => {
+                let names = Arc::new(Aggregates::with_names(
+                    result
+                        .rows
+                        .into_iter()
+                        .filter_map(|row| row.into_iter().next().flatten()),
+                ));
+                *self.shared.aggregates.lock() =
+                    Some((std::time::Instant::now(), Arc::clone(&names)));
+                Ok(names)
+            }
+            // The built-in list still catches the standard aggregates; not
+            // remembering the failure means the next read tries again.
+            Err(error) => {
+                tracing::warn!(%error, "could not read the aggregate catalog");
+                Ok(Arc::new(Aggregates::default()))
+            }
+        }
     }
 
     async fn distributed(
@@ -864,6 +1062,60 @@ fn is_request(message: &luxbyte_proto::RawMessage, code: i32) -> bool {
         .get(..4)
         .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
         .is_some_and(|bytes| i32::from_be_bytes(bytes) == code)
+}
+
+/// Why a read across `regions` regions could not be combined.
+fn cannot_combine(regions: usize, reason: &str) -> Refusal {
+    Refusal {
+        sqlstate: "0A000".to_owned(),
+        message: format!("the statement reads {regions} regions and cannot be combined: {reason}"),
+        hint: Some(
+            "add the shard key to the WHERE clause so the statement reads one region".to_owned(),
+        ),
+        retryable: false,
+    }
+}
+
+fn region_failed(region: &str, error: &PoolError) -> Refusal {
+    Refusal {
+        sqlstate: error.sqlstate().unwrap_or("08000").to_owned(),
+        message: format!("{region} did not answer: {error}"),
+        hint: None,
+        retryable: error.retryable(),
+    }
+}
+
+/// The SQL type of each column, or a refusal naming one that cannot be
+/// carried to the home region intact.
+fn type_names(type_oids: &[i32]) -> Result<Vec<String>, Refusal> {
+    type_oids
+        .iter()
+        .map(|oid| {
+            luxbyte_sql::combine::type_name(*oid)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| Refusal {
+                    sqlstate: "0A000".to_owned(),
+                    message: format!(
+                        "a column of type oid {oid} cannot be combined across regions"
+                    ),
+                    hint: Some(
+                        "cast the column to a built-in type, or add the shard key to the WHERE \
+                         clause"
+                            .to_owned(),
+                    ),
+                    retryable: false,
+                })
+        })
+        .collect()
+}
+
+/// Every region's rows as typed arrays, for a finishing statement.
+fn carried(answers: &[RegionResult], type_oids: &[i32]) -> Result<String, Refusal> {
+    let types = type_names(type_oids)?;
+    let values = merge::by_column(answers, types.len());
+    Ok(luxbyte_sql::combine::source(
+        &types.into_iter().zip(values).collect::<Vec<_>>(),
+    ))
 }
 
 fn to_refusal(error: &PoolError) -> Refusal {

@@ -30,22 +30,32 @@ Luxbyte handles the hard half.
 | `WHERE tenant_id = $1` | no value yet — refuse, or broadcast | defer the decision to `Bind`, then route to one region |
 | `WHERE tenant_id IN ('alice','bob')` | two shards — refuse | scatter to those two regions, merge the results |
 | `WHERE name = 'ada'` (no key) | refuse | scatter to every region, merge |
-| `... ORDER BY created_at DESC` across regions | refuse | k-way sorted merge of the regions' streams |
+| `... ORDER BY created_at DESC LIMIT 20` across regions | refuse | each region sends its top 20; a k-way merge keeps the overall top 20 |
 | `INSERT ... VALUES ('alice'),('bob')` | two shards — refuse | one distributed transaction across both |
-| `SELECT count(*)` across regions | refuse | **refuse** — and say exactly why |
+| `SELECT country, count(*), avg(age) ... GROUP BY country HAVING ...` across regions | refuse | partial aggregates per region, regrouped by PostgreSQL in the home region |
+| `count(DISTINCT ...)`, `stddev()` across regions | refuse | **refuse** — and say exactly why |
 | `users JOIN orders` across regions | refuse | **refuse** — and say exactly why |
 
-Measured against shahrah on the same machine with the same statements,
-Luxbyte runs **19 of 23** where shahrah runs **12** — including a join
-between two sharded tables provably in the same region, which shahrah refuses
-outright.
+See [docs/NUMBERS.md](docs/NUMBERS.md) for a measured head-to-head against
+shahrah on the same machine with the same statements.
 
-The last two rows matter as much as the others. A `count(*)` fanned out to
-three regions returns three partial counts; concatenating them gives you three
-rows, each wrong. A join run separately in two regions silently drops exactly
+The last two rows matter as much as the others. A `count(DISTINCT country)`
+cannot be rebuilt from per-region answers: the same country in two regions
+looks like two. A join run separately in two regions silently drops exactly
 the rows that match across the boundary. Both would look like they worked.
 Luxbyte refuses them with a real SQLSTATE and a hint, because **a wrong answer
 is worse than an error**.
+
+What it can combine, it combines exactly. Plain ordered reads are merged in
+the proxy only where every sort column compares exactly outside PostgreSQL —
+integers, `numeric` digit by digit, floats, `bool`, `uuid`. Everything else —
+text in a collation's order, `DISTINCT`, `UNION`, every aggregate — is
+finished *in PostgreSQL*: the regions' parts go to the home region as typed
+arrays and a rewritten statement does the last step there, so collation,
+`numeric` precision, `HAVING` and result types are PostgreSQL's own rather
+than a reimplementation of them. Aggregates the database lists in `pg_proc`
+are recognised as aggregates even when the built-in list does not know them,
+so a user-defined one is never computed per region and concatenated.
 
 Everything else errs the other way. Any predicate the analyser does not
 understand produces *no* constraint rather than a guessed one, so the statement
@@ -89,13 +99,24 @@ cargo run -p luxbyte -- explain \
   plan    one region: eu-west (ReadOnly)
 ```
 
-A read whose key spans two regions, with an ordering to preserve:
+A read whose key spans two regions, with an ordering and a limit to keep:
 
 ```
-$ luxbyte explain "SELECT * FROM users WHERE tenant_id IN ('alice','bob') ORDER BY created_at DESC"
+$ luxbyte explain "SELECT * FROM users WHERE tenant_id IN ('alice','bob') ORDER BY created_at DESC LIMIT 20"
   kind    Select, ReadOnly, tables: users
   plan    scatter-gather over eu-west, us-east
-  merge   sorted merge on created_at desc
+  regions SELECT *, created_at AS "__luxbyte_sort_0" FROM users WHERE tenant_id IN ('alice', 'bob') ORDER BY created_at DESC LIMIT 20
+  finish  rows: merged in order, limit 20
+```
+
+An aggregate over every region:
+
+```
+$ luxbyte explain "SELECT country, count(*), avg(age) FROM users GROUP BY country HAVING count(*) > 100"
+  kind    Select, ReadOnly, tables: users
+  plan    scatter-gather over ap-south, eu-west, us-east
+  regions SELECT country, count(*), sum(age), count(age) FROM users GROUP BY country
+  finish  2 partial aggregate(s) regrouped in the home region
 ```
 
 A write that spans regions:

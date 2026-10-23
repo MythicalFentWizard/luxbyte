@@ -259,10 +259,13 @@ async fn a_read_without_a_key_fans_out_and_the_rows_are_merged() {
 
 #[tokio::test]
 async fn an_ordered_scatter_comes_back_in_order() {
+    // int4 ids, so the regions' sorted rows are merged here exactly.
+    let ids =
+        |a: &'static str, b: &'static str| Reply::typed(&[("id", 23)], &[&[Some(a)], &[Some(b)]]);
     let f = fixture_with(
-        BackendConfig::new("eu").reply_to("SELECT", Reply::rows(&["id"], &[&["1"], &["4"]])),
-        BackendConfig::new("us").reply_to("SELECT", Reply::rows(&["id"], &[&["2"], &["5"]])),
-        BackendConfig::new("ap").reply_to("SELECT", Reply::rows(&["id"], &[&["3"], &["6"]])),
+        BackendConfig::new("eu").reply_to("SELECT", ids("1", "4")),
+        BackendConfig::new("us").reply_to("SELECT", ids("2", "5")),
+        BackendConfig::new("ap").reply_to("SELECT", ids("3", "6")),
         &placed(),
     )
     .await;
@@ -291,18 +294,19 @@ async fn an_in_list_touches_only_the_regions_it_names() {
 }
 
 #[tokio::test]
-async fn an_aggregate_across_regions_is_refused_with_a_reason() {
+async fn an_aggregate_that_cannot_be_combined_is_refused_with_a_reason() {
+    // A standard deviation cannot be rebuilt exactly from per-region ones.
     let f = fixture(&placed()).await;
     let mut client = client(&f.proxy).await;
     let error = client
-        .simple_query("SELECT count(*) FROM users")
+        .simple_query("SELECT stddev(age) FROM users")
         .await
         .expect_err("should be refused");
 
     assert_eq!(error.sqlstate(), Some("0A000"));
-    assert!(error.to_string().contains("aggregat"));
-    // Nothing was sent to any backend.
-    assert!(!f.eu.saw("count(*)"));
+    assert!(error.to_string().contains("stddev"));
+    // Nothing was sent to any region.
+    assert!(!f.us.saw("stddev"));
 }
 
 #[tokio::test]
