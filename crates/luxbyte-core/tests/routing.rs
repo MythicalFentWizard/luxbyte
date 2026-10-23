@@ -487,7 +487,7 @@ fn a_join_across_regions_is_refused_rather_than_silently_losing_rows() {
     // Running this separately in each region would drop exactly the rows
     // that match across the boundary, and return a plausible-looking result.
     let Plan::Refuse(refusal) = plan(
-        "SELECT * FROM users u JOIN orders o ON o.tenant_id = u.tenant_id \
+        "SELECT * FROM users u JOIN orders o ON o.buyer = u.id \
          WHERE u.tenant_id = 'alice' AND o.tenant_id = 'bob'",
     ) else {
         panic!("expected a refusal");
@@ -505,6 +505,90 @@ fn joining_a_partitioned_table_to_a_global_one_stays_in_one_region() {
         ),
         "eu-west"
     );
+}
+
+// ------------------------------------------------ joins on the shard key
+
+#[test]
+fn a_join_on_the_shard_key_runs_in_every_region_at_once() {
+    // Rows only meet where their keys are equal, so each region has every
+    // pair it returns, and no pair comes back from two regions.
+    for sql in [
+        "SELECT * FROM users u JOIN orders o ON o.tenant_id = u.tenant_id",
+        "SELECT * FROM users u WHERE EXISTS \
+         (SELECT 1 FROM orders o WHERE o.tenant_id = u.tenant_id AND o.total > 100)",
+        "SELECT u.name, (SELECT count(*) FROM orders o WHERE o.tenant_id = u.tenant_id) \
+         FROM users u",
+        "SELECT * FROM orders o JOIN currencies c ON c.code = o.currency",
+    ] {
+        let Plan::ScatterGather { regions, .. } = plan(sql) else {
+            panic!("expected a scatter, got {:?} for {sql}", plan(sql));
+        };
+        assert_eq!(regions.len(), 3, "{sql}");
+    }
+    let Plan::Distributed { regions } = plan(
+        "UPDATE orders SET total = 0 WHERE EXISTS \
+         (SELECT 1 FROM users u WHERE u.tenant_id = orders.tenant_id AND u.closed)",
+    ) else {
+        panic!("expected a distributed write");
+    };
+    assert_eq!(regions.len(), 3);
+}
+
+#[test]
+fn a_key_reaches_a_correlated_subquery_so_one_region_answers() {
+    assert_eq!(
+        single(
+            "SELECT * FROM users u WHERE u.tenant_id = 'bob' AND EXISTS \
+             (SELECT 1 FROM orders o WHERE o.tenant_id = u.tenant_id)"
+        ),
+        "us-east"
+    );
+    assert_eq!(
+        single(
+            "WITH recent AS (SELECT * FROM orders WHERE tenant_id = 'alice') \
+             SELECT * FROM recent"
+        ),
+        "eu-west"
+    );
+}
+
+#[test]
+fn rows_that_could_meet_across_regions_are_refused_rather_than_lost() {
+    for sql in [
+        // Not tied by the key: alice's user could match bob's orders.
+        "SELECT * FROM users WHERE id IN (SELECT buyer FROM orders)",
+        // Every region would return the same currency, once per region.
+        "SELECT * FROM currencies WHERE code IN (SELECT currency FROM orders)",
+        "SELECT * FROM currencies c LEFT JOIN orders o ON o.currency = c.code",
+        // A pinned table lives in one region only.
+        "SELECT * FROM orders o JOIN eu_audit a ON a.tenant_id = o.tenant_id",
+    ] {
+        let Plan::Refuse(refusal) = plan(sql) else {
+            panic!("expected a refusal, got {:?} for {sql}", plan(sql));
+        };
+        assert_eq!(refusal.sqlstate, "0A000", "{sql}");
+    }
+}
+
+#[test]
+fn copies_of_a_replicated_table_are_never_written_from_partial_rows() {
+    for sql in [
+        "UPDATE currencies SET used = true WHERE code IN (SELECT currency FROM orders)",
+        "UPDATE currencies SET used = true WHERE code IN \
+         (SELECT currency FROM orders WHERE tenant_id = 'alice')",
+        "INSERT INTO currencies SELECT currency FROM orders WHERE tenant_id = 'alice'",
+    ] {
+        let Plan::Refuse(refusal) = plan(sql) else {
+            panic!("expected a refusal, got {:?} for {sql}", plan(sql));
+        };
+        assert!(refusal.message.contains("copies would differ"), "{sql}");
+    }
+    // From other replicated tables, every copy changes alike.
+    assert!(matches!(
+        plan("UPDATE currencies SET rate = (SELECT max(rate) FROM currencies)"),
+        Plan::Distributed { .. }
+    ));
 }
 
 // ------------------------------------------------------------------ local work

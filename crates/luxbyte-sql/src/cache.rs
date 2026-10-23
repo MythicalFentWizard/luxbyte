@@ -264,6 +264,9 @@ fn equivalent(original: &[StatementAnalysis], normalized: &[StatementAnalysis]) 
             // Catches `ORDER BY 1` becoming `ORDER BY $1`: the sort key text
             // changes, so the merge order would have changed with it.
             && left.post_processing == right.post_processing
+            && left.links == right.links
+            && left.anchors == right.anchors
+            && left.branches == right.branches
             && same_constraint_structure(left, right)
     })
 }
