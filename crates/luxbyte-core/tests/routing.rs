@@ -724,3 +724,52 @@ fn with_a_shared_directory_reads_and_known_keys_need_no_claim() {
     };
     assert_eq!(region, "eu-west");
 }
+
+#[test]
+fn a_new_key_is_created_in_the_home_shard_it_hashes_to() {
+    let topology = Topology::from_toml(
+        r#"
+home_region = "eu-west-1"
+
+[[regions]]
+id = "eu-west-1"
+location = "eu-west"
+primary = { host = "eu1" }
+
+[[regions]]
+id = "eu-west-2"
+location = "eu-west"
+primary = { host = "eu2" }
+
+[[regions]]
+id = "us-east"
+primary = { host = "us" }
+
+[[tables]]
+table = "users"
+placement = "geo_partitioned"
+key = "tenant_id"
+"#,
+    )
+    .expect("topology should parse");
+    let router = Router::new(topology, Arc::new(MemoryDirectory::new()));
+    let region_of = |key: &str| {
+        let sql = format!("INSERT INTO users (tenant_id) VALUES ('{key}')");
+        match plan_with(&router, &sql, None) {
+            Plan::Single { region, .. } => region,
+            other => panic!("expected a single region for {key}, got {other:?}"),
+        }
+    };
+    // As the topology's own tests pin: alice hashes odd, bob even.
+    assert_eq!(region_of("alice"), "eu-west-2");
+    assert_eq!(region_of("bob"), "eu-west-1");
+    // A key nobody placed is read from every shard and every region.
+    let Plan::ScatterGather { regions, .. } = plan_with(
+        &router,
+        "SELECT * FROM users WHERE tenant_id = 'alice'",
+        None,
+    ) else {
+        panic!("expected a fan-out");
+    };
+    assert_eq!(regions.len(), 3);
+}

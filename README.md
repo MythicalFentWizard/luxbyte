@@ -238,6 +238,32 @@ guessed. A table outside the move with a foreign key onto one inside it is
 refused too, since the move would break it; foreign keys between the moved
 tables are followed, parents inserted first and deleted last.
 
+### Shards within a region
+
+One primary per region is not always enough. Regions that share a
+`location` are shards of it:
+
+```toml
+[[topology.regions]]
+id = "eu-west"
+location = "eu-west"
+primary = { host = "eu1.db.internal" }
+
+[[topology.regions]]
+id = "eu-west-2"
+location = "eu-west"
+primary = { host = "eu2.db.internal" }
+```
+
+A key nobody has placed is created in the home location's shard its hash
+picks (FNV-1a, written out rather than taken from the standard library, so
+proxies built at different times agree), and every one of its tables'
+rows goes there with it. `REBALANCE eu-west TO eu-west-2 LIMIT 100` moves
+up to 100 of a shard's keys, read from its rows, each with its own atomic
+`RELOCATE`; it stops at the first key that cannot move and reports the rest.
+Everything else — the directory, moves, reads that fan out — treats a shard
+as the region it is.
+
 ### Several proxies
 
 With `shared = true` under `[directory_store]`, several proxies — one per

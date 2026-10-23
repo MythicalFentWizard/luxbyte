@@ -664,7 +664,10 @@ async fn the_console_answers_over_the_same_connection() {
     let mut client = client(&f.proxy).await;
 
     let regions = client.simple_query("SHOW REGIONS").await.expect("regions");
-    assert_eq!(regions.columns, ["region", "home", "primary", "replicas"]);
+    assert_eq!(
+        regions.columns,
+        ["region", "location", "home", "primary", "replicas"]
+    );
     assert_eq!(values(&regions, 0), ["eu-west", "us-east", "ap-south"]);
 
     let placement = client

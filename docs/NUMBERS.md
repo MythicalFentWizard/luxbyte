@@ -220,9 +220,12 @@ aggregates across regions that it used to refuse.
   a dependency Raft does not have, and leaves a window — a write delayed past
   half a lease — that consensus closes. In exchange there is no quorum to
   keep: one proxy per region is enough.
-- **Sharding within a region.** shahrah hashes keys onto several shards inside
-  each region, and `REBALANCE` moves rows between them. Luxbyte has one primary
-  per region.
+- **Sharding within a region.** shahrah hashes keys onto logical shards and
+  moves whole ranges of them with `REBALANCE`. Luxbyte's shards are regions
+  sharing a `location`: new keys spread across the home location's shards by
+  hash, and its `REBALANCE` moves keys one atomic `RELOCATE` at a time. Per
+  key is finer and keeps a key's tables together; per range moves many keys
+  in fewer steps, and a range's keys never need a directory entry each.
 - **Operating it.** shahrah's dashboard is live over a WebSocket and shows
   every proxy in the group, and it has a comment to supply a key a view
   hides. Luxbyte now has `DRAIN`, `ROUTE`, warm connections, `SHOW HEALTH`

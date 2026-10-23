@@ -161,14 +161,18 @@ fn table_error(message: &str) -> QueryResult {
 
 fn show_regions(shared: &Shared) -> QueryResult {
     let topology = shared.router.topology();
+    let home_shards = topology.home_shards();
     let rows = topology
         .regions
         .iter()
         .map(|region| {
             vec![
                 region.id.clone(),
+                region.location().to_owned(),
                 if region.id == topology.home_region {
                     "yes".to_owned()
+                } else if home_shards.contains(&region.id.as_str()) {
+                    "shard".to_owned()
                 } else {
                     "no".to_owned()
                 },
@@ -182,7 +186,7 @@ fn show_regions(shared: &Shared) -> QueryResult {
             ]
         })
         .collect();
-    table(&["region", "home", "primary", "replicas"], rows)
+    table(&["region", "location", "home", "primary", "replicas"], rows)
 }
 
 fn show_placement(shared: &Shared) -> QueryResult {

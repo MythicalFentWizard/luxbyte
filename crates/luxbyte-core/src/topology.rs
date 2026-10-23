@@ -25,15 +25,32 @@ impl std::fmt::Display for Endpoint {
 }
 
 /// One region: a primary and any read replicas beside it.
+///
+/// Several regions can share a `location`, each a shard of it: one place on
+/// the map with more than one primary, because one server is not enough
+/// for the keys that live there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Region {
-    /// Stable identifier, such as `eu-west`.
+    /// Stable identifier, such as `eu-west`, or `eu-west-2` for a second
+    /// shard of a location.
     pub id: String,
     /// The writable endpoint.
     pub primary: Endpoint,
     /// Read-only endpoints, which may lag.
     #[serde(default)]
     pub replicas: Vec<Endpoint>,
+    /// Where it is, when other regions are in the same place: regions with
+    /// the same location are shards of it. Its own id when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+}
+
+impl Region {
+    /// Where it is: its location, or its own id.
+    #[must_use]
+    pub fn location(&self) -> &str {
+        self.location.as_deref().unwrap_or(&self.id)
+    }
 }
 
 impl Region {
@@ -210,6 +227,42 @@ impl Topology {
         self.regions.iter().map(|region| region.id.as_str())
     }
 
+    /// The shards of the home region's location, in configuration order:
+    /// the home region alone, unless others share its location.
+    #[must_use]
+    pub fn home_shards(&self) -> Vec<&str> {
+        let home = self
+            .region(&self.home_region)
+            .map_or(self.home_region.as_str(), Region::location);
+        self.regions
+            .iter()
+            .filter(|region| region.location() == home)
+            .map(|region| region.id.as_str())
+            .collect()
+    }
+
+    /// Where a key nobody has placed is created: the home region, or with
+    /// several shards at home, the one the key hashes to.
+    ///
+    /// The hash is FNV-1a, written out here rather than taken from the
+    /// standard library, whose hasher may change between releases: proxies
+    /// built at different times must agree on where a key goes.
+    #[must_use]
+    pub fn new_key_region(&self, key: &str) -> &str {
+        let shards = self.home_shards();
+        let Ok(count) = u64::try_from(shards.len()) else {
+            return &self.home_region;
+        };
+        let index = fnv1a(key.as_bytes())
+            .checked_rem(count)
+            .and_then(|index| usize::try_from(index).ok())
+            .unwrap_or(0);
+        shards
+            .get(index)
+            .copied()
+            .unwrap_or(self.home_region.as_str())
+    }
+
     /// The placement policy for a table.
     ///
     /// Matching ignores the schema when the statement did not give one,
@@ -225,6 +278,15 @@ impl Topology {
             })
             .map(|policy| &policy.placement)
     }
+}
+
+/// The 64-bit FNV-1a hash.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes.iter().fold(OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    })
 }
 
 #[cfg(test)]
@@ -423,5 +485,56 @@ region = "mars-one"
             Topology::from_toml("this is not toml ["),
             Err(TopologyError::Parse(_))
         ));
+    }
+
+    const SHARDED: &str = r#"
+home_region = "eu-west-1"
+
+[[regions]]
+id = "eu-west-1"
+location = "eu-west"
+primary = { host = "eu1" }
+
+[[regions]]
+id = "us-east"
+primary = { host = "us" }
+
+[[regions]]
+id = "eu-west-2"
+location = "eu-west"
+primary = { host = "eu2" }
+"#;
+
+    #[test]
+    fn regions_sharing_a_location_are_the_shards_of_it() {
+        let topology = Topology::from_toml(SHARDED).expect("should parse");
+        assert_eq!(topology.home_shards(), ["eu-west-1", "eu-west-2"]);
+        assert_eq!(
+            topology.region("us-east").map(Region::location),
+            Some("us-east")
+        );
+        // Without locations, home is one region.
+        let topology = Topology::from_toml(sample()).expect("should parse");
+        assert_eq!(topology.home_shards(), [topology.home_region.as_str()]);
+        assert_eq!(topology.new_key_region("anything"), topology.home_region);
+    }
+
+    #[test]
+    fn a_new_key_goes_to_the_home_shard_it_hashes_to_on_every_proxy() {
+        // The standard FNV-1a test vectors: a proxy built with another
+        // compiler or library must place a key in the same shard.
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a(b"foobar"), 0x8594_4171_f739_67e8);
+
+        let topology = Topology::from_toml(SHARDED).expect("should parse");
+        // fnv1a("alice") is odd and fnv1a("bob") even.
+        assert_eq!(topology.new_key_region("alice"), "eu-west-2");
+        assert_eq!(topology.new_key_region("bob"), "eu-west-1");
+        // Never a shard of another location.
+        let spread: BTreeSet<&str> = (0..100)
+            .map(|n| topology.new_key_region(&format!("tenant-{n}")))
+            .collect();
+        assert_eq!(spread, BTreeSet::from(["eu-west-1", "eu-west-2"]));
     }
 }

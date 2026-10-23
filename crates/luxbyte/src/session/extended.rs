@@ -406,12 +406,14 @@ impl Session {
             Body::Empty
         } else if crate::console::handle(&self.shared, parse.sql).is_some() {
             Body::Console
-        } else if crate::relocate::parse(parse.sql).is_some() {
+        } else if crate::relocate::parse(parse.sql).is_some()
+            || crate::relocate::parse_rebalance(parse.sql).is_some()
+        {
             return self.refuse(
                 sequence,
                 &plain(
                     "0A000",
-                    "RELOCATE runs only as a simple query, as psql sends it",
+                    "RELOCATE and REBALANCE run only as simple queries, as psql sends them",
                 ),
             );
         } else if is_copy(parse.sql) {
