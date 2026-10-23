@@ -87,12 +87,14 @@ async fn cancel(proxy: &ServerHandle, key: (i32, i32)) {
     .expect("deliver the cancel");
 }
 
+/// Two regions where reading or writing users is slow, and nothing else
+/// is, so a cancel lands on the statement under test.
 async fn slow_pair() -> (Backend, Backend) {
     (
-        Backend::start(BackendConfig::new("eu-west").with_delay(SLOW))
+        Backend::start(BackendConfig::new("eu-west").slow_on("users", SLOW))
             .await
             .unwrap(),
-        Backend::start(BackendConfig::new("us-east").with_delay(SLOW))
+        Backend::start(BackendConfig::new("us-east").slow_on("users", SLOW))
             .await
             .unwrap(),
     )
@@ -153,8 +155,6 @@ async fn a_cancel_reaches_a_statement_inside_a_transaction() {
         (client, outcome)
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
-    // The enlisting BEGIN is slow too, so the cancel may land on it or on
-    // the UPDATE; either way the statement fails and the block with it.
     cancel(&proxy, key).await;
 
     let (mut client, outcome) = query.await.expect("task");

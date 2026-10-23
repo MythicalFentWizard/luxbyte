@@ -202,13 +202,15 @@ fn explain(arguments: &[String]) -> Result<String, String> {
     let parameters =
         (!parsed.parameters.is_empty()).then(|| ParameterValues::new(parsed.parameters.clone()));
 
+    let texts = luxbyte_sql::statements::split(&sql);
     let mut report = String::new();
     for (position, analysis) in analyses.iter().enumerate() {
         if analyses.len() > 1 {
             let _ = writeln!(report, "statement {}:", position.saturating_add(1));
         }
         let plan = router.plan(analysis, parameters.as_ref());
-        let _ = write!(report, "{}", describe(analysis, &plan));
+        let text = texts.get(position).copied().unwrap_or(&sql);
+        let _ = write!(report, "{}", describe(text, analysis, &plan));
     }
     Ok(report.trim_end().to_owned())
 }
@@ -233,7 +235,7 @@ fn load_directory(directory: &MemoryDirectory, path: &str) -> Result<(), String>
     Ok(())
 }
 
-fn describe(analysis: &luxbyte_sql::StatementAnalysis, plan: &Plan) -> String {
+fn describe(sql: &str, analysis: &luxbyte_sql::StatementAnalysis, plan: &Plan) -> String {
     let mut out = String::new();
     let tables: Vec<String> = analysis.tables.iter().map(ToString::to_string).collect();
     let _ = writeln!(
@@ -257,24 +259,47 @@ fn describe(analysis: &luxbyte_sql::StatementAnalysis, plan: &Plan) -> String {
         }
         Plan::ScatterGather { regions, merge } => {
             let _ = writeln!(out, "  plan    scatter-gather over {}", regions.join(", "));
-            let _ = writeln!(
-                out,
-                "  merge   {}",
-                match merge {
-                    MergeStrategy::Concatenate => "concatenate".to_owned(),
-                    MergeStrategy::SortedMerge(keys) => format!(
-                        "sorted merge on {}",
-                        keys.iter()
-                            .map(|key| format!(
-                                "{}{}",
-                                key.expression,
-                                if key.descending { " desc" } else { "" }
-                            ))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
+            let combined =
+                luxbyte_sql::combine::plan(sql, &luxbyte_sql::combine::Aggregates::default());
+            match (merge, combined) {
+                (MergeStrategy::Concatenate, Ok(_)) => {
+                    let _ = writeln!(out, "  merge   concatenate");
                 }
-            );
+                (_, Ok(plan)) => {
+                    let _ = writeln!(out, "  regions {}", plan.region_sql);
+                    let _ = writeln!(
+                        out,
+                        "  finish  {}",
+                        match plan.finish {
+                            luxbyte_sql::combine::Finish::Rows(rows) => format!(
+                                "rows: {}{}{}{}",
+                                if rows.order.is_empty() {
+                                    "concatenated"
+                                } else {
+                                    "merged in order"
+                                },
+                                if rows.distinct { ", deduplicated" } else { "" },
+                                rows.limit
+                                    .map(|limit| format!(", limit {limit}"))
+                                    .unwrap_or_default(),
+                                if rows.offset > 0 {
+                                    format!(", offset {}", rows.offset)
+                                } else {
+                                    String::new()
+                                }
+                            ),
+                            luxbyte_sql::combine::Finish::Aggregate(aggregates) => format!(
+                                "{} partial aggregate(s) regrouped in the home region",
+                                aggregates.aggregates.len()
+                            ),
+                        }
+                    );
+                }
+                (_, Err(reason)) => {
+                    let _ = writeln!(out, "  combine refused [0A000]");
+                    let _ = writeln!(out, "  reason  {reason}");
+                }
+            }
         }
         Plan::Distributed { regions } => {
             let _ = writeln!(

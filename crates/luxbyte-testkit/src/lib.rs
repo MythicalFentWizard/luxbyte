@@ -62,6 +62,15 @@ pub enum Reply {
         /// Row values, with `None` for SQL `NULL`.
         rows: Vec<Vec<Option<String>>>,
     },
+    /// Reply with rows whose columns have the given type OIDs.
+    TypedRows {
+        /// Column names.
+        columns: Vec<String>,
+        /// Each column's type OID.
+        types: Vec<i32>,
+        /// Row values, with `None` for SQL `NULL`.
+        rows: Vec<Vec<Option<String>>>,
+    },
     /// Reply with an error.
     Fail {
         /// SQLSTATE to report.
@@ -85,6 +94,20 @@ impl Reply {
             rows: rows
                 .iter()
                 .map(|row| row.iter().map(|v| Some((*v).to_owned())).collect())
+                .collect(),
+        }
+    }
+
+    /// Typed rows from string literals: each column is a name and a type
+    /// OID, such as `("id", 23)` for `int4`.
+    #[must_use]
+    pub fn typed(columns: &[(&str, i32)], rows: &[&[Option<&str>]]) -> Self {
+        Self::TypedRows {
+            columns: columns.iter().map(|(name, _)| (*name).to_owned()).collect(),
+            types: columns.iter().map(|(_, oid)| *oid).collect(),
+            rows: rows
+                .iter()
+                .map(|row| row.iter().map(|v| v.map(ToOwned::to_owned)).collect())
                 .collect(),
         }
     }
@@ -123,6 +146,8 @@ pub struct BackendConfig {
     pub disconnect_on: Option<String>,
     /// Delay every reply by this long.
     pub delay: Option<std::time::Duration>,
+    /// Delay only statements containing this, when set.
+    pub delay_only: Option<String>,
     /// Refuse to authenticate.
     pub refuse_auth: bool,
     /// Roles that must authenticate with SCRAM, and their verifiers. When
@@ -140,6 +165,7 @@ impl BackendConfig {
             refuse_prepare: false,
             disconnect_on: None,
             delay: None,
+            delay_only: None,
             refuse_auth: false,
             scram_users: Vec::new(),
         }
@@ -183,6 +209,15 @@ impl BackendConfig {
         verifier: luxbyte_proto::auth::ScramVerifier,
     ) -> Self {
         self.scram_users.push((user.to_owned(), verifier));
+        self
+    }
+
+    /// Delays only statements containing `pattern`, so a test can slow the
+    /// statement it is about and nothing else.
+    #[must_use]
+    pub fn slow_on(mut self, pattern: &str, delay: std::time::Duration) -> Self {
+        self.delay = Some(delay);
+        self.delay_only = Some(pattern.to_owned());
         self
     }
 
@@ -571,7 +606,11 @@ enum Pace {
 /// Applies the configured delay, during which a cancel can interrupt it, then
 /// says whether this statement is the one to hang up on.
 async fn pace(sql: &str, config: &BackendConfig, cancelled: &tokio::sync::Notify) -> Pace {
-    if let Some(delay) = config.delay {
+    let applies = config
+        .delay_only
+        .as_ref()
+        .is_none_or(|pattern| sql.contains(pattern));
+    if let Some(delay) = config.delay.filter(|_| applies) {
         tokio::select! {
             () = tokio::time::sleep(delay) => {}
             () = cancelled.notified() => return Pace::Cancelled,
@@ -929,6 +968,10 @@ fn describe_rows(sql: &str, config: &BackendConfig) -> Result<Bytes, ProtocolErr
             let names: Vec<&str> = columns.iter().map(String::as_str).collect();
             build::row_description(&names, 25)
         }
+        Some((_, Reply::TypedRows { columns, types, .. })) => {
+            let names: Vec<&str> = columns.iter().map(String::as_str).collect();
+            build::row_description_typed(&names, types)
+        }
         _ => build::no_data(),
     }
 }
@@ -1074,6 +1117,20 @@ fn scripted_reply(
 ) -> Result<Vec<Bytes>, ProtocolError> {
     match reply {
         Reply::Done { tag } => Ok(vec![build::command_complete(tag)?]),
+        Reply::TypedRows {
+            columns,
+            types,
+            rows,
+        } => {
+            let names: Vec<&str> = columns.iter().map(String::as_str).collect();
+            let mut out = vec![build::row_description_typed(&names, types)?];
+            for row in rows {
+                let values: Vec<Option<&str>> = row.iter().map(|value| value.as_deref()).collect();
+                out.push(build::data_row(&values)?);
+            }
+            out.push(build::command_complete(&format!("SELECT {}", rows.len()))?);
+            Ok(out)
+        }
         Reply::Rows { columns, rows } => {
             let names: Vec<&str> = columns.iter().map(String::as_str).collect();
             // 25 is `text`, which is what every value here is.

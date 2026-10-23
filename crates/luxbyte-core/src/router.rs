@@ -3,28 +3,28 @@
 //! The planner is a pure function of three things — the statement, the
 //! topology, and the directory — and it has no I/O of its own. That is what
 //! makes the interesting cases testable: a cross-region join, a write during
-//! a cutover, a `count(*)` that cannot be merged, all without a database
+//! a cutover, a `count(*)` over every region, all without a database
 //! anywhere in sight.
 //!
 //! Where it differs from refusing everything it cannot pin down:
 //!
-//! - A read whose key is not known fans out and the rows are merged, rather
-//!   than failing.
+//! - A read whose key is not known fans out and the results are combined —
+//!   ordered, limited, deduplicated or re-aggregated as the statement asks —
+//!   rather than failing.
 //! - A write that touches several regions becomes a distributed transaction,
 //!   rather than failing.
 //! - A statement whose key arrives in a `Bind` is deferred, not refused.
 //!
 //! What it still refuses, it refuses for a reason it can state: a join across
-//! regions would silently return the wrong rows, and a merged `count(*)`
-//! would silently return the wrong number. A wrong answer is worse than an
-//! error, and both get a real SQLSTATE so a client can tell them apart.
+//! regions would silently return the wrong rows. A wrong answer is worse than
+//! an error, and an error gets a real SQLSTATE so a client can tell it apart.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use luxbyte_sql::{
-    Access, KeyValue, MergeObstacle, MergeStrategy, Prepared, StatementAnalysis, StatementKind,
-    TableRef, TransactionOp,
+    Access, KeyValue, MergeStrategy, Prepared, StatementAnalysis, StatementKind, TableRef,
+    TransactionOp,
 };
 
 use crate::directory::{Directory, Location};
@@ -395,8 +395,21 @@ impl Router {
     ) -> Plan {
         // A join whose sides are in different regions cannot be answered by
         // running it separately in each: the rows that should match across
-        // the boundary would simply be missing from both results.
-        if user_tables.len() > 1 {
+        // the boundary would simply be missing from both results. A set
+        // operation's branches are read independently, so only tables within
+        // one branch count as joined.
+        let joined = if analysis.branches.is_empty() {
+            user_tables.len() > 1
+        } else {
+            analysis.branches.iter().any(|branch| {
+                branch
+                    .iter()
+                    .filter(|table| !is_catalog_table(table))
+                    .count()
+                    > 1
+            })
+        };
+        if joined {
             let names: Vec<String> = user_tables.iter().map(ToString::to_string).collect();
             return Plan::Refuse(
                 Refusal::new(
@@ -419,26 +432,11 @@ impl Router {
             return Plan::Distributed { regions };
         }
 
-        match analysis.post_processing.merge_strategy() {
-            Ok(merge) => Plan::ScatterGather { regions, merge },
-            Err(obstacle) => Plan::Refuse(
-                Refusal::new(
-                    "0A000",
-                    format!(
-                        "the statement reads {} regions and cannot be merged: {}",
-                        regions.len(),
-                        obstacle.reason()
-                    ),
-                )
-                .with_hint(match obstacle {
-                    MergeObstacle::Aggregate => {
-                        "add the shard key to the WHERE clause so the statement reads one region"
-                    }
-                    MergeObstacle::Distinct => {
-                        "add the shard key to the WHERE clause, or deduplicate in the application"
-                    }
-                }),
-            ),
+        // Whether the combined result can be computed is decided from the
+        // statement's text when it runs; see `luxbyte_sql::combine`.
+        Plan::ScatterGather {
+            regions,
+            merge: analysis.post_processing.merge_strategy(),
         }
     }
 
