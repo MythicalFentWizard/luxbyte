@@ -82,9 +82,17 @@ pub enum Placement {
     /// Every region holds a full copy.
     ///
     /// Suitable for small, rarely written reference data — currency tables,
-    /// feature flags. Writes must reach every region, so this is expensive
-    /// to write and free to read.
-    GlobalReplicated,
+    /// feature flags. Reads go to the nearest copy.
+    GlobalReplicated {
+        /// Where writes go. Without one, a write changes every region in
+        /// one two-phase commit: every copy is current once it commits, at
+        /// the price of a round trip to each region. With one, a write goes
+        /// there alone, PostgreSQL's own replication carries it to the
+        /// other copies, and a session that wrote reads these tables from
+        /// the writer from then on, so it never misses its own write.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writer: Option<String>,
+    },
     /// The table exists in exactly one region.
     Pinned {
         /// The region that holds it.
@@ -167,6 +175,14 @@ pub enum TopologyError {
         /// The region it named.
         region: String,
     },
+    /// A replicated table's writer is a region that does not exist.
+    #[error("table {table} is written in unknown region {region}")]
+    UnknownWriterRegion {
+        /// The table.
+        table: String,
+        /// The region it named.
+        region: String,
+    },
     /// The configuration file was not valid TOML.
     #[error("could not parse the topology: {0}")]
     Parse(String),
@@ -208,6 +224,16 @@ impl Topology {
                 && !seen.contains(region)
             {
                 return Err(TopologyError::UnknownPinnedRegion {
+                    table: qualified,
+                    region: region.clone(),
+                });
+            }
+            if let Placement::GlobalReplicated {
+                writer: Some(region),
+            } = &policy.placement
+                && !seen.contains(region)
+            {
+                return Err(TopologyError::UnknownWriterRegion {
                     table: qualified,
                     region: region.clone(),
                 });
@@ -349,7 +375,7 @@ region = "eu-west"
         );
         assert_eq!(
             topology.placement(None, "currencies"),
-            Some(&Placement::GlobalReplicated)
+            Some(&Placement::GlobalReplicated { writer: None })
         );
         assert_eq!(
             topology.placement(None, "eu_audit_log"),

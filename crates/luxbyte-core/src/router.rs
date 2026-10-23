@@ -554,10 +554,17 @@ impl Router {
                 Placement::Pinned { region } => {
                     regions.insert(region.clone());
                 }
-                Placement::GlobalReplicated => {
+                Placement::GlobalReplicated { writer } => {
                     if analysis.access.needs_primary() {
-                        // Every copy has to change, or the copies diverge.
-                        regions.extend(self.all_regions());
+                        match writer {
+                            // Replication carries it from there.
+                            Some(writer) => {
+                                regions.insert(writer.clone());
+                            }
+                            // Every copy has to change, or the copies
+                            // diverge.
+                            None => regions.extend(self.all_regions()),
+                        }
                     } else {
                         // Any copy will do, so read the nearest one.
                         regions.insert(self.topology.home_region.clone());

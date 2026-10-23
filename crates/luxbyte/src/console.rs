@@ -202,7 +202,12 @@ fn show_placement(shared: &Shared) -> QueryResult {
         .map(|policy| {
             let (kind, detail) = match &policy.placement {
                 Placement::GeoPartitioned { key } => ("geo_partitioned", key.clone()),
-                Placement::GlobalReplicated => ("global_replicated", String::new()),
+                Placement::GlobalReplicated { writer } => (
+                    "global_replicated",
+                    writer
+                        .as_ref()
+                        .map_or_else(String::new, |writer| format!("written in {writer}")),
+                ),
                 Placement::Pinned { region } => ("pinned", region.clone()),
             };
             vec![

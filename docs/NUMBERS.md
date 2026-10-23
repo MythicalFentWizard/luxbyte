@@ -208,12 +208,13 @@ aggregates across regions that it used to refuse.
   region; and one the application marks `/* luxbyte: region=... */` runs
   there unread, which covers the gap but puts the routing in the
   application's hands.)
-- **Replicated writes.** shahrah sends a write to a replicated table to one
-  configured writer region and lets PostgreSQL replication carry it. Luxbyte
-  broadcasts to every region under two-phase commit. Ours is synchronous and
-  therefore consistent on read-your-writes from any region; his is much
-  cheaper. Which is correct depends on the application, and his default is the
-  more economical one.
+- **Replicated writes.** No longer ahead. shahrah sends a write to a
+  replicated table to one writer region and lets PostgreSQL replication
+  carry it. Luxbyte does that too when a table names a `writer`, and then
+  sends a session that wrote such a table to the writer for its reads of it,
+  so it never reads a copy that has not caught up with its own write;
+  without a `writer`, it keeps the synchronous two-phase commit to every
+  region. Both ways are there, and the cheap one keeps read-your-writes.
 - **Several proxies.** shahrah's proxies form a Raft group that agrees on the
   topology and hears about a move at once. Luxbyte's proxies share a
   directory through leases and confirmations in one authority region (see
