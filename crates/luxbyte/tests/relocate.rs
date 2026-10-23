@@ -864,3 +864,41 @@ async fn rebalance_is_for_operators_and_needs_two_regions() {
         assert_eq!(error.sqlstate(), Some(code), "{sql}: {error}");
     }
 }
+
+// ------------------------------------------------------- recording new keys
+
+const NEW_ROW: &str = "INSERT INTO users (tenant_id, name) VALUES ('carol', 'C')";
+const READ_NEW: &str = "SELECT * FROM users WHERE tenant_id = 'carol'";
+
+#[tokio::test]
+async fn a_key_written_for_the_first_time_is_recorded_and_read_from_one_region() {
+    let (eu, us, proxy) = start(europe(), america(), &sections()).await;
+    let mut app = connect(&proxy, "app").await;
+    app.simple_query(NEW_ROW).await.unwrap();
+    // Recorded in the home region's directory before the row was written.
+    let recorded = position(&eu, "INSERT INTO \"luxbyte_directory\" AS d");
+    assert!(recorded < position(&eu, NEW_ROW));
+    assert!(eu.saw("E'carol'"));
+    assert_eq!(region_of(&proxy, "users", "carol"), resident("eu-west"));
+
+    // So reading it asks only Europe, rather than every region.
+    app.simple_query(READ_NEW).await.unwrap();
+    assert_eq!(eu.count_of(READ_NEW), 1);
+    assert_eq!(us.count_of(READ_NEW), 0);
+}
+
+#[tokio::test]
+async fn recording_can_be_turned_off_for_rows_the_directory_does_not_list_yet() {
+    let (eu, us, proxy) = start(
+        europe(),
+        america(),
+        &format!("{}\n{STORE}record_new_keys = false\n", auth()),
+    )
+    .await;
+    let mut app = connect(&proxy, "app").await;
+    app.simple_query(NEW_ROW).await.unwrap();
+    assert!(!eu.saw("INSERT INTO \"luxbyte_directory\" AS d"));
+    app.simple_query(READ_NEW).await.unwrap();
+    assert_eq!(eu.count_of(READ_NEW), 1);
+    assert_eq!(us.count_of(READ_NEW), 1, "unrecorded, so read everywhere");
+}

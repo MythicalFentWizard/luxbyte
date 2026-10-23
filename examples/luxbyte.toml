@@ -78,6 +78,8 @@ listen = "127.0.0.1:9187"
 # hold_ms = 10000
 # How long a move waits for writes under way and for its locks.
 # lock_timeout_ms = 5000
+# Record a key the first time it is written, so its reads go to one region.
+# record_new_keys = true
 # Several proxies share this directory: moves are agreed with every live
 # proxy, new keys are claimed, and a proxy that cannot reach the others
 # stops routing on the directory. Every proxy needs its own server.node.

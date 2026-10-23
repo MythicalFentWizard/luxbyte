@@ -175,7 +175,13 @@ impl Server {
                 config.topology.clone(),
                 Arc::clone(&directory) as Arc<dyn Directory>,
             )
-            .claiming(peers.is_some()),
+            .claiming(
+                peers.is_some()
+                    || config
+                        .directory_store
+                        .as_ref()
+                        .is_some_and(|store| store.record_new_keys),
+            ),
             cache: AnalysisCache::default(),
             pools: PoolSet::new(
                 config

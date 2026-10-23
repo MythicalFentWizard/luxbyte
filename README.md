@@ -198,7 +198,11 @@ hash sharding. A key with no entry is created in the proxy's home region: new
 rows land where the person who made them is.
 
 With a `[directory_store]` section the directory lives in a table in every
-region, loaded at startup, and keys move with `RELOCATE`:
+region, loaded at startup, and keys move with `RELOCATE`. A key written for
+the first time is recorded there too, in the same round trip to the home
+region that every proxy-placed key costs once, so its reads go straight to
+its region instead of asking all of them (`record_new_keys = false` keeps
+the old fan-out, for rows the directory does not list yet):
 
 ```
 => RELOCATE alice TO 'us-east';
