@@ -61,6 +61,21 @@ pub struct DirectoryStore {
     /// Milliseconds a move waits for the writes already under way and for
     /// each lock it takes, before giving up and leaving everything as it was.
     pub lock_timeout_ms: u64,
+    /// Several proxies use this directory. Each then agrees every move with
+    /// the others before making it, claims a new key before writing it, and
+    /// stops routing on the directory when it cannot reach the others.
+    pub shared: bool,
+    /// The region where proxies sharing the directory meet, and whose copy
+    /// of it they read: the home region when unset. Every proxy sharing the
+    /// directory must name the same one.
+    pub authority: Option<String>,
+    /// Milliseconds between a proxy's visits to the authority region.
+    pub poll_ms: u64,
+    /// Milliseconds a proxy keeps routing on its directory after its last
+    /// visit to the authority region. Past that it refuses whatever depends
+    /// on the directory, and a move stops waiting for it once half as long
+    /// again has passed.
+    pub lease_ms: u64,
 }
 
 impl Default for DirectoryStore {
@@ -69,6 +84,10 @@ impl Default for DirectoryStore {
             table: "luxbyte_directory".to_owned(),
             hold_ms: 10_000,
             lock_timeout_ms: 5_000,
+            shared: false,
+            authority: None,
+            poll_ms: 200,
+            lease_ms: 2_000,
         }
     }
 }

@@ -88,11 +88,39 @@ pub struct Server {
     admin: Option<(TcpListener, Option<String>, Option<crate::tls::Acceptor>)>,
     /// Probes the backends, when probing is on.
     prober: Option<crate::health::Prober>,
+    /// Whether the shared directory is already being visited.
+    visiting: bool,
 }
 
 impl Server {
     /// Binds the listener and prepares everything the sessions share.
     pub async fn bind(config: &Config) -> Result<Self, ServerError> {
+        Self::bind_with(config, None).await
+    }
+
+    /// Binds a proxy whose shared directory is kept in `memory` rather than
+    /// in the authority region's tables, so that several proxies in one
+    /// process can share it. `directory_store.shared` must be on.
+    pub async fn bind_sharing(
+        config: &Config,
+        memory: Arc<crate::peers::MemoryPeers>,
+    ) -> Result<Self, ServerError> {
+        if !config
+            .directory_store
+            .as_ref()
+            .is_some_and(|store| store.shared)
+        {
+            return Err(ServerError::Directory(
+                "a shared directory needs directory_store.shared = true".to_owned(),
+            ));
+        }
+        Self::bind_with(config, Some(memory)).await
+    }
+
+    async fn bind_with(
+        config: &Config,
+        memory: Option<Arc<crate::peers::MemoryPeers>>,
+    ) -> Result<Self, ServerError> {
         let auth = Authenticator::new(&config.auth)?;
         // Accepting anyone is a choice to be made out loud. Left as the
         // default, it is allowed only where nobody else can connect.
@@ -117,6 +145,24 @@ impl Server {
             directory.place(&entry.table, &entry.key, &entry.region);
         }
 
+        let peers = match &config.directory_store {
+            Some(store) if store.shared => Some(
+                crate::peers::Peers::new(
+                    store,
+                    &config.server.node,
+                    &config.topology.home_region,
+                    &config
+                        .topology
+                        .region_ids()
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>(),
+                    memory,
+                )
+                .map_err(ServerError::Directory)?,
+            ),
+            _ => None,
+        };
+
         let log: Arc<dyn CommitLog> = match &config.server.commit_log {
             Some(path) => Arc::new(FileLog::open(path)?),
             // Without a durable log a crash between prepare and commit
@@ -128,7 +174,8 @@ impl Server {
             router: Router::new(
                 config.topology.clone(),
                 Arc::clone(&directory) as Arc<dyn Directory>,
-            ),
+            )
+            .claiming(peers.is_some()),
             cache: AnalysisCache::default(),
             pools: PoolSet::new(
                 config
@@ -148,6 +195,7 @@ impl Server {
             metrics: crate::metrics::Metrics::default(),
             moves: crate::relocate::Moves::new(config.directory_store.clone()),
             health: crate::health::Health::new(config.health.clone(), &config.topology.regions),
+            peers,
         });
 
         let listener = TcpListener::bind(&config.server.listen)
@@ -157,43 +205,14 @@ impl Server {
                 source,
             })?;
 
-        let admin = match &config.admin.listen {
-            None => None,
-            Some(address) => {
-                let password = config.admin.password();
-                if password.is_none() && !config.admin.open && !is_loopback(address) {
-                    return Err(ServerError::AdminUnprotected {
-                        address: address.clone(),
-                    });
-                }
-                let admin_listener = TcpListener::bind(address).await.map_err(|source| {
-                    ServerError::AdminListen {
-                        address: address.clone(),
-                        source,
-                    }
-                })?;
-                let tls = if config.admin.tls {
-                    Some(
-                        crate::tls::acceptor(&config.tls)
-                            .map_err(ServerError::Tls)?
-                            .ok_or_else(|| {
-                                ServerError::Tls(
-                                    "admin.tls needs tls.cert_file and tls.key_file".to_owned(),
-                                )
-                            })?,
-                    )
-                } else {
-                    None
-                };
-                Some((admin_listener, password, tls))
-            }
-        };
+        let admin = bind_admin(config).await?;
 
         let mut server = Self {
             shared,
             listener,
             admin,
             prober: None,
+            visiting: false,
         };
         server.open_directory().await?;
         server.start_probing(config).await?;
@@ -277,18 +296,36 @@ impl Server {
         // A move commits the rows and the directory together; one a crash
         // left in doubt has to be finished before the directory is read, or
         // what is read may not be what was decided.
-        match self.recover().await {
-            Ok(report) if !report.still_in_doubt.is_empty() => tracing::warn!(
-                still_in_doubt = report.still_in_doubt.len(),
-                "transactions are still in doubt; the directory may be read before they resolve"
-            ),
-            Ok(_) => {}
-            Err(error) => tracing::warn!(%error, "recovery failed before loading the directory"),
-        }
+        let recovered = match self.recover().await {
+            Ok(report) if !report.still_in_doubt.is_empty() => {
+                tracing::warn!(
+                    still_in_doubt = report.still_in_doubt.len(),
+                    "transactions are still in doubt; the directory may be read before they                      resolve"
+                );
+                false
+            }
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(%error, "recovery failed before loading the directory");
+                false
+            }
+        };
         let keys = crate::relocate::load(&self.shared)
             .await
             .map_err(ServerError::Directory)?;
-        tracing::info!(keys, "loaded the directory");
+        if let Some(peers) = &self.shared.peers {
+            peers
+                .start(&self.shared, recovered)
+                .await
+                .map_err(ServerError::Directory)?;
+            tracing::info!(
+                keys = self.shared.directory.len(),
+                authority = peers.authority(),
+                "joined the shared directory"
+            );
+        } else {
+            tracing::info!(keys, "loaded the directory");
+        }
         Ok(())
     }
 
@@ -343,10 +380,22 @@ impl Server {
         self.shared.coordinator.recover(&pools).await
     }
 
+    /// Visits the shared directory in the background, if there is one.
+    fn start_peers(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.shared.peers.as_ref()?;
+        if std::mem::replace(&mut self.visiting, true) {
+            return None;
+        }
+        Some(tokio::spawn(crate::peers::Peers::run(Arc::clone(
+            &self.shared,
+        ))))
+    }
+
     /// Serves until the listener fails.
     pub async fn serve(mut self) {
         let _admin = self.start_admin();
         let _prober = self.start_prober();
+        let _peers = self.start_peers();
         loop {
             let (stream, peer) = match self.listener.accept().await {
                 Ok(accepted) => accepted,
@@ -372,6 +421,7 @@ impl Server {
         let admin_addr = self.admin_addr();
         let admin = self.start_admin();
         let prober = self.start_prober();
+        let peers = self.start_peers();
         let shared = Arc::clone(&self.shared);
         let task = tokio::spawn(self.serve());
         Ok(ServerHandle {
@@ -381,8 +431,47 @@ impl Server {
             task,
             admin,
             prober,
+            peers,
         })
     }
+}
+
+/// The admin port's listener, password and TLS, when it is configured.
+async fn bind_admin(
+    config: &Config,
+) -> Result<Option<(TcpListener, Option<String>, Option<crate::tls::Acceptor>)>, ServerError> {
+    Ok(match &config.admin.listen {
+        None => None,
+        Some(address) => {
+            let password = config.admin.password();
+            if password.is_none() && !config.admin.open && !is_loopback(address) {
+                return Err(ServerError::AdminUnprotected {
+                    address: address.clone(),
+                });
+            }
+            let admin_listener =
+                TcpListener::bind(address)
+                    .await
+                    .map_err(|source| ServerError::AdminListen {
+                        address: address.clone(),
+                        source,
+                    })?;
+            let tls = if config.admin.tls {
+                Some(
+                    crate::tls::acceptor(&config.tls)
+                        .map_err(ServerError::Tls)?
+                        .ok_or_else(|| {
+                            ServerError::Tls(
+                                "admin.tls needs tls.cert_file and tls.key_file".to_owned(),
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
+            Some((admin_listener, password, tls))
+        }
+    })
 }
 
 /// A running proxy.
@@ -397,6 +486,7 @@ pub struct ServerHandle {
     task: tokio::task::JoinHandle<()>,
     admin: Option<tokio::task::JoinHandle<()>>,
     prober: Option<tokio::task::JoinHandle<()>>,
+    peers: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ServerHandle {
@@ -433,6 +523,9 @@ impl Drop for ServerHandle {
         }
         if let Some(prober) = &self.prober {
             prober.abort();
+        }
+        if let Some(peers) = &self.peers {
+            peers.abort();
         }
     }
 }

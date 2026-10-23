@@ -60,6 +60,8 @@ pub struct Shared {
     pub moves: crate::relocate::Moves,
     /// Which backends are up, and how far replicas lag.
     pub health: crate::health::Health,
+    /// The other proxies sharing the directory, when it is shared.
+    pub peers: Option<crate::peers::Peers>,
 }
 
 impl Shared {
@@ -96,6 +98,18 @@ impl Shared {
         };
         let target = ConnectionTarget::new(endpoint, &self.backend_database, user);
         Some(self.pools.pool(&target, credentials))
+    }
+
+    /// Whether where a statement goes depends on the directory: whether it
+    /// touches a geo-partitioned table.
+    pub fn uses_directory(&self, analysis: &StatementAnalysis) -> bool {
+        let topology = self.router.topology();
+        analysis.tables.iter().any(|table| {
+            matches!(
+                topology.placement(table.schema.as_deref(), &table.name),
+                Some(luxbyte_core::topology::Placement::GeoPartitioned { .. })
+            )
+        })
     }
 
     /// Borrows a connection from `pool`. A read whose replica cannot be
@@ -581,18 +595,47 @@ impl Session {
         let moves = &self.shared.moves;
         let started = std::time::Instant::now();
         let mut counted = false;
+        let mut claims = 0_u32;
         loop {
             let changed = moves.changed();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            // Taken before planning, so that a move that begins after this
-            // point either is seen by the planner or waits for this write.
-            let ticket = analysis.access.needs_primary().then(|| moves.write());
-            let refusal = match self.shared.router.route(analysis, Some(parameters)) {
-                Routing::Ready(plan) => return (plan, ticket),
-                Routing::Held(refusal) => refusal,
+            // A proxy that cannot hear about moves cannot know where keys
+            // are; it waits for its lease to come back, then refuses.
+            let fenced = self
+                .shared
+                .peers
+                .as_ref()
+                .filter(|peers| peers.fenced() && self.shared.uses_directory(analysis));
+            let refusal = if let Some(peers) = fenced {
+                peers.fence_refusal()
+            } else {
+                // Taken before planning, so that a move that begins after
+                // this point either is seen by the planner or waits for this
+                // write.
+                let ticket = analysis.access.needs_primary().then(|| moves.write());
+                match self.shared.router.route(analysis, Some(parameters)) {
+                    Routing::Ready(plan) => return (plan, ticket),
+                    Routing::Held(refusal) => refusal,
+                    Routing::Claim(keys) => {
+                        // Not held while claiming: a move waiting for this
+                        // proxy's writes must not wait on the claim too.
+                        drop(ticket);
+                        claims = claims.saturating_add(1);
+                        let claimed = match &self.shared.peers {
+                            Some(peers) if claims <= 2 => peers.claim(&self.shared, &keys).await,
+                            _ => Err(Refusal::new(
+                                "XX000",
+                                "new keys were claimed but the statement still asks for them",
+                            )),
+                        };
+                        match claimed {
+                            Ok(()) => continue,
+                            Err(refusal) => return (Plan::Refuse(refusal), None),
+                        }
+                    }
+                }
             };
-            drop(ticket);
             // A transaction that has already done work may hold locks the
             // move is waiting for; waiting here would only stall them both.
             let busy = self

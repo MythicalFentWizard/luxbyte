@@ -54,6 +54,7 @@ pub fn handle(shared: &Shared, sql: &str) -> Option<QueryResult> {
         "SHOW DIRECTORY" => Some(show_directory(shared)),
         "SHOW IN DOUBT" => Some(show_in_doubt(shared)),
         "SHOW HEALTH" => Some(show_health(shared)),
+        "SHOW PEERS" => Some(show_peers(shared)),
         "SHOW ALERTS" => Some(table(
             &["alert", "subject", "detail"],
             crate::alerts::current(shared)
@@ -103,6 +104,55 @@ fn route(shared: &Shared, sql: &str) -> QueryResult {
         }
     }
     table(&["statement", "step", "detail"], rows)
+}
+
+/// The proxies sharing the directory, as of this proxy's last visit to the
+/// authority region, and the moves it is holding keys for.
+fn show_peers(shared: &Shared) -> QueryResult {
+    let Some(peers) = &shared.peers else {
+        return table_error("this proxy does not share its directory");
+    };
+    let mut rows: Vec<Vec<String>> = peers
+        .peers()
+        .into_iter()
+        .map(|peer| {
+            let role = if peer.node == peers.node() {
+                if peers.fenced() {
+                    "this proxy, fenced"
+                } else {
+                    "this proxy"
+                }
+            } else {
+                "peer"
+            };
+            vec![
+                peer.node,
+                role.to_owned(),
+                peer.heartbeat_age_ms.to_string(),
+                String::new(),
+            ]
+        })
+        .collect();
+    for (key, to, confirmed, held) in peers.following() {
+        rows.push(vec![
+            String::new(),
+            "holding for a move".to_owned(),
+            held.as_millis().to_string(),
+            format!(
+                "{key} to {to}, confirmed {}",
+                confirmed.map_or("nothing yet", crate::peers::Phase::as_str)
+            ),
+        ]);
+    }
+    if let Some(error) = peers.last_error() {
+        rows.push(vec![
+            String::new(),
+            "last visit failed".to_owned(),
+            String::new(),
+            error,
+        ]);
+    }
+    table(&["node", "role", "age_ms", "detail"], rows)
 }
 
 fn table_error(message: &str) -> QueryResult {

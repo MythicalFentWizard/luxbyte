@@ -78,6 +78,16 @@ listen = "127.0.0.1:9187"
 # hold_ms = 10000
 # How long a move waits for writes under way and for its locks.
 # lock_timeout_ms = 5000
+# Several proxies share this directory: moves are agreed with every live
+# proxy, new keys are claimed, and a proxy that cannot reach the others
+# stops routing on the directory. Every proxy needs its own server.node.
+# shared = false
+# Where the proxies meet; the home region when unset. All must agree.
+# authority = "eu-west"
+# How often each proxy visits the authority region.
+# poll_ms = 200
+# How long a proxy routes after its last visit before refusing.
+# lease_ms = 2000
 
 [topology]
 home_region = "eu-west"

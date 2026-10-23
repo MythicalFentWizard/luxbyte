@@ -675,3 +675,52 @@ fn copy_and_explain_of_several_regions_are_refused_rather_than_answered_for_one(
     // A global table's copy is the same in every region.
     assert_eq!(single("COPY currencies TO STDOUT"), "eu-west");
 }
+
+// ------------------------------------------------------- shared directory
+
+#[test]
+fn with_a_shared_directory_a_write_to_a_new_key_asks_for_a_claim() {
+    let router = router().claiming(true);
+    let Routing::Claim(keys) = route(
+        &router,
+        "INSERT INTO users (tenant_id, name) VALUES ('carol', 'C'), ('alice', 'A'), ('dave', 'D')",
+    ) else {
+        panic!("expected a claim");
+    };
+    // Only the keys nobody has placed; alice is known.
+    assert_eq!(
+        keys,
+        [
+            ("users".to_owned(), "carol".to_owned()),
+            ("users".to_owned(), "dave".to_owned())
+        ]
+    );
+}
+
+#[test]
+fn with_a_shared_directory_reads_and_known_keys_need_no_claim() {
+    let router = router().claiming(true);
+    // A read of a key nobody placed may find rows anywhere, and asks
+    // everywhere rather than claiming it.
+    assert!(matches!(
+        route(&router, "SELECT * FROM users WHERE tenant_id = 'carol'"),
+        Routing::Ready(Plan::ScatterGather { .. })
+    ));
+    assert!(matches!(
+        route(
+            &router,
+            "UPDATE users SET name = 'x' WHERE tenant_id = 'bob'"
+        ),
+        Routing::Ready(Plan::Single { .. })
+    ));
+    // Planning without waiting, as ROUTE and EXPLAIN do, shows the home
+    // region a new key would be claimed for.
+    let Plan::Single { region, .. } = plan_with(
+        &router,
+        "INSERT INTO users (tenant_id, name) VALUES ('carol', 'C')",
+        None,
+    ) else {
+        panic!("expected a single-region plan");
+    };
+    assert_eq!(region, "eu-west");
+}

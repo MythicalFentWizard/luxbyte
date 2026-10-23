@@ -165,8 +165,20 @@ impl Moves {
         self.store.as_ref()
     }
 
-    fn announce(&self) {
+    /// Wakes every statement waiting on a move, to plan again.
+    pub(crate) fn announce(&self) {
         self.changed.notify_waiters();
+    }
+
+    /// Starts a new generation of writes: every write planned from here on
+    /// sees the directory as it is now.
+    pub(crate) fn advance(&self) -> u64 {
+        self.gate.advance()
+    }
+
+    /// Waits up to `limit` for the writes planned before `generation`.
+    pub(crate) async fn drained(&self, generation: u64, limit: Duration) -> bool {
+        self.gate.drain(generation, limit).await
     }
 }
 
@@ -405,6 +417,12 @@ async fn run_move(shared: &Arc<Shared>, key: &str, to: &str) -> Result<Report, R
         ));
     }
 
+    // With other proxies sharing the directory, they hold the key too.
+    let announcement = match &shared.peers {
+        Some(peers) => Some(peers.announce(shared, key, to).await?),
+        None => None,
+    };
+
     // 1. Cutover: writes to the key wait from here on.
     let mut cutover = Cutover {
         shared: Arc::clone(shared),
@@ -435,15 +453,39 @@ async fn run_move(shared: &Arc<Shared>, key: &str, to: &str) -> Result<Report, R
             "try again when the database is less busy, or raise directory_store.lock_timeout_ms",
         ));
     }
+    if let Some(announcement) = &announcement {
+        announcement
+            .confirmed(crate::peers::Phase::Cutover, lock_timeout)
+            .await?;
+    }
 
-    // Where each table's rows are. A key the directory did not know may
-    // have rows anywhere, so every region is asked.
+    // Where each table's rows are: as the shared directory says, when there
+    // is one, since this proxy's copy may know less. A key the directory
+    // did not know may have rows anywhere, so every region is asked.
+    let shared_regions = match &shared.peers {
+        Some(peers) => Some(
+            peers
+                .regions_of(shared, key)
+                .await
+                .map_err(|error| fail("57P03", format!("{error}; nothing was moved")))?,
+        ),
+        None => None,
+    };
     let literal_key = literal(key);
     for part in &mut parts {
-        part.source = match shared.directory.locate(&part.name, key) {
-            Location::Known(state) => state.source().map(ToOwned::to_owned),
-            Location::Unseen => None,
+        part.source = match &shared_regions {
+            Some(regions) => regions
+                .iter()
+                .find(|(table, _)| *table == part.name)
+                .map(|(_, region)| region.clone()),
+            None => match shared.directory.locate(&part.name, key) {
+                Location::Known(state) => state.source().map(ToOwned::to_owned),
+                Location::Unseen => None,
+            },
         };
+        if shared_regions.is_some() {
+            part.settled = part.source.as_deref() == Some(to);
+        }
         if part.source.is_none() {
             part.source = find_rows(shared, part, &literal_key).await?;
             let _ = shared
@@ -495,6 +537,20 @@ async fn run_move(shared: &Arc<Shared>, key: &str, to: &str) -> Result<Report, R
         let _ = shared.directory.begin_committing(&part.name, key);
     }
     shared.moves.announce();
+    if let Some(announcement) = &announcement {
+        let agreed = match announcement.advance(crate::peers::Phase::Committing).await {
+            Ok(()) => {
+                announcement
+                    .confirmed(crate::peers::Phase::Committing, lock_timeout)
+                    .await
+            }
+            Err(refusal) => Err(refusal),
+        };
+        if let Err(refusal) = agreed {
+            let _ = transaction.rollback().await;
+            return Err(refusal);
+        }
+    }
     let outcome = transaction
         .commit()
         .await
@@ -512,8 +568,31 @@ async fn run_move(shared: &Arc<Shared>, key: &str, to: &str) -> Result<Report, R
     if !holding {
         settle(shared, &parts, key);
     }
+    // The other proxies read where the key went from the authority region,
+    // so they are let go once it has committed.
+    let authority_pending = shared
+        .peers
+        .as_ref()
+        .is_some_and(|peers| pending.iter().any(|region| region == peers.authority()));
+    let announcement = match announcement {
+        Some(announcement) if !holding && !authority_pending => {
+            let tables: Vec<String> = parts.iter().map(|part| part.name.clone()).collect();
+            announcement.moved(&tables, to);
+            None
+        }
+        other => other,
+    };
     if !pending.is_empty() {
-        finish_later(shared, gid, &pending, holding, &parts, key);
+        finish_later(
+            shared,
+            gid,
+            &pending,
+            holding,
+            &parts,
+            key,
+            to,
+            announcement,
+        );
     }
     tracing::info!(key, to, "relocated a key");
 
@@ -540,6 +619,7 @@ fn settle(shared: &Shared, parts: &[Part], key: &str) {
 
 /// Keeps asking the regions that did not acknowledge a committed move until
 /// they do, then lets the key go if it was waiting for them.
+#[allow(clippy::too_many_arguments)]
 fn finish_later(
     shared: &Arc<Shared>,
     gid: String,
@@ -547,6 +627,8 @@ fn finish_later(
     holding: bool,
     parts: &[Part],
     key: &str,
+    to: &str,
+    announcement: Option<crate::peers::Announcement>,
 ) {
     let pools: Vec<Pool> = pending
         .iter()
@@ -555,6 +637,7 @@ fn finish_later(
     let tables: Vec<String> = parts.iter().map(|part| part.name.clone()).collect();
     let shared = Arc::clone(shared);
     let key = key.to_owned();
+    let to = to.to_owned();
     tokio::spawn(async move {
         let mut wait = Duration::from_millis(250);
         loop {
@@ -569,6 +652,9 @@ fn finish_later(
                 let _ = shared.directory.finish_relocation(table, &key);
             }
             shared.moves.announce();
+        }
+        if let Some(announcement) = announcement {
+            announcement.moved(&tables, &to);
         }
         tracing::info!(%gid, "every region acknowledged a relocation");
     });
@@ -967,7 +1053,7 @@ fn affected(result: &QueryResult) -> u64 {
 
 /// A string literal that means the same whatever
 /// `standard_conforming_strings` is set to.
-fn literal(text: &str) -> String {
+pub(crate) fn literal(text: &str) -> String {
     let mut out = String::with_capacity(text.len().saturating_add(3));
     out.push_str("E'");
     for character in text.chars() {
@@ -981,11 +1067,11 @@ fn literal(text: &str) -> String {
     out
 }
 
-fn ident(name: &str) -> String {
+pub(crate) fn ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn store_table(store: &DirectoryStore) -> String {
+pub(crate) fn store_table(store: &DirectoryStore) -> String {
     match store.table.split_once('.') {
         Some((schema, table)) => format!("{}.{}", ident(schema), ident(table)),
         None => ident(&store.table),
@@ -1026,6 +1112,11 @@ pub async fn load(shared: &Shared) -> Result<usize, String> {
             }
             tracing::warn!(%region, %error, "could not create the directory table");
         }
+    }
+    // Shared, the authority region's copy is the one read, when the proxy
+    // joins the others.
+    if shared.peers.is_some() {
+        return Ok(0);
     }
 
     let pool = shared

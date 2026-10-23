@@ -238,8 +238,43 @@ guessed. A table outside the move with a foreign key onto one inside it is
 refused too, since the move would break it; foreign keys between the moved
 tables are followed, parents inserted first and deleted last.
 
-Not covered yet: several proxies sharing one directory. Each proxy reads the
-table at startup and learns of its own moves only.
+### Several proxies
+
+With `shared = true` under `[directory_store]`, several proxies — one per
+region, say — share the directory. They meet in one region, the
+`authority`, and agree there without a consensus protocol of their own:
+
+- **Leases.** Each proxy records a heartbeat every `poll_ms` and routes on its
+  directory only while its last visit is under `lease_ms` old. Past that it
+  refuses statements on geo-partitioned tables with `57P03` rather than route
+  on a directory that may be out of date (other tables carry on), and when it
+  gets through again it reads the directory whole before routing.
+- **Moves.** `RELOCATE` is announced there first. Every live proxy holds the
+  key's writes, waits for its own writes under way, and confirms; only then
+  are rows copied. Before the commit each holds reads too and confirms again.
+  A proxy that does not confirm stops the move, unless its heartbeat is more
+  than half again `lease_ms` old, by when it has stopped routing by itself.
+  If the mover dies, the others keep holding the key until it restarts,
+  finishes what it left in doubt and withdraws the announcement.
+- **New keys.** A first write to a key nobody has placed claims it there, so
+  two proxies homed in different regions cannot each create it at home.
+
+`SHOW PEERS` lists the proxies and the moves this one is holding keys for,
+and `SHOW ALERTS` reports `directory_unreachable` and `move_stalled`. Each
+proxy needs its own `server.node`; a second process with a name in use is
+refused at startup.
+
+What it costs: a small query to the authority every `poll_ms` from each
+proxy, a round trip there on the first write of each new key, and holds up
+to two polls longer while a key moves. What it does not cover: a write a
+proxy sent before its lease ran out that reaches its region more than
+`lease_ms / 2` later can land after a move it never heard of. That window is
+the price of leases instead of consensus.
+
+Against PostgreSQL 16 (two proxies, three clusters), a move through one
+proxy while the other ran pgbench incrementing the moving key's rows lost
+nothing: the rows' sum rose by exactly two per committed transaction, 43 647
+of them, none failed and none retried, and the move took 0.39 s.
 
 ## Speed
 

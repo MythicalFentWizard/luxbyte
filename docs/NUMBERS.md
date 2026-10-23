@@ -213,10 +213,13 @@ aggregates across regions that it used to refuse.
   cheaper. Which is correct depends on the application, and his default is the
   more economical one.
 - **Several proxies.** shahrah's proxies form a Raft group that agrees on the
-  topology and hears about a move at once. Luxbyte keeps its directory in a
-  table in every region, which survives restarts and changes in the same
-  transaction as the rows a move carries — but each proxy reads it at
-  startup and learns only of its own moves, so it is one proxy per directory.
+  topology and hears about a move at once. Luxbyte's proxies share a
+  directory through leases and confirmations in one authority region (see
+  the README): a move waits for every live proxy, and a proxy that loses the
+  authority stops routing on the directory. That makes the authority region
+  a dependency Raft does not have, and leaves a window — a write delayed past
+  half a lease — that consensus closes. In exchange there is no quorum to
+  keep: one proxy per region is enough.
 - **Sharding within a region.** shahrah hashes keys onto several shards inside
   each region, and `REBALANCE` moves rows between them. Luxbyte has one primary
   per region.

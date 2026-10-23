@@ -15,6 +15,7 @@ pub mod explain;
 pub mod health;
 pub mod merge;
 pub mod metrics;
+pub mod peers;
 pub mod relocate;
 pub mod server;
 pub mod session;
