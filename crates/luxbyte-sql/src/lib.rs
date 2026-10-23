@@ -58,6 +58,13 @@ pub enum StatementKind {
     Show,
     /// `CREATE`, `ALTER`, `DROP`, `TRUNCATE`.
     Ddl,
+    /// `EXPLAIN`, of the statement whose tables and keys the analysis
+    /// describes; with `ANALYZE` it runs that statement.
+    Explain,
+    /// `COPY ... TO`, of a table or a query.
+    CopyOut,
+    /// `COPY ... FROM`, into a table.
+    CopyIn,
     /// Anything else.
     Other,
 }

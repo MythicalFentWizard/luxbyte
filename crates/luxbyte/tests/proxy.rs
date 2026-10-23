@@ -855,3 +855,46 @@ async fn a_batch_across_regions_commits_in_two_phases() {
         );
     }
 }
+
+#[tokio::test]
+async fn copy_from_stdin_is_refused_instead_of_hanging() {
+    let f = fixture(&placed()).await;
+    let mut client = client(&f.proxy).await;
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.simple_query("COPY users FROM STDIN"),
+    )
+    .await
+    .expect("answered, not hung")
+    .expect_err("refused");
+    assert_eq!(error.sqlstate(), Some("0A000"), "{error}");
+    assert!(client.simple_query("SELECT 1").await.is_ok());
+}
+
+#[tokio::test]
+async fn a_large_result_streams_through_whole() {
+    let rows: Vec<Vec<Option<String>>> = (0..20_000)
+        .map(|n| vec![Some(format!("row-{n:05}")), Some("x".repeat(40))])
+        .collect();
+    let f = fixture_with(
+        BackendConfig::new("eu-west").reply_to(
+            "FROM currencies",
+            Reply::Rows {
+                columns: vec!["id".to_owned(), "padding".to_owned()],
+                rows,
+            },
+        ),
+        BackendConfig::new("us-east"),
+        BackendConfig::new("ap-south"),
+        &placed(),
+    )
+    .await;
+    let mut client = client(&f.proxy).await;
+    let result = client
+        .simple_query("SELECT * FROM currencies")
+        .await
+        .expect("all of it");
+    assert_eq!(result.rows.len(), 20_000);
+    assert_eq!(result.rows[19_999][0].as_deref(), Some("row-19999"));
+    assert_eq!(result.tags.last().map(String::as_str), Some("SELECT 20000"));
+}

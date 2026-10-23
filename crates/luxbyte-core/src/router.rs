@@ -292,6 +292,36 @@ impl Router {
             // in a region whose table does not match. So DDL goes to every
             // region, atomically.
             StatementKind::Ddl => Routing::Ready(self.distributed_over_all_regions()),
+            // The rows would arrive through a relay that does not carry them,
+            // and each would have to be placed by its key.
+            StatementKind::CopyIn => Routing::Ready(Plan::Refuse(
+                Refusal::new("0A000", "COPY FROM is not supported through the proxy")
+                    .with_hint("insert the rows with INSERT, which places each by its key"),
+            )),
+            // Each region would answer for its own rows only, and their
+            // answers cannot be joined into one.
+            StatementKind::Explain | StatementKind::CopyOut => {
+                match self.plan_data_statement(analysis, parameters) {
+                    Routing::Ready(
+                        Plan::ScatterGather { regions, .. } | Plan::Distributed { regions },
+                    ) => Routing::Ready(Plan::Refuse(
+                        Refusal::new(
+                            "0A000",
+                            format!(
+                                "{} of a statement spanning regions {} cannot be combined",
+                                if analysis.kind == StatementKind::Explain {
+                                    "EXPLAIN"
+                                } else {
+                                    "COPY"
+                                },
+                                regions.join(", ")
+                            ),
+                        )
+                        .with_hint("constrain it to one shard key"),
+                    )),
+                    other => other,
+                }
+            }
             _ => self.plan_data_statement(analysis, parameters),
         }
     }

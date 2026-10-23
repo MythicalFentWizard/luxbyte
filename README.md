@@ -428,6 +428,14 @@ refuses, it refuses with a reason:
   inside `BEGIN`/`COMMIT` both work;
 - `COPY`.
 
+A statement for one region is relayed as the backend sends it: rows are never
+decoded or held, so a large result streams through in bounded memory, and the
+column descriptions keep the table and column numbers and type modifiers that
+drivers such as JDBC read. `COPY ... TO` and `EXPLAIN` route by the table and
+key inside them, and are refused when they would span regions, since each
+region could answer only for its own rows; `COPY ... FROM` is refused, since
+its rows would have to be placed by key.
+
 Clients authenticate with SCRAM-SHA-256 against PostgreSQL's own stored
 verifiers, from the configuration or read from the home region with a bound
 parameter. With `passthrough`, the keys a client's login proved are used to

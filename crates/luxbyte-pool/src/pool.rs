@@ -356,6 +356,18 @@ impl PooledConnection {
         connection.pipeline(steps).await
     }
 
+    /// Sends a simple query without waiting; see [`Connection::send_query`].
+    pub async fn send_query(&mut self, sql: &str) -> Result<(), PoolError> {
+        let connection = self.connection.as_mut().ok_or(PoolError::Closed)?;
+        connection.send_query(sql).await
+    }
+
+    /// The next message of the answer; see [`Connection::next_reply`].
+    pub async fn next_reply(&mut self) -> Result<Option<luxbyte_proto::RawMessage>, PoolError> {
+        let connection = self.connection.as_mut().ok_or(PoolError::Closed)?;
+        connection.next_reply().await
+    }
+
     /// Which backend this connection goes to.
     #[must_use]
     pub fn target(&self) -> &ConnectionTarget {

@@ -625,3 +625,53 @@ fn literals_are_numbered_after_parameters_the_client_already_bound() {
     };
     assert_eq!(region, "us-east");
 }
+
+// ------------------------------------------------------------ COPY, EXPLAIN
+
+#[test]
+fn copy_and_explain_go_where_what_they_wrap_goes() {
+    assert_eq!(
+        single("COPY (SELECT * FROM users WHERE tenant_id = 'bob') TO STDOUT"),
+        "us-east"
+    );
+    assert_eq!(
+        single("EXPLAIN SELECT * FROM users WHERE tenant_id = 'bob'"),
+        "us-east"
+    );
+    // EXPLAIN ANALYZE runs the statement, so a write needs the primary.
+    let Plan::Single { access, .. } =
+        plan("EXPLAIN ANALYZE UPDATE users SET name = 'x' WHERE tenant_id = 'bob'")
+    else {
+        panic!("expected one region");
+    };
+    assert_eq!(access, Access::ReadWrite);
+    let Plan::Single { access, .. } =
+        plan("EXPLAIN UPDATE users SET name = 'x' WHERE tenant_id = 'bob'")
+    else {
+        panic!("expected one region");
+    };
+    assert_eq!(access, Access::ReadOnly);
+}
+
+#[test]
+fn copy_and_explain_of_several_regions_are_refused_rather_than_answered_for_one() {
+    for sql in [
+        "COPY users TO STDOUT",
+        "EXPLAIN SELECT count(*) FROM users",
+        "EXPLAIN (ANALYZE) INSERT INTO users (tenant_id) VALUES ('alice'), ('bob')",
+    ] {
+        let Plan::Refuse(refusal) = plan(sql) else {
+            panic!("{sql} should be refused");
+        };
+        assert!(
+            refusal.message.contains("cannot be combined"),
+            "{sql}: {refusal:?}"
+        );
+    }
+    let Plan::Refuse(refusal) = plan("COPY users FROM STDIN") else {
+        panic!("COPY FROM should be refused");
+    };
+    assert!(refusal.message.contains("COPY FROM"));
+    // A global table's copy is the same in every region.
+    assert_eq!(single("COPY currencies TO STDOUT"), "eu-west");
+}

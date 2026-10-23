@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sqlparser::ast::{
-    BinaryOperator, Delete, Expr, FromTable, GroupByExpr, Ident, Insert, ObjectName, OrderByKind,
-    OrderBySort, Query, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
+    BinaryOperator, CopySource, Delete, Expr, FromTable, GroupByExpr, Ident, Insert, ObjectName,
+    OrderByKind, OrderBySort, Query, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
     UnaryOperator, Update, Value, Values, Visit, visit_expressions,
 };
 use sqlparser::dialect::PostgreSqlDialect;
@@ -394,6 +394,55 @@ fn select_is_locking(query: &Query) -> bool {
 
 #[allow(clippy::too_many_lines)]
 fn analyze_statement(statement: &Statement, highest_parameter: u16) -> StatementAnalysis {
+    // EXPLAIN and COPY wrap a statement or a table; what they touch is what
+    // that does, and a router that saw no tables in them would send them
+    // anywhere.
+    match statement {
+        Statement::Explain {
+            statement: inner,
+            analyze,
+            options,
+            ..
+        } => {
+            let mut analysis = analyze_statement(inner, highest_parameter);
+            let runs = *analyze
+                || options.as_ref().is_some_and(|options| {
+                    options
+                        .iter()
+                        .any(|option| option.name.value.eq_ignore_ascii_case("analyze"))
+                });
+            if !runs {
+                analysis.access = Access::ReadOnly;
+            }
+            analysis.kind = StatementKind::Explain;
+            return analysis;
+        }
+        Statement::Copy { source, to, .. } => {
+            let mut analysis = match source {
+                CopySource::Query(query) => {
+                    analyze_statement(&Statement::Query(query.clone()), highest_parameter)
+                }
+                CopySource::Table { table_name, .. } => StatementAnalysis {
+                    kind: StatementKind::Other,
+                    access: Access::ReadOnly,
+                    tables: vec![table_from_name(table_name, None)],
+                    constraints: KeyConstraints::unconstrained(),
+                    assigned_columns: Vec::new(),
+                    highest_parameter,
+                    post_processing: PostProcessing::default(),
+                    branches: Vec::new(),
+                },
+            };
+            (analysis.kind, analysis.access) = if *to {
+                (StatementKind::CopyOut, Access::ReadOnly)
+            } else {
+                (StatementKind::CopyIn, Access::ReadWrite)
+            };
+            return analysis;
+        }
+        _ => {}
+    }
+
     let mut tables = Vec::new();
     let mut constraints = KeyConstraints::unconstrained();
     let mut assigned_columns = Vec::new();

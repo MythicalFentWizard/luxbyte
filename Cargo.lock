@@ -245,6 +245,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tinytemplate",
+ "tokio",
  "walkdir",
 ]
 
@@ -547,6 +548,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "bytes",
+ "criterion",
  "luxbyte-core",
  "luxbyte-pool",
  "luxbyte-proto",

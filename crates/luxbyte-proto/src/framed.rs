@@ -60,6 +60,12 @@ impl<S> Framed<S> {
         !self.write_buf.is_empty()
     }
 
+    /// How many bytes are staged but not yet written.
+    #[must_use]
+    pub fn pending_writes(&self) -> usize {
+        self.write_buf.len()
+    }
+
     /// Bytes buffered from the stream but not yet parsed.
     ///
     /// Non-zero after a message is read means the peer pipelined, which the

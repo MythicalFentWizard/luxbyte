@@ -545,8 +545,10 @@ impl Session {
             if outcome.is_ok() {
                 self.note_writes(writes.iter().map(String::as_str));
             }
-            if let Err(refusal) = outcome {
-                self.error(&refusal)?;
+            if let Err(failure) = outcome {
+                if let Failed::Refused(refusal) = failure {
+                    self.error(&refusal)?;
+                }
                 failed = true;
                 // A failed statement inside a transaction poisons it, as it
                 // would on a single server.
@@ -688,28 +690,92 @@ impl Session {
         analysis: &StatementAnalysis,
         sql: &str,
         plan: Plan,
-    ) -> Result<Result<(), Refusal>, SessionError> {
+    ) -> Result<Result<(), Failed>, SessionError> {
+        let refused = |outcome: Result<(), Refusal>| outcome.map_err(Failed::Refused);
         match plan {
-            Plan::Refuse(refusal) => Ok(Err(refusal)),
-            Plan::NeedsParameters { .. } => Ok(Err(Refusal {
+            Plan::Refuse(refusal) => Ok(Err(Failed::Refused(refusal))),
+            Plan::NeedsParameters { .. } => Ok(Err(Failed::Refused(Refusal {
                 sqlstate: "0A000".to_owned(),
                 message: "the shard key is a placeholder, which needs the extended query \
                           protocol"
                     .to_owned(),
                 hint: None,
                 retryable: false,
-            })),
+            }))),
             Plan::Local(intent) => self.local(intent, sql).await,
-            Plan::Single { region, access } => match self.run_on(&region, access, sql).await {
-                Ok(result) => {
-                    self.respond(&result)?;
-                    Ok(Ok(()))
-                }
-                Err(error) => Ok(Err(to_refusal(&error))),
-            },
-            Plan::ScatterGather { regions, .. } => self.scatter(&regions, sql).await,
-            Plan::Distributed { regions } => self.distributed(analysis, sql, &regions).await,
+            Plan::Single { region, access } => self.relay_on(&region, access, sql).await,
+            Plan::ScatterGather { regions, .. } => Ok(refused(self.scatter(&regions, sql).await?)),
+            Plan::Distributed { regions } => {
+                Ok(refused(self.distributed(analysis, sql, &regions).await?))
+            }
         }
+    }
+
+    /// Runs a statement in one region and passes the answer to the client
+    /// as the backend sends it: rows are never decoded, a large result is
+    /// never held in memory, and the column descriptions keep everything
+    /// PostgreSQL put in them.
+    async fn relay_on(
+        &mut self,
+        region: &str,
+        access: Access,
+        sql: &str,
+    ) -> Result<Result<(), Failed>, SessionError> {
+        let statement = self.with_settings(sql);
+        let replayed = self.settings.len();
+        self.reads = self.reads.wrapping_add(1);
+        // Inside a transaction every region is enlisted on its primary.
+        let access = if self.transaction.is_some() {
+            Access::ReadWrite
+        } else {
+            access
+        };
+        let remote = region != self.shared.router.topology().home_region;
+        self.shared.metrics.sent(region, remote);
+        let Some(pool) = self.pool_for(region, access, self.reads) else {
+            return Ok(Err(Failed::Refused(Refusal {
+                sqlstate: "08000".to_owned(),
+                message: format!("region {region} is not configured"),
+                hint: None,
+                retryable: false,
+            })));
+        };
+
+        if let Some(transaction) = self.transaction.as_mut() {
+            if let Err(error) = transaction.enlist(region, &pool).await {
+                return Ok(Err(Failed::Refused(to_refusal(&backend_error(error)))));
+            }
+            let connection = match transaction.connection(region) {
+                Ok(connection) => connection,
+                Err(error) => return Ok(Err(Failed::Refused(txn_refusal(&error)))),
+            };
+            return relay(
+                connection,
+                &mut self.client,
+                &statement,
+                replayed,
+                &self.shared.metrics,
+            )
+            .await;
+        }
+        let primary = if access.needs_primary() {
+            None
+        } else {
+            self.pool_for(region, Access::ReadWrite, 0)
+        };
+        let mut connection = match self.shared.acquire(&pool, primary.as_ref()).await {
+            Ok(connection) => connection,
+            Err(error) => return Ok(Err(Failed::Refused(to_refusal(&error)))),
+        };
+        connection.join(&self.cancel);
+        relay(
+            &mut connection,
+            &mut self.client,
+            &statement,
+            replayed,
+            &self.shared.metrics,
+        )
+        .await
     }
 
     // ------------------------------------------------------- local work
@@ -718,7 +784,7 @@ impl Session {
         &mut self,
         intent: LocalIntent,
         sql: &str,
-    ) -> Result<Result<(), Refusal>, SessionError> {
+    ) -> Result<Result<(), Failed>, SessionError> {
         match intent {
             LocalIntent::SessionState => {
                 self.record_setting(sql);
@@ -727,15 +793,11 @@ impl Session {
             }
             LocalIntent::Show => {
                 let home = self.shared.router.topology().home_region.clone();
-                match self.run_on(&home, Access::ReadOnly, sql).await {
-                    Ok(result) => {
-                        self.respond(&result)?;
-                        Ok(Ok(()))
-                    }
-                    Err(error) => Ok(Err(to_refusal(&error))),
-                }
+                self.relay_on(&home, Access::ReadOnly, sql).await
             }
-            LocalIntent::TransactionControl(op) => self.transaction_control(op).await,
+            LocalIntent::TransactionControl(op) => {
+                Ok(self.transaction_control(op).await?.map_err(Failed::Refused))
+            }
         }
     }
 
@@ -1456,6 +1518,78 @@ fn is_request(message: &luxbyte_proto::RawMessage, code: i32) -> bool {
         .get(..4)
         .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
         .is_some_and(|bytes| i32::from_be_bytes(bytes) == code)
+}
+
+/// How a statement that did not succeed ended.
+pub(crate) enum Failed {
+    /// Refused, or failed before anything reached the client, which has
+    /// still to be told.
+    Refused(Refusal),
+    /// The backend's error has been passed to the client already.
+    Reported,
+}
+
+/// How much of an answer to stage before writing it to the client, so a
+/// large result streams rather than piling up.
+const RELAY_FLUSH_BYTES: usize = 64 * 1024;
+
+/// Passes a simple query's answer from `connection` to `client` as it
+/// arrives, leaving out the answers to the `replayed` settings sent ahead
+/// of it, which the client did not ask for.
+async fn relay(
+    connection: &mut luxbyte_pool::PooledConnection,
+    client: &mut Framed<Stream>,
+    sql: &str,
+    replayed: usize,
+    metrics: &crate::metrics::Metrics,
+) -> Result<Result<(), Failed>, SessionError> {
+    if let Err(error) = connection.send_query(sql).await {
+        return Ok(Err(Failed::Refused(to_refusal(&error))));
+    }
+    let mut replayed = replayed;
+    let mut answered = false;
+    let mut failed = false;
+    loop {
+        let message = match connection.next_reply().await {
+            Ok(Some(message)) => message,
+            Ok(None) => break,
+            Err(error) => {
+                let refusal = to_refusal(&error);
+                if !answered {
+                    return Ok(Err(Failed::Refused(refusal)));
+                }
+                // Part of the answer is already with the client; an error
+                // after rows is something every client handles.
+                metrics.error(&refusal.sqlstate);
+                client.queue_raw(
+                    &build::ErrorBuilder::error(&refusal.sqlstate, refusal.message).build()?,
+                );
+                return Ok(Err(Failed::Reported));
+            }
+        };
+        if replayed > 0 && message.is(luxbyte_proto::tag::CLOSE_OR_COMMAND_COMPLETE) {
+            replayed = replayed.saturating_sub(1);
+            continue;
+        }
+        if message.is(luxbyte_proto::tag::EXECUTE_OR_ERROR) {
+            failed = true;
+            if let Ok(luxbyte_proto::backend::Backend::Error(notice)) =
+                luxbyte_proto::backend::Backend::decode(&message)
+            {
+                metrics.error(notice.code());
+            }
+        }
+        client.queue(&message)?;
+        answered = true;
+        if client.pending_writes() >= RELAY_FLUSH_BYTES {
+            client.flush().await?;
+        }
+    }
+    Ok(if failed {
+        Err(Failed::Reported)
+    } else {
+        Ok(())
+    })
 }
 
 /// The label a plan is counted under.
