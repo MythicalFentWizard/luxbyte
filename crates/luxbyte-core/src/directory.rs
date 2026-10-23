@@ -4,21 +4,23 @@
 //! different from hash sharding: it is an explicit, mutable mapping, so a key
 //! can *move* when the person behind it moves.
 //!
-//! Relocation is modelled as two phases rather than one atomic switch,
-//! because copying a key's rows between continents takes real time and the
-//! application is not allowed to stop:
+//! A move copies the key's rows to the destination, deletes them from the
+//! source and changes the mapping in one distributed transaction, so the rows
+//! are never in both regions or neither once it commits. Around that
+//! transaction the key goes through two phases:
 //!
-//! - **Copying** — rows are being streamed to the destination. The source is
-//!   still authoritative, so reads and writes both go there. Writes during
-//!   this phase are fine; the copy picks them up.
-//! - **Cutover** — the brief window where the destination is caught up and
-//!   the mapping is about to flip. Reads still go to the source. Writes are
-//!   refused with SQLSTATE `40001`, which every PostgreSQL client library
-//!   already treats as "retry this transaction".
+//! - **Cutover** — writes to the key wait. Reads still go to the source,
+//!   which holds every row and, with writes waiting, is not changing.
+//! - **Committing** — reads wait too. The regions commit one after another,
+//!   so for a moment the rows may be visible in both or in neither, and a
+//!   read in that moment would see one of those.
 //!
-//! Choosing an existing retryable SQLSTATE rather than inventing an error is
-//! deliberate: it means a correctly written application survives a
-//! relocation without being changed or even recompiled.
+//! Waiting rather than failing is deliberate: a statement held for the
+//! second a move takes costs the application nothing, where an error would
+//! cost it a retry path. Only a statement that has waited too long, or one
+//! inside a transaction that may be holding what the move needs, is refused,
+//! and then with SQLSTATE `40001`, which every client library already treats
+//! as "retry this transaction".
 
 use std::collections::BTreeMap;
 
@@ -34,8 +36,9 @@ pub enum KeyState {
     },
     /// Being moved.
     Relocating {
-        /// The region still authoritative for reads.
-        from: String,
+        /// Where the rows are until the move commits. `None` for a key that
+        /// had no directory entry, whose rows may be in any region.
+        from: Option<String>,
         /// The region it is moving to.
         to: String,
         /// How far the move has got.
@@ -44,40 +47,66 @@ pub enum KeyState {
 }
 
 /// How far a relocation has progressed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RelocationPhase {
-    /// Rows are streaming; the source still serves everything.
-    Copying,
-    /// The destination is caught up; writes pause for the flip.
+    /// Writes wait; the source still serves reads.
     Cutover,
+    /// The move is committing; reads wait as well.
+    Committing,
+}
+
+/// Where a read of a key goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reads<'a> {
+    /// One region holds every row.
+    Region(&'a str),
+    /// The rows may be in any region.
+    Everywhere,
+    /// Nowhere yet: the key is between regions.
+    Wait,
 }
 
 impl KeyState {
-    /// The region a read should go to.
+    /// Where a read should go.
     #[must_use]
-    pub fn read_region(&self) -> &str {
+    pub fn reads(&self) -> Reads<'_> {
         match self {
-            Self::Resident { region } => region,
-            // The source stays authoritative until the mapping flips, so a
-            // read never sees the half-copied destination.
-            Self::Relocating { from, .. } => from,
+            Self::Resident { region } => Reads::Region(region),
+            Self::Relocating {
+                from,
+                phase: RelocationPhase::Cutover,
+                ..
+            } => from.as_deref().map_or(Reads::Everywhere, Reads::Region),
+            Self::Relocating {
+                phase: RelocationPhase::Committing,
+                ..
+            } => Reads::Wait,
         }
     }
 
-    /// The region a write should go to, or `None` while writes are paused.
+    /// The region a write should go to, or `None` while writes wait.
     #[must_use]
     pub fn write_region(&self) -> Option<&str> {
         match self {
             Self::Resident { region } => Some(region),
-            Self::Relocating {
-                from,
-                phase: RelocationPhase::Copying,
-                ..
-            } => Some(from),
-            Self::Relocating {
-                phase: RelocationPhase::Cutover,
-                ..
-            } => None,
+            Self::Relocating { .. } => None,
+        }
+    }
+
+    /// Where the key's rows are right now, if one region is known to hold
+    /// them all.
+    #[must_use]
+    pub fn source(&self) -> Option<&str> {
+        match self {
+            Self::Resident { region } => Some(region),
+            Self::Relocating { from, .. } => from.as_deref(),
+        }
+    }
+
+    const fn phase(&self) -> Option<RelocationPhase> {
+        match self {
+            Self::Resident { .. } => None,
+            Self::Relocating { phase, .. } => Some(*phase),
         }
     }
 }
@@ -103,17 +132,12 @@ pub trait Directory: Send + Sync {
     /// Records a key as resident in a region.
     fn place(&self, table: &str, key: &str, region: &str);
 
-    /// Begins a relocation, leaving the source authoritative.
-    fn begin_relocation(&self, table: &str, key: &str, to: &str) -> Result<(), RelocationError>;
-
-    /// Moves a relocation into its cutover window, pausing writes.
-    fn begin_cutover(&self, table: &str, key: &str) -> Result<(), RelocationError>;
-
-    /// Completes a relocation, making the destination authoritative.
-    fn finish_relocation(&self, table: &str, key: &str) -> Result<(), RelocationError>;
-
-    /// Abandons a relocation, leaving the key where it was.
-    fn abort_relocation(&self, table: &str, key: &str) -> Result<(), RelocationError>;
+    /// The furthest phase any key of `table` has reached in a move, or
+    /// `None` if none of its keys is moving.
+    ///
+    /// A statement that touches every key of a table — an `UPDATE` with no
+    /// key in its `WHERE` — touches the moving ones too.
+    fn moving_in(&self, table: &str) -> Option<RelocationPhase>;
 
     /// How many keys the directory knows about.
     fn len(&self) -> usize;
@@ -128,14 +152,6 @@ pub trait Directory: Send + Sync {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RelocationError {
-    /// The key has no directory entry, so there is nothing to move.
-    #[error("key {key} of {table} has no directory entry")]
-    NotFound {
-        /// The table.
-        table: String,
-        /// The key.
-        key: String,
-    },
     /// A relocation is already running for this key.
     #[error("key {key} of {table} is already relocating to {to}")]
     AlreadyRelocating {
@@ -154,26 +170,56 @@ pub enum RelocationError {
         /// The key.
         key: String,
     },
-    /// The destination is where the key already is.
-    #[error("key {key} of {table} is already in {region}")]
-    AlreadyThere {
-        /// The table.
-        table: String,
-        /// The key.
-        key: String,
-        /// The region.
-        region: String,
-    },
+}
+
+#[derive(Debug, Default)]
+struct Entries {
+    keys: BTreeMap<(String, String), KeyState>,
+    /// For each table, how many of its keys are in each phase of a move, so
+    /// that asking whether a table has a moving key does not scan it.
+    moving: BTreeMap<String, BTreeMap<RelocationPhase, usize>>,
+}
+
+impl Entries {
+    fn count(&mut self, table: &str, phase: Option<RelocationPhase>, up: bool) {
+        let Some(phase) = phase else { return };
+        let phases = self.moving.entry(table.to_owned()).or_default();
+        let count = phases.entry(phase).or_insert(0);
+        *count = if up {
+            count.saturating_add(1)
+        } else {
+            count.saturating_sub(1)
+        };
+        if *count == 0 {
+            phases.remove(&phase);
+        }
+        if phases.is_empty() {
+            self.moving.remove(table);
+        }
+    }
+
+    fn set(&mut self, table: &str, key: &str, state: Option<KeyState>) {
+        let id = (table.to_owned(), key.to_owned());
+        let old = match state {
+            Some(state) => {
+                self.count(table, state.phase(), true);
+                self.keys.insert(id, state)
+            }
+            None => self.keys.remove(&id),
+        };
+        if let Some(old) = old {
+            self.count(table, old.phase(), false);
+        }
+    }
 }
 
 /// An in-memory directory.
 ///
-/// Durable enough for a single proxy and for tests; a deployment with
-/// several proxies replicates this mapping between them, which is the one
-/// place a consensus protocol genuinely earns its keep.
+/// The proxy keeps its working copy here, loaded from a durable store when
+/// one is configured; every lookup is a map read with no I/O.
 #[derive(Debug, Default)]
 pub struct MemoryDirectory {
-    entries: RwLock<BTreeMap<(String, String), KeyState>>,
+    entries: RwLock<Entries>,
 }
 
 impl MemoryDirectory {
@@ -200,23 +246,120 @@ impl MemoryDirectory {
     pub fn snapshot(&self) -> Vec<(String, String, KeyState)> {
         self.entries
             .read()
+            .keys
             .iter()
             .map(|((table, key), state)| (table.clone(), key.clone(), state.clone()))
             .collect()
     }
 
-    fn mutate<F>(&self, table: &str, key: &str, change: F) -> Result<(), RelocationError>
+    /// Sets a key's state outright.
+    pub fn set(&self, table: &str, key: &str, state: KeyState) {
+        self.entries.write().set(table, key, Some(state));
+    }
+
+    /// Removes a key's entry, so that it is unseen again.
+    pub fn forget(&self, table: &str, key: &str) {
+        self.entries.write().set(table, key, None);
+    }
+
+    /// Starts moving a key to `to`: writes to it wait from here on.
+    ///
+    /// A key with no entry can be moved too; its source is then unknown
+    /// until the mover finds its rows.
+    pub fn begin_relocation(
+        &self,
+        table: &str,
+        key: &str,
+        to: &str,
+    ) -> Result<(), RelocationError> {
+        let mut entries = self.entries.write();
+        let from = match entries.keys.get(&(table.to_owned(), key.to_owned())) {
+            Some(KeyState::Relocating { to: running, .. }) => {
+                return Err(RelocationError::AlreadyRelocating {
+                    table: table.to_owned(),
+                    key: key.to_owned(),
+                    to: running.clone(),
+                });
+            }
+            Some(KeyState::Resident { region }) => Some(region.clone()),
+            None => None,
+        };
+        entries.set(
+            table,
+            key,
+            Some(KeyState::Relocating {
+                from,
+                to: to.to_owned(),
+                phase: RelocationPhase::Cutover,
+            }),
+        );
+        Ok(())
+    }
+
+    /// Records where a moving key's rows were found.
+    pub fn found_source(
+        &self,
+        table: &str,
+        key: &str,
+        region: Option<&str>,
+    ) -> Result<(), RelocationError> {
+        self.advance(table, key, |from, to, phase| KeyState::Relocating {
+            from: region.map(ToOwned::to_owned).or_else(|| from.clone()),
+            to: to.to_owned(),
+            phase,
+        })
+    }
+
+    /// Moves a relocation into its commit: reads of the key wait as well.
+    pub fn begin_committing(&self, table: &str, key: &str) -> Result<(), RelocationError> {
+        self.advance(table, key, |from, to, _| KeyState::Relocating {
+            from: from.clone(),
+            to: to.to_owned(),
+            phase: RelocationPhase::Committing,
+        })
+    }
+
+    /// Completes a relocation, making the destination authoritative.
+    pub fn finish_relocation(&self, table: &str, key: &str) -> Result<(), RelocationError> {
+        self.advance(table, key, |_, to, _| KeyState::Resident {
+            region: to.to_owned(),
+        })
+    }
+
+    /// Abandons a relocation, leaving the key where it was — or unseen, if
+    /// it was unseen before.
+    pub fn abort_relocation(&self, table: &str, key: &str) -> Result<(), RelocationError> {
+        let mut entries = self.entries.write();
+        let restored = match entries.keys.get(&(table.to_owned(), key.to_owned())) {
+            Some(KeyState::Relocating { from, .. }) => {
+                from.clone().map(|region| KeyState::Resident { region })
+            }
+            _ => {
+                return Err(RelocationError::NotRelocating {
+                    table: table.to_owned(),
+                    key: key.to_owned(),
+                });
+            }
+        };
+        entries.set(table, key, restored);
+        Ok(())
+    }
+
+    fn advance<F>(&self, table: &str, key: &str, next: F) -> Result<(), RelocationError>
     where
-        F: FnOnce(&KeyState) -> Result<KeyState, RelocationError>,
+        F: FnOnce(&Option<String>, &str, RelocationPhase) -> KeyState,
     {
         let mut entries = self.entries.write();
-        let id = (table.to_owned(), key.to_owned());
-        let current = entries.get(&id).ok_or_else(|| RelocationError::NotFound {
-            table: table.to_owned(),
-            key: key.to_owned(),
-        })?;
-        let next = change(current)?;
-        entries.insert(id, next);
+        let state = match entries.keys.get(&(table.to_owned(), key.to_owned())) {
+            Some(KeyState::Relocating { from, to, phase }) => next(from, to, *phase),
+            _ => {
+                return Err(RelocationError::NotRelocating {
+                    table: table.to_owned(),
+                    key: key.to_owned(),
+                });
+            }
+        };
+        entries.set(table, key, Some(state));
         Ok(())
     }
 }
@@ -225,77 +368,31 @@ impl Directory for MemoryDirectory {
     fn locate(&self, table: &str, key: &str) -> Location {
         self.entries
             .read()
+            .keys
             .get(&(table.to_owned(), key.to_owned()))
             .map_or(Location::Unseen, |state| Location::Known(state.clone()))
     }
 
     fn place(&self, table: &str, key: &str, region: &str) {
-        self.entries.write().insert(
-            (table.to_owned(), key.to_owned()),
+        self.set(
+            table,
+            key,
             KeyState::Resident {
                 region: region.to_owned(),
             },
         );
     }
 
-    fn begin_relocation(&self, table: &str, key: &str, to: &str) -> Result<(), RelocationError> {
-        self.mutate(table, key, |current| match current {
-            KeyState::Resident { region } if region == to => Err(RelocationError::AlreadyThere {
-                table: table.to_owned(),
-                key: key.to_owned(),
-                region: region.clone(),
-            }),
-            KeyState::Resident { region } => Ok(KeyState::Relocating {
-                from: region.clone(),
-                to: to.to_owned(),
-                phase: RelocationPhase::Copying,
-            }),
-            KeyState::Relocating { to: running, .. } => Err(RelocationError::AlreadyRelocating {
-                table: table.to_owned(),
-                key: key.to_owned(),
-                to: running.clone(),
-            }),
-        })
-    }
-
-    fn begin_cutover(&self, table: &str, key: &str) -> Result<(), RelocationError> {
-        self.mutate(table, key, |current| match current {
-            KeyState::Relocating { from, to, .. } => Ok(KeyState::Relocating {
-                from: from.clone(),
-                to: to.clone(),
-                phase: RelocationPhase::Cutover,
-            }),
-            KeyState::Resident { .. } => Err(RelocationError::NotRelocating {
-                table: table.to_owned(),
-                key: key.to_owned(),
-            }),
-        })
-    }
-
-    fn finish_relocation(&self, table: &str, key: &str) -> Result<(), RelocationError> {
-        self.mutate(table, key, |current| match current {
-            KeyState::Relocating { to, .. } => Ok(KeyState::Resident { region: to.clone() }),
-            KeyState::Resident { .. } => Err(RelocationError::NotRelocating {
-                table: table.to_owned(),
-                key: key.to_owned(),
-            }),
-        })
-    }
-
-    fn abort_relocation(&self, table: &str, key: &str) -> Result<(), RelocationError> {
-        self.mutate(table, key, |current| match current {
-            KeyState::Relocating { from, .. } => Ok(KeyState::Resident {
-                region: from.clone(),
-            }),
-            KeyState::Resident { .. } => Err(RelocationError::NotRelocating {
-                table: table.to_owned(),
-                key: key.to_owned(),
-            }),
-        })
+    fn moving_in(&self, table: &str) -> Option<RelocationPhase> {
+        self.entries
+            .read()
+            .moving
+            .get(table)
+            .and_then(|phases| phases.keys().next_back().copied())
     }
 
     fn len(&self) -> usize {
-        self.entries.read().len()
+        self.entries.read().keys.len()
     }
 }
 
@@ -307,6 +404,13 @@ mod tests {
         MemoryDirectory::with_entries([("users", "alice", "eu-west")])
     }
 
+    fn state(directory: &MemoryDirectory, key: &str) -> KeyState {
+        let Location::Known(state) = directory.locate("users", key) else {
+            panic!("{key} should be known");
+        };
+        state
+    }
+
     #[test]
     fn an_unseen_key_is_reported_as_unseen_rather_than_guessed() {
         assert_eq!(directory().locate("users", "nobody"), Location::Unseen);
@@ -314,40 +418,55 @@ mod tests {
 
     #[test]
     fn a_resident_key_serves_reads_and_writes_from_its_region() {
-        let Location::Known(state) = directory().locate("users", "alice") else {
-            panic!("alice should be known");
-        };
-        assert_eq!(state.read_region(), "eu-west");
+        let state = state(&directory(), "alice");
+        assert_eq!(state.reads(), Reads::Region("eu-west"));
         assert_eq!(state.write_region(), Some("eu-west"));
     }
 
     #[test]
-    fn during_copying_the_source_still_serves_everything() {
+    fn during_cutover_reads_continue_from_the_source_but_writes_wait() {
         let directory = directory();
         directory
             .begin_relocation("users", "alice", "us-east")
             .expect("relocation should start");
-        let Location::Known(state) = directory.locate("users", "alice") else {
-            panic!("alice should be known");
-        };
-        assert_eq!(state.read_region(), "eu-west");
-        assert_eq!(state.write_region(), Some("eu-west"));
-    }
-
-    #[test]
-    fn during_cutover_reads_continue_but_writes_pause() {
-        let directory = directory();
-        directory
-            .begin_relocation("users", "alice", "us-east")
-            .expect("relocation should start");
-        directory
-            .begin_cutover("users", "alice")
-            .expect("cutover should start");
-        let Location::Known(state) = directory.locate("users", "alice") else {
-            panic!("alice should be known");
-        };
-        assert_eq!(state.read_region(), "eu-west");
+        let state = state(&directory, "alice");
+        assert_eq!(state.reads(), Reads::Region("eu-west"));
         assert_eq!(state.write_region(), None);
+        assert_eq!(directory.moving_in("users"), Some(RelocationPhase::Cutover));
+    }
+
+    #[test]
+    fn while_committing_reads_wait_too() {
+        let directory = directory();
+        directory
+            .begin_relocation("users", "alice", "us-east")
+            .expect("relocation should start");
+        directory
+            .begin_committing("users", "alice")
+            .expect("commit should start");
+        let state = state(&directory, "alice");
+        assert_eq!(state.reads(), Reads::Wait);
+        assert_eq!(state.write_region(), None);
+        assert_eq!(
+            directory.moving_in("users"),
+            Some(RelocationPhase::Committing)
+        );
+    }
+
+    #[test]
+    fn an_unseen_key_being_moved_is_read_everywhere_until_its_rows_are_found() {
+        let directory = directory();
+        directory
+            .begin_relocation("users", "ghost", "us-east")
+            .expect("an unseen key can move");
+        assert_eq!(state(&directory, "ghost").reads(), Reads::Everywhere);
+        directory
+            .found_source("users", "ghost", Some("ap-south"))
+            .expect("still relocating");
+        assert_eq!(
+            state(&directory, "ghost").reads(),
+            Reads::Region("ap-south")
+        );
     }
 
     #[test]
@@ -360,11 +479,12 @@ mod tests {
             .finish_relocation("users", "alice")
             .expect("relocation should finish");
         assert_eq!(
-            directory.locate("users", "alice"),
-            Location::Known(KeyState::Resident {
+            state(&directory, "alice"),
+            KeyState::Resident {
                 region: "us-east".to_owned()
-            })
+            }
         );
+        assert_eq!(directory.moving_in("users"), None);
     }
 
     #[test]
@@ -377,11 +497,25 @@ mod tests {
             .abort_relocation("users", "alice")
             .expect("relocation should abort");
         assert_eq!(
-            directory.locate("users", "alice"),
-            Location::Known(KeyState::Resident {
+            state(&directory, "alice"),
+            KeyState::Resident {
                 region: "eu-west".to_owned()
-            })
+            }
         );
+        assert_eq!(directory.moving_in("users"), None);
+    }
+
+    #[test]
+    fn aborting_the_move_of_an_unseen_key_leaves_it_unseen() {
+        let directory = directory();
+        directory
+            .begin_relocation("users", "ghost", "us-east")
+            .expect("an unseen key can move");
+        directory
+            .abort_relocation("users", "ghost")
+            .expect("relocation should abort");
+        assert_eq!(directory.locate("users", "ghost"), Location::Unseen);
+        assert_eq!(directory.len(), 1);
     }
 
     #[test]
@@ -401,29 +535,6 @@ mod tests {
     }
 
     #[test]
-    fn relocating_a_key_to_where_it_already_is_is_refused() {
-        assert_eq!(
-            directory().begin_relocation("users", "alice", "eu-west"),
-            Err(RelocationError::AlreadyThere {
-                table: "users".to_owned(),
-                key: "alice".to_owned(),
-                region: "eu-west".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn moving_a_key_that_does_not_exist_is_refused() {
-        assert_eq!(
-            directory().begin_relocation("users", "ghost", "us-east"),
-            Err(RelocationError::NotFound {
-                table: "users".to_owned(),
-                key: "ghost".to_owned(),
-            })
-        );
-    }
-
-    #[test]
     fn finishing_a_relocation_that_never_started_is_refused() {
         assert_eq!(
             directory().finish_relocation("users", "alice"),
@@ -432,6 +543,30 @@ mod tests {
                 key: "alice".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn a_table_counts_as_moving_until_its_last_moving_key_settles() {
+        let directory = MemoryDirectory::with_entries([
+            ("users", "alice", "eu-west"),
+            ("users", "bob", "eu-west"),
+        ]);
+        directory
+            .begin_relocation("users", "alice", "us-east")
+            .unwrap();
+        directory
+            .begin_relocation("users", "bob", "us-east")
+            .unwrap();
+        directory.begin_committing("users", "bob").unwrap();
+        assert_eq!(
+            directory.moving_in("users"),
+            Some(RelocationPhase::Committing)
+        );
+        directory.finish_relocation("users", "bob").unwrap();
+        assert_eq!(directory.moving_in("users"), Some(RelocationPhase::Cutover));
+        directory.finish_relocation("users", "alice").unwrap();
+        assert_eq!(directory.moving_in("users"), None);
+        assert_eq!(directory.moving_in("orders"), None);
     }
 
     #[test]
@@ -446,8 +581,8 @@ mod tests {
         let Location::Known(orders) = directory.locate("orders", "alice") else {
             panic!("orders.alice should be known");
         };
-        assert_eq!(users.read_region(), "eu-west");
-        assert_eq!(orders.read_region(), "us-east");
+        assert_eq!(users.reads(), Reads::Region("eu-west"));
+        assert_eq!(orders.reads(), Reads::Region("us-east"));
         assert_eq!(directory.len(), 2);
     }
 }

@@ -34,6 +34,44 @@ pub struct Config {
     /// have a directory of its own.
     #[serde(default)]
     pub directory: Vec<DirectoryEntry>,
+    /// Keep the directory in PostgreSQL, and allow `RELOCATE`.
+    #[serde(default)]
+    pub directory_store: Option<DirectoryStore>,
+}
+
+/// The `[directory_store]` section: the directory kept in a table in every
+/// region.
+///
+/// In PostgreSQL rather than a file beside the proxy, because a move changes
+/// the directory in the same transaction that moves the rows: the two
+/// commit together or not at all, and no crash can leave the rows in one
+/// region and the directory pointing at another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DirectoryStore {
+    /// The table, created in every region if it is missing. May be
+    /// qualified with a schema.
+    pub table: String,
+    /// Roles allowed to run `RELOCATE`. They have to authenticate, so with
+    /// `auth.method = "trust"` nobody can.
+    pub operators: Vec<String>,
+    /// Milliseconds a statement waits for a moving key before it is refused
+    /// with `40001`.
+    pub hold_ms: u64,
+    /// Milliseconds a move waits for the writes already under way and for
+    /// each lock it takes, before giving up and leaving everything as it was.
+    pub lock_timeout_ms: u64,
+}
+
+impl Default for DirectoryStore {
+    fn default() -> Self {
+        Self {
+            table: "luxbyte_directory".to_owned(),
+            operators: Vec::new(),
+            hold_ms: 10_000,
+            lock_timeout_ms: 5_000,
+        }
+    }
 }
 
 /// The `[tls]` section: TLS to clients.

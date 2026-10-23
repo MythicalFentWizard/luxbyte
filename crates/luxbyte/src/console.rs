@@ -163,14 +163,17 @@ fn show_directory(shared: &Shared) -> QueryResult {
     table(&["table", "key", "region", "state"], rows)
 }
 
-fn describe(state: &KeyState) -> (String, String) {
+pub(crate) fn describe(state: &KeyState) -> (String, String) {
     match state {
         KeyState::Resident { region } => (region.clone(), "resident".to_owned()),
         KeyState::Relocating { from, to, phase } => (
-            from.clone(),
+            from.clone()
+                .unwrap_or_else(|| "being looked for".to_owned()),
             match phase {
-                RelocationPhase::Copying => format!("copying to {to}"),
-                RelocationPhase::Cutover => format!("cutover to {to}, writes paused"),
+                RelocationPhase::Cutover => format!("moving to {to}; writes wait"),
+                RelocationPhase::Committing => {
+                    format!("moving to {to}; committing, reads and writes wait")
+                }
             },
         ),
     }

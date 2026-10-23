@@ -9,8 +9,7 @@
 
 use std::sync::Arc;
 
-use luxbyte_core::directory::Directory;
-use luxbyte_core::{MemoryDirectory, ParameterValues, Plan, Router, Topology};
+use luxbyte_core::{MemoryDirectory, ParameterValues, Plan, Router, Routing, Topology};
 use luxbyte_sql::{Access, MergeStrategy};
 
 const TOPOLOGY: &str = r#"
@@ -316,13 +315,28 @@ fn ddl_reaches_every_region_atomically() {
 
 // ----------------------------------------------------------------- relocation
 
-#[test]
-fn reads_continue_from_the_source_while_a_key_is_copying() {
+fn moving_alice(phase: luxbyte_core::RelocationPhase) -> Router {
     let directory = MemoryDirectory::with_entries([("users", "alice", "eu-west")]);
     directory
         .begin_relocation("users", "alice", "us-east")
         .expect("relocation should start");
-    let router = router_with(directory);
+    if phase == luxbyte_core::RelocationPhase::Committing {
+        directory
+            .begin_committing("users", "alice")
+            .expect("commit should start");
+    }
+    router_with(directory)
+}
+
+fn route(router: &Router, sql: &str) -> Routing {
+    let parsed = luxbyte_sql::analyze(sql).expect("parse");
+    let statement = parsed.first().expect("one statement");
+    router.route(statement, Some(&ParameterValues::default()))
+}
+
+#[test]
+fn reads_continue_from_the_source_during_cutover() {
+    let router = moving_alice(luxbyte_core::RelocationPhase::Cutover);
     let Plan::Single { region, .. } = plan_with(
         &router,
         "SELECT * FROM users WHERE tenant_id = 'alice'",
@@ -334,64 +348,58 @@ fn reads_continue_from_the_source_while_a_key_is_copying() {
 }
 
 #[test]
-fn writes_continue_to_the_source_while_a_key_is_copying() {
-    let directory = MemoryDirectory::with_entries([("users", "alice", "eu-west")]);
-    directory
-        .begin_relocation("users", "alice", "us-east")
-        .expect("relocation should start");
-    let router = router_with(directory);
-    let Plan::Single { region, .. } = plan_with(
-        &router,
-        "UPDATE users SET name = 'x' WHERE tenant_id = 'alice'",
-        None,
-    ) else {
-        panic!("expected a single-region plan");
-    };
-    assert_eq!(region, "eu-west");
-}
-
-#[test]
-fn a_write_during_cutover_is_refused_with_a_retryable_sqlstate() {
+fn a_write_during_cutover_is_held_and_refused_retryably_if_it_cannot_wait() {
     // `40001` is serialization_failure, which every client library already
-    // retries. A relocation therefore costs a correctly written application
-    // nothing, and no code change at all.
-    let directory = MemoryDirectory::with_entries([("users", "alice", "eu-west")]);
-    directory
-        .begin_relocation("users", "alice", "us-east")
-        .expect("relocation should start");
-    directory
-        .begin_cutover("users", "alice")
-        .expect("cutover should start");
-    let router = router_with(directory);
-    let Plan::Refuse(refusal) = plan_with(
-        &router,
-        "UPDATE users SET name = 'x' WHERE tenant_id = 'alice'",
-        None,
-    ) else {
-        panic!("expected a refusal");
+    // retries. A statement that cannot wait for a move therefore costs a
+    // correctly written application nothing, and no code change at all.
+    let router = moving_alice(luxbyte_core::RelocationPhase::Cutover);
+    let sql = "UPDATE users SET name = 'x' WHERE tenant_id = 'alice'";
+    let Routing::Held(refusal) = route(&router, sql) else {
+        panic!("expected the write to be held");
     };
     assert_eq!(refusal.sqlstate, "40001");
     assert!(refusal.retryable);
+    let Plan::Refuse(refusal) = plan_with(&router, sql, None) else {
+        panic!("expected a refusal from plan()");
+    };
+    assert_eq!(refusal.sqlstate, "40001");
 }
 
 #[test]
-fn reads_are_not_paused_during_cutover() {
-    let directory = MemoryDirectory::with_entries([("users", "alice", "eu-west")]);
-    directory
-        .begin_relocation("users", "alice", "us-east")
-        .expect("relocation should start");
-    directory
-        .begin_cutover("users", "alice")
-        .expect("cutover should start");
-    let router = router_with(directory);
-    let Plan::Single { region, .. } = plan_with(
-        &router,
-        "SELECT * FROM users WHERE tenant_id = 'alice'",
-        None,
-    ) else {
-        panic!("expected a single-region plan");
-    };
-    assert_eq!(region, "eu-west");
+fn reads_are_held_while_a_move_commits() {
+    let router = moving_alice(luxbyte_core::RelocationPhase::Committing);
+    assert!(matches!(
+        route(&router, "SELECT * FROM users WHERE tenant_id = 'alice'"),
+        Routing::Held(_)
+    ));
+    // Other keys are not affected.
+    assert!(matches!(
+        route(&router, "SELECT * FROM users WHERE tenant_id = 'bob'"),
+        Routing::Ready(_)
+    ));
+}
+
+#[test]
+fn a_write_to_every_key_waits_for_a_moving_key_but_a_read_of_every_key_waits_only_for_the_commit() {
+    let router = moving_alice(luxbyte_core::RelocationPhase::Cutover);
+    assert!(matches!(
+        route(&router, "UPDATE users SET name = 'x'"),
+        Routing::Held(_)
+    ));
+    assert!(matches!(
+        route(&router, "SELECT count(*) FROM users"),
+        Routing::Ready(_)
+    ));
+    let router = moving_alice(luxbyte_core::RelocationPhase::Committing);
+    assert!(matches!(
+        route(&router, "SELECT count(*) FROM users"),
+        Routing::Held(_)
+    ));
+    // A table with no moving key carries on.
+    assert!(matches!(
+        route(&router, "UPDATE orders SET total = 0"),
+        Routing::Ready(_)
+    ));
 }
 
 #[test]

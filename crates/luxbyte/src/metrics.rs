@@ -54,6 +54,8 @@ pub struct Metrics {
     region_statements: Mutex<BTreeMap<String, u64>>,
     combines: Mutex<BTreeMap<&'static str, u64>>,
     transactions: Mutex<BTreeMap<&'static str, u64>>,
+    relocations: Mutex<BTreeMap<&'static str, u64>>,
+    held: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -71,6 +73,8 @@ impl Default for Metrics {
             region_statements: Mutex::new(BTreeMap::new()),
             combines: Mutex::new(BTreeMap::new()),
             transactions: Mutex::new(BTreeMap::new()),
+            relocations: Mutex::new(BTreeMap::new()),
+            held: AtomicU64::new(0),
         }
     }
 }
@@ -148,6 +152,16 @@ impl Metrics {
         bump(&self.transactions, outcome);
     }
 
+    /// A `RELOCATE` ended this way.
+    pub fn relocation(&self, outcome: &'static str) {
+        bump(&self.relocations, outcome);
+    }
+
+    /// A statement waited for a moving key.
+    pub fn held(&self) {
+        self.held.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Seconds since the proxy started.
     #[must_use]
     pub fn uptime(&self) -> Duration {
@@ -195,6 +209,13 @@ impl Metrics {
         for (outcome, count) in self.transactions.lock().iter() {
             out.insert(format!("transactions_{outcome}"), *count);
         }
+        for (outcome, count) in self.relocations.lock().iter() {
+            out.insert(format!("relocations_{outcome}"), *count);
+        }
+        out.insert(
+            "held_statements_total".to_owned(),
+            self.held.load(Ordering::Relaxed),
+        );
         out
     }
 
@@ -244,6 +265,12 @@ impl Metrics {
                 "counter",
                 "Statements sent to a region other than the home region.",
                 self.remote_statements.load(Ordering::Relaxed),
+            ),
+            (
+                "luxbyte_held_statements_total",
+                "counter",
+                "Statements that waited for a key moving between regions.",
+                self.held.load(Ordering::Relaxed),
             ),
         ] {
             header(&mut out, name, kind, help);
@@ -321,6 +348,13 @@ impl Metrics {
             "Transactions, by how they ended.",
             "outcome",
             self.transactions.lock().iter().map(|(k, v)| (*k, *v)),
+        );
+        labelled(
+            out,
+            "luxbyte_relocations_total",
+            "RELOCATE commands, by how they ended.",
+            "outcome",
+            self.relocations.lock().iter().map(|(k, v)| (*k, *v)),
         );
     }
 }

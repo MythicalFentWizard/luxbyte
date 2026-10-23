@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use luxbyte_core::directory::MemoryDirectory;
 use luxbyte_core::topology::Endpoint;
-use luxbyte_core::{LocalIntent, ParameterValues, Plan, Refusal, Router};
+use luxbyte_core::{LocalIntent, ParameterValues, Plan, Refusal, Router, Routing};
 use luxbyte_pool::{
     CancelScope, ConnectionTarget, Credentials, Pool, PoolError, PoolSet, QueryResult,
 };
@@ -56,6 +56,8 @@ pub struct Shared {
     pub tls_required: bool,
     /// The aggregate functions the database lists, and when they were read.
     pub aggregates: parking_lot::Mutex<Option<(std::time::Instant, Arc<Aggregates>)>>,
+    /// Keys moving between regions, and the writes a move waits for.
+    pub moves: crate::relocate::Moves,
 }
 
 impl Shared {
@@ -117,6 +119,8 @@ pub struct Session {
     cancel: CancelScope,
     /// The cancel key this session was given, once it has one.
     key: Option<CancelRequest>,
+    /// The role the client logged in as.
+    user: String,
 }
 
 impl Drop for Session {
@@ -147,6 +151,7 @@ impl Session {
             credentials: shared.credentials.clone(),
             cancel: CancelScope::new(),
             key: None,
+            user: String::new(),
             shared,
         };
         if session.startup(&first).await? {
@@ -179,6 +184,7 @@ impl Session {
                 if !self.authenticate(&user).await? {
                     return Ok(false);
                 }
+                self.user.clone_from(&user);
                 self.client.queue_raw(&build::authentication_ok()?);
                 for (name, value) in [
                     ("server_version", "18.0 (luxbyte)"),
@@ -370,6 +376,14 @@ impl Session {
             return self.ready().await;
         }
 
+        if let Some(command) = crate::relocate::parse(sql) {
+            match self.relocate(command).await {
+                Ok(result) => self.respond(&result)?,
+                Err(refusal) => self.error(&refusal)?,
+            }
+            return self.ready().await;
+        }
+
         if let Some(result) = crate::console::handle(&self.shared, sql) {
             self.respond(&result)?;
             return self.ready().await;
@@ -435,9 +449,9 @@ impl Session {
                 break;
             }
 
-            let plan = self.shared.router.plan(analysis, Some(&parameters));
-            let kind = plan_kind(&plan);
             let started = std::time::Instant::now();
+            let (plan, _write) = self.route(analysis, &parameters).await;
+            let kind = plan_kind(&plan);
             let outcome = self.execute(analysis, text, plan).await?;
             self.shared.metrics.statement(kind, started.elapsed());
             if let Err(refusal) = outcome {
@@ -465,6 +479,102 @@ impl Session {
         }
 
         self.ready().await
+    }
+
+    /// Plans a statement, waiting while it touches a key that is moving
+    /// between regions. A write comes back with the ticket that makes a move
+    /// wait for it, to be held until the write has been answered.
+    async fn route(
+        &self,
+        analysis: &StatementAnalysis,
+        parameters: &ParameterValues,
+    ) -> (Plan, Option<crate::relocate::Ticket>) {
+        let moves = &self.shared.moves;
+        let started = std::time::Instant::now();
+        let mut counted = false;
+        loop {
+            let changed = moves.changed();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            // Taken before planning, so that a move that begins after this
+            // point either is seen by the planner or waits for this write.
+            let ticket = analysis.access.needs_primary().then(|| moves.write());
+            let refusal = match self.shared.router.route(analysis, Some(parameters)) {
+                Routing::Ready(plan) => return (plan, ticket),
+                Routing::Held(refusal) => refusal,
+            };
+            drop(ticket);
+            // A transaction that has already done work may hold locks the
+            // move is waiting for; waiting here would only stall them both.
+            let busy = self
+                .transaction
+                .as_ref()
+                .is_some_and(|transaction| !transaction.is_empty());
+            let remaining = moves.hold().saturating_sub(started.elapsed());
+            if busy || remaining.is_zero() {
+                return (Plan::Refuse(refusal), None);
+            }
+            if !counted {
+                self.shared.metrics.held();
+                counted = true;
+            }
+            if tokio::time::timeout(remaining, changed).await.is_err() {
+                return (Plan::Refuse(refusal), None);
+            }
+        }
+    }
+
+    /// Runs `RELOCATE`, for an operator.
+    async fn relocate(
+        &mut self,
+        command: Result<(String, String), String>,
+    ) -> Result<QueryResult, Refusal> {
+        let refuse = |sqlstate: &str, message: String, hint: Option<&str>| Refusal {
+            sqlstate: sqlstate.to_owned(),
+            message,
+            hint: hint.map(ToOwned::to_owned),
+            retryable: false,
+        };
+        let (key, to) = command.map_err(|usage| refuse("42601", usage, None))?;
+        let Some(store) = self.shared.moves.store() else {
+            return Err(refuse(
+                "55000",
+                "RELOCATE needs a durable directory".to_owned(),
+                Some("add a [directory_store] section"),
+            ));
+        };
+        // Moving data is an operator's act. With trust authentication any
+        // client can claim any role, so nobody qualifies.
+        if self.shared.auth.method() == crate::auth::Method::Trust {
+            return Err(refuse(
+                "42501",
+                "RELOCATE needs clients to authenticate".to_owned(),
+                Some("configure [auth], and list the operator in directory_store.operators"),
+            ));
+        }
+        if !store.operators.contains(&self.user) {
+            return Err(refuse(
+                "42501",
+                format!("role \"{}\" may not run RELOCATE", self.user),
+                Some("list it in directory_store.operators"),
+            ));
+        }
+        if self.transaction.is_some() {
+            return Err(refuse(
+                "25001",
+                "RELOCATE cannot run inside a transaction block".to_owned(),
+                None,
+            ));
+        }
+        let outcome =
+            crate::relocate::relocate(Arc::clone(&self.shared), key.clone(), to.clone()).await;
+        match &outcome {
+            Ok(_) => tracing::info!(user = %self.user, %key, %to, "RELOCATE"),
+            Err(refusal) => {
+                tracing::warn!(user = %self.user, %key, %to, error = %refusal.message, "RELOCATE refused");
+            }
+        }
+        outcome.map(|report| report.result())
     }
 
     fn blocked_by_failed_transaction(&self, analysis: &StatementAnalysis) -> bool {
@@ -1053,7 +1163,9 @@ impl Session {
         split_insert(sql, &key, move |value| {
             use luxbyte_core::directory::{Directory, Location};
             match directory.locate(&table_name, value) {
-                Location::Known(state) => state.read_region().to_owned(),
+                // A write planned before a move began still goes where the
+                // rows were; the move waits for it before taking them.
+                Location::Known(state) => state.source().unwrap_or(&home).to_owned(),
                 Location::Unseen => home.clone(),
             }
         })

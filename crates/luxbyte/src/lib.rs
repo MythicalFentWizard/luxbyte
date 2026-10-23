@@ -12,6 +12,7 @@ pub mod config;
 pub mod console;
 pub mod merge;
 pub mod metrics;
+pub mod relocate;
 pub mod server;
 pub mod session;
 pub mod split;
