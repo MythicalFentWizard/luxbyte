@@ -15,7 +15,10 @@ deliberate. A benchmark nobody can run is a benchmark nobody checks.
 
 ## Method
 
-- **Machine:** Intel Core i5-12600K, 16 logical cores, Windows 11.
+- **Machine:** Intel Core i5-12600K, 16 logical cores, Windows 11, for the
+  routing figures; the end-to-end figures and the second set of comparison
+  figures below were measured on a 4-vCPU Linux VM (Intel Xeon @ 2.80 GHz).
+  Figures from the two machines are never mixed in one ratio.
 - **Harness:** [criterion](https://github.com/bheisler/criterion.rs) 0.7, which
   warms up, takes 100 samples per benchmark, and reports a confidence interval
   rather than a single figure.
@@ -103,6 +106,21 @@ The widest gaps are where predicates get complicated — `tenant_id = 'alice' OR
 name = 'ada'` is 7.56 µs against 15.27 µs — and the narrowest is a plain
 single-row `INSERT`, at 6.68 µs against 7.88 µs.
 
+Re-measured later on the Linux VM, with the analyser grown since (it now sees
+inside `COPY` and `EXPLAIN`) and criterion's measurement time cut to three
+seconds per benchmark:
+
+| Workload | Luxbyte | shahrah | Ratio |
+|---|---|---|---|
+| Cached, 256 varying literals | **983 ns** | 3.15 µs | **3.2x** |
+| Cached, repeated statement | **933 ns** | 3.43 µs | **3.7x** |
+| Cold, median across 23 statements | — | — | **2.2x** |
+
+Cold, Luxbyte is again faster on all 23, between 1.70x (a multi-row `INSERT`,
+11.0 µs against 18.7 µs) and 3.06x (a key under `AND`, 10.4 µs against
+31.9 µs). The cold gap is wider on this machine than on the first; both are
+reported rather than either being picked.
+
 The gap widens with the cache because the two caches are doing different
 amounts of work on a hit, not because either is badly written.
 
@@ -123,37 +141,59 @@ document that quietly drops its own overstatements is not worth reading.
 ### Decisions, measured
 
 Speed is the easy comparison and the less interesting one. Given identical
-input, which statements does each project agree to run?
+input, which statements does each project agree to run? shahrah's proxy can
+also read a sharded table from every shard when the table opts into
+*broadcast*, so it is shown both ways: as configured by default, and with both
+sharded tables opted in.
 
-| Statement | Luxbyte | shahrah |
-|---|---|---|
-| point read, including reversed, aliased, cast and negative keys | one region | one region |
-| point write, insert, delete | one region | one region |
-| key under `AND` | one region | one region |
-| `count(*)` within one region | one region | one region |
-| replicated read | one region | one region |
-| **no key at all** | fan out | refused |
-| **key in an `IN` list** | fan out, 2 of 3 regions | refused |
-| **same key under `OR`** | fan out, 2 of 3 regions | refused |
-| **key `OR` unconstrained** | fan out | refused |
-| **multi-region insert** | distributed write | refused |
-| **ordered scatter** | fan out, sorted merge | refused |
-| **join within one region** | one region | refused |
-| join across regions | refused | refused |
-| `count(*)`, `sum()`, `DISTINCT` across regions | refused | refused |
+| Statement | Luxbyte | shahrah | shahrah, broadcast on |
+|---|---|---|---|
+| point read, including reversed, aliased, cast and negative keys | one region | one region | one region |
+| point write, insert, delete | one region | one region | one region |
+| key under `AND` | one region | one region | one region |
+| `count(*)` within one region | one region | one region | one region |
+| replicated read | one region | one region | one region |
+| **no key at all** | fan out | refused | fan out |
+| **key in an `IN` list** | fan out, 2 of 3 regions | refused | fan out, every shard |
+| **same key under `OR`** | fan out, 2 of 3 regions | refused | fan out, every shard |
+| **key `OR` unconstrained** | fan out | refused | fan out |
+| **`count(*)` across regions** | fan out, combined | refused | fan out, combined |
+| **ordered scatter** | fan out, sorted merge | refused | fan out, sorted merge |
+| **`sum()` across regions** | fan out, combined | refused | refused |
+| **`DISTINCT` across regions** | fan out, combined | refused | refused |
+| **multi-region insert** | distributed write | refused | refused |
+| **join within one region** | one region | refused | refused |
+| replicated write | every region, two-phase commit | writer region | writer region |
+| join across regions | refused | refused | refused |
 
-**Luxbyte runs 19 of the 23; shahrah runs 12.**
+**Of 23 statements, Luxbyte runs 22; shahrah runs 12, or 18 with broadcast
+on.** Reproduce with `cargo run --release --manifest-path compare/Cargo.toml`.
 
-Two of those rows are worth separating out:
+Three rows are worth separating out:
 
 - **`join within one region`.** shahrah refuses *any* statement touching two
   sharded tables — "more than one sharded table in one statement" — even when
   both are constrained to the same key and therefore provably in one place.
   That is a large class of ordinary application queries.
-- **Aggregates across regions.** Both refuse, but for different reasons.
-  shahrah refuses for want of a shard key; Luxbyte gets far enough to say
-  that the statement *reads three regions and cannot be merged because it
-  aggregates*. Same outcome, and one of the two errors tells you what to do.
+- **Aggregates across regions.** Luxbyte splits `count`, `sum`, `avg`, `min`,
+  `max`, `bool_and`/`bool_or`, `bit_and`/`bit_or` and `DISTINCT` into per-region
+  partials and finishes them exactly, in the proxy or in the home region's
+  PostgreSQL; aggregates it cannot split, such as `count(DISTINCT)` or a
+  percentile, are refused with the reason. shahrah's broadcast merges
+  `count(*)`, sorts and limits, and refuses the rest.
+- **`IN` and `OR` over keys.** Both fan out, but Luxbyte asks only the regions
+  holding the named keys; a broadcast asks every shard.
+
+### A second correction
+
+The previous version of this table showed shahrah refusing every read without
+a key, and Luxbyte running 19 statements to its 12. That was measured with
+shahrah's broadcast left off, because the harness called shahrah's analyser
+and broadcast is decided later, in its proxy. With broadcast on, shahrah runs
+18. The harness now applies the rule shahrah's proxy applies
+(`crates/proxy/src/session.rs` at the pinned revision) and reports both
+columns. Luxbyte's own count has also moved, to 22, because it now combines
+aggregates across regions that it used to refuse.
 
 ### Where shahrah is better
 
@@ -172,6 +212,22 @@ Two of those rows are worth separating out:
   therefore consistent on read-your-writes from any region; his is much
   cheaper. Which is correct depends on the application, and his default is the
   more economical one.
+- **Several proxies.** shahrah's proxies form a Raft group that agrees on the
+  topology and hears about a move at once. Luxbyte keeps its directory in a
+  table in every region, which survives restarts and changes in the same
+  transaction as the rows a move carries — but each proxy reads it at
+  startup and learns only of its own moves, so it is one proxy per directory.
+- **Sharding within a region.** shahrah hashes keys onto several shards inside
+  each region, and `REBALANCE` moves rows between them. Luxbyte has one primary
+  per region.
+- **Operating it.** shahrah's dashboard is live over a WebSocket, shows every
+  proxy in the group, and raises alert series; it has `DRAIN`, `TRACE`, warm
+  connections at start, and a comment to supply a key a view hides. Luxbyte's
+  admin port has metrics, a snapshot, key lookup and a static page.
+- **Measured against PostgreSQL.** shahrah reports end-to-end numbers from a
+  three-region bed with real latencies, against pgbouncer, pgcat and PgDog.
+  Luxbyte's end-to-end figures below are against its in-process test backend
+  only.
 
 ## A note on cache correctness
 
@@ -196,13 +252,34 @@ order. Both are covered by tests.
 The verification runs once per shape, so its cost disappears under any
 repeating workload. It is included in every number in this document.
 
+## End to end
+
+The same statements sent straight to a backend and through the proxy in front
+of it, both in this process over loopback TCP, on the Linux VM. The backend is
+the testkit's, not PostgreSQL, so the difference is the proxy's own work —
+parsing, routing, relaying, one extra hop on loopback — and what a real server
+adds is left out rather than guessed at.
+
+```bash
+cargo bench -p luxbyte --bench proxy
+```
+
+| | direct | through the proxy | added |
+|---|---|---|---|
+| point read, simple protocol | 65.2 µs | 86.4 µs | **21 µs** |
+| point read, prepared (`Parse`/`Bind`/`Execute`/`Sync`) | 66.2 µs | 95.3 µs | **29 µs** |
+| 10 000 rows | 5.03 ms | 6.93 ms | **1.9 ms** |
+
+Before answers from one region were relayed as they arrive, the 10 000-row
+result was decoded and re-encoded in the proxy: measured the same way on the
+same machine, it added **5.1 ms** (6.06 ms direct, 11.12 ms through the proxy).
+Point reads did not move outside noise.
+
 ## What is not measured here
 
-- End-to-end proxy throughput, latency and CPU per transaction. There is no
-  server yet.
-- Connection pooling.
-- Two-phase commit.
-- Anything against a real PostgreSQL.
+- Anything against a real PostgreSQL, and anything across real regions.
+- Throughput under many concurrent clients, and CPU per transaction.
+- Two-phase commit and `RELOCATE` against real backends.
 
-Those land with the server, measured the same way: reproducible on one machine,
-with the method written down.
+Each of those needs a testbed this document does not yet have; until then it
+says nothing about them.

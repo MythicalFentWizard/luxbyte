@@ -472,26 +472,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
-name = "memchr"
-version = "2.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
-
-[[package]]
-name = "meridian-compare"
+name = "luxbyte-compare"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "meridian-core",
- "meridian-sql",
+ "luxbyte-core",
+ "luxbyte-sql",
  "shahrah-sql",
 ]
 
 [[package]]
-name = "meridian-core"
+name = "luxbyte-core"
 version = "0.1.0"
 dependencies = [
- "meridian-sql",
+ "luxbyte-sql",
  "parking_lot",
  "serde",
  "thiserror 2.0.21",
@@ -500,7 +494,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "meridian-sql"
+name = "luxbyte-sql"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -508,6 +502,12 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
 ]
+
+[[package]]
+name = "memchr"
+version = "2.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "minimal-lexical"
