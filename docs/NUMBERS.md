@@ -217,15 +217,21 @@ aggregates across regions that it used to refuse.
   region. Both ways are there, and the cheap one keeps read-your-writes.
 - **Several proxies.** shahrah's proxies form a Raft group that agrees on the
   topology and hears about a move at once. Luxbyte's proxies share a
-  directory through leases and confirmations in one authority region (see
-  the README): a move waits for every live proxy, and a proxy that loses the
-  authority stops routing on the directory. That makes the authority region
-  a dependency Raft does not have. The window a write delayed past half a
-  lease leaves open is closed by the database instead: with `guard = true`
+  directory through leases and confirmations, either in one authority
+  region or, with `authority = "majority"`, across a majority of the
+  regions' own databases, with Paxos for new keys (see the README). In
+  majority mode no single region is a dependency: against PostgreSQL 16
+  with two proxies and three regions, stopping one region's database left
+  both routing — a key moved between the other two in 0.49 s and 43,515
+  transactions across the outage and restart had no failures — while the
+  same outage with the authority in that region refused every geo
+  statement. The quorum is the regions' databases, which a deployment
+  already runs, so there is still no separate group of proxies to keep
+  alive: one proxy per region is enough. The window a write delayed past
+  half a lease leaves open is closed by the database: with `guard = true`
   PostgreSQL refuses a write for a key in a region it has left, which no
-  agreement between proxies can do for a write already in flight (it costs
-  24–34% on single-row writes, so it is opt-in). In exchange there is no
-  quorum to keep: one proxy per region is enough.
+  agreement between proxies — Raft included — can do for a write already
+  in flight (it costs 24–34% on single-row writes, so it is opt-in).
 - **Sharding within a region.** shahrah hashes keys onto logical shards and
   moves whole ranges of them with `REBALANCE`. Luxbyte's shards are regions
   sharing a `location`: new keys spread across the home location's shards by

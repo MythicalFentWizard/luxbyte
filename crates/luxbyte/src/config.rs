@@ -77,15 +77,16 @@ pub struct DirectoryStore {
     /// stops routing on the directory when it cannot reach the others.
     pub shared: bool,
     /// The region where proxies sharing the directory meet, and whose copy
-    /// of it they read: the home region when unset. Every proxy sharing the
-    /// directory must name the same one.
+    /// of it they read: the home region when unset. `"majority"` spreads
+    /// both over every region, each step counting once a majority has it.
+    /// Every proxy sharing the directory must name the same.
     pub authority: Option<String>,
-    /// Milliseconds between a proxy's visits to the authority region.
+    /// Milliseconds between a proxy's visits.
     pub poll_ms: u64,
-    /// Milliseconds a proxy keeps routing on its directory after its last
-    /// visit to the authority region. Past that it refuses whatever depends
-    /// on the directory, and a move stops waiting for it once half as long
-    /// again has passed.
+    /// Milliseconds a proxy keeps routing on its directory after its lease
+    /// was last renewed. Past that it refuses whatever depends on the
+    /// directory, and a move stops waiting for it once half as long again
+    /// has passed.
     pub lease_ms: u64,
 }
 

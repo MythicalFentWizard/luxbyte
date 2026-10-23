@@ -549,6 +549,7 @@ dependencies = [
  "base64",
  "bytes",
  "criterion",
+ "futures-util",
  "luxbyte-core",
  "luxbyte-pool",
  "luxbyte-proto",

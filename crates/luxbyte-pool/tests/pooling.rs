@@ -693,3 +693,37 @@ async fn concurrent_borrowers_share_a_bounded_set_of_connections() {
         backend.connections_accepted()
     );
 }
+
+#[tokio::test]
+async fn a_query_abandoned_halfway_does_not_hand_its_answer_to_the_next_borrower() {
+    // The slow answer is still on its way when the caller stops waiting.
+    let backend = backend_with(
+        BackendConfig::new("eu-west")
+            .reply_to("SELECT 'slow'", Reply::rows(&["v"], &[&["slow"]]))
+            .slow_on("SELECT 'slow'", Duration::from_millis(200))
+            .reply_to("SELECT 'next'", Reply::rows(&["v"], &[&["next"]])),
+    )
+    .await;
+    let pool = pool_with(
+        &backend,
+        PoolConfig {
+            max_size: 1,
+            ..PoolConfig::default()
+        },
+    );
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(50),
+        pool.simple_query("SELECT 'slow'"),
+    )
+    .await;
+    assert!(abandoned.is_err(), "the caller gave up");
+
+    // The one connection owed an answer, so it was retired rather than
+    // reused, and the next query gets its own answer.
+    let result = pool.simple_query("SELECT 'next'").await.unwrap();
+    assert_eq!(
+        result.rows.first().and_then(|row| row.first().cloned()),
+        Some(Some("next".to_owned()))
+    );
+    assert_eq!(pool.stats().opened, 2);
+}
