@@ -41,7 +41,7 @@ use bytes::Bytes;
 use luxbyte_proto::backend::{TransactionStatus, build};
 use luxbyte_proto::frontend::{Format, Frontend, Target};
 use luxbyte_proto::startup::{SSL_REQUEST_CODE, StartupRequest};
-use luxbyte_proto::{Framed, Peer, ProtocolError};
+use luxbyte_proto::{Framed, Peer, ProtocolError, Stream};
 use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -122,6 +122,66 @@ impl Reply {
     }
 }
 
+/// A certificate authority and a server certificate it signed, made fresh
+/// for a test.
+///
+/// Signed by a separate CA rather than self-signed, so a client verifying
+/// the chain does the same work it would against a real deployment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestCertificates {
+    /// The CA certificate, PEM: what a client trusts.
+    pub ca_pem: String,
+    /// The server certificate, PEM.
+    pub cert_pem: String,
+    /// The server's private key, PEM.
+    pub key_pem: String,
+}
+
+impl TestCertificates {
+    /// A CA, and a certificate from it naming each of `names` (host names
+    /// or IP addresses).
+    pub fn generate(names: &[&str]) -> Result<Self, rcgen::Error> {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+        let ca_key = KeyPair::generate()?;
+        let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key)?;
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let server_key = KeyPair::generate()?;
+        let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+        let server_cert = CertificateParams::new(names)?.signed_by(&server_key, &issuer)?;
+        Ok(Self {
+            ca_pem: ca_cert.pem(),
+            cert_pem: server_cert.pem(),
+            key_pem: server_key.serialize_pem(),
+        })
+    }
+
+    /// A TLS acceptor presenting the server certificate.
+    pub fn acceptor(&self) -> Result<tokio_rustls::TlsAcceptor, ProtocolError> {
+        use rustls_pki_types::pem::PemObject as _;
+        let invalid = |error: &dyn std::fmt::Display| {
+            ProtocolError::Io(std::io::Error::other(error.to_string()))
+        };
+        let certificates =
+            rustls_pki_types::CertificateDer::pem_slice_iter(self.cert_pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| invalid(&error))?;
+        let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(self.key_pem.as_bytes())
+            .map_err(|error| invalid(&error))?;
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|error| invalid(&error))?
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)
+        .map_err(|error| invalid(&error))?;
+        Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+    }
+}
+
 /// How a prepared transaction ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreparedOutcome {
@@ -150,6 +210,9 @@ pub struct BackendConfig {
     pub delay_only: Option<String>,
     /// Refuse to authenticate.
     pub refuse_auth: bool,
+    /// Certificates to answer an `SSLRequest` with; without them the
+    /// backend declines TLS.
+    pub tls: Option<TestCertificates>,
     /// Roles that must authenticate with SCRAM, and their verifiers. When
     /// any are listed, every other role is refused.
     pub scram_users: Vec<(String, luxbyte_proto::auth::ScramVerifier)>,
@@ -168,6 +231,7 @@ impl BackendConfig {
             delay_only: None,
             refuse_auth: false,
             scram_users: Vec::new(),
+            tls: None,
         }
     }
 
@@ -197,6 +261,13 @@ impl BackendConfig {
     #[must_use]
     pub const fn with_delay(mut self, delay: std::time::Duration) -> Self {
         self.delay = Some(delay);
+        self
+    }
+
+    /// Accepts TLS with these certificates.
+    #[must_use]
+    pub fn with_tls(mut self, certificates: TestCertificates) -> Self {
+        self.tls = Some(certificates);
         self
     }
 
@@ -242,6 +313,7 @@ struct Observed {
     parses: AtomicU64,
     /// The role each accepted connection authenticated as.
     users: Mutex<Vec<String>>,
+    tls_connections: AtomicU64,
     /// Wakes a connection's slow statement when a cancel names its key.
     cancel_waiters: Mutex<HashMap<(i32, i32), Arc<tokio::sync::Notify>>>,
     cancels: AtomicU64,
@@ -264,6 +336,7 @@ impl Default for Observed {
             abandoned: Mutex::new(Vec::new()),
             parses: AtomicU64::new(0),
             users: Mutex::new(Vec::new()),
+            tls_connections: AtomicU64::new(0),
             cancel_waiters: Mutex::new(HashMap::new()),
             cancels: AtomicU64::new(0),
             next_process: AtomicU64::new(1_000),
@@ -396,6 +469,12 @@ impl Backend {
         self.observed.abandoned.lock().clone()
     }
 
+    /// How many connections were encrypted.
+    #[must_use]
+    pub fn tls_connections(&self) -> u64 {
+        self.observed.tls_connections.load(Ordering::SeqCst)
+    }
+
     /// How many `CancelRequest`s have arrived.
     #[must_use]
     pub fn cancels(&self) -> u64 {
@@ -473,8 +552,29 @@ async fn session(
     observed: &Observed,
 ) -> Result<(), ProtocolError> {
     stream.set_nodelay(true)?;
-    let mut framed = Framed::new(stream, Peer::Frontend);
-    let Some((key, cancelled)) = startup(&mut framed, config, observed).await? else {
+    let mut framed = Framed::new(Stream::Plain(stream), Peer::Frontend);
+    let mut first = framed.read_untagged().await?;
+    if is_ssl_request(&first) {
+        if let Some(certificates) = &config.tls {
+            framed.queue_raw(b"S");
+            framed.flush().await?;
+            let Some(plain) = framed.into_inner().into_plain() else {
+                return Ok(());
+            };
+            let Ok(encrypted) = certificates.acceptor()?.accept(plain).await else {
+                return Ok(());
+            };
+            observed.tls_connections.fetch_add(1, Ordering::SeqCst);
+            framed = Framed::new(Stream::Server(Box::new(encrypted)), Peer::Frontend);
+        } else {
+            // Decline TLS with the single byte the protocol specifies, then
+            // wait for the real startup packet.
+            framed.queue_raw(b"N");
+            framed.flush().await?;
+        }
+        first = framed.read_untagged().await?;
+    }
+    let Some((key, cancelled)) = startup(&mut framed, &first, config, observed).await? else {
         return Ok(());
     };
     let outcome = serve(&mut framed, config, observed, &cancelled).await;
@@ -490,7 +590,7 @@ async fn session(
 /// Serves statements until the client goes. Returns `true` when the backend
 /// is meant to vanish mid-statement instead.
 async fn serve(
-    framed: &mut Framed<TcpStream>,
+    framed: &mut Framed<Stream>,
     config: &BackendConfig,
     observed: &Observed,
     cancelled: &tokio::sync::Notify,
@@ -638,20 +738,12 @@ fn canceled(status: &mut TransactionStatus) -> Result<Bytes, ProtocolError> {
 /// Runs the startup phase. Returns the connection's cancel key and what a
 /// cancel wakes, when the client went on to a session.
 async fn startup(
-    framed: &mut Framed<TcpStream>,
+    framed: &mut Framed<Stream>,
+    startup: &luxbyte_proto::RawMessage,
     config: &BackendConfig,
     observed: &Observed,
 ) -> Result<Option<((i32, i32), Arc<tokio::sync::Notify>)>, ProtocolError> {
-    // The startup phase, including a possible TLS request first.
-    let mut startup = framed.read_untagged().await?;
-    if is_ssl_request(&startup) {
-        // Decline TLS with the single byte the protocol specifies, then wait
-        // for the real startup packet.
-        framed.queue_raw(b"N");
-        framed.flush().await?;
-        startup = framed.read_untagged().await?;
-    }
-    let parameters = match StartupRequest::decode(&startup)? {
+    let parameters = match StartupRequest::decode(startup)? {
         StartupRequest::Startup(parameters) => parameters,
         // A cancel names a connection by the key it was given, and wakes
         // whatever slow statement that connection is running.
@@ -733,7 +825,7 @@ async fn startup(
 /// Runs the server side of a SCRAM-SHA-256 exchange. Returns whether the
 /// client proved it holds the password.
 async fn scram(
-    framed: &mut Framed<TcpStream>,
+    framed: &mut Framed<Stream>,
     verifier: luxbyte_proto::auth::ScramVerifier,
 ) -> Result<bool, ProtocolError> {
     use luxbyte_proto::auth::{SCRAM_SHA_256, ScramServer};
@@ -814,7 +906,7 @@ impl Extended {
 
     fn fail(
         &mut self,
-        framed: &mut Framed<TcpStream>,
+        framed: &mut Framed<Stream>,
         sqlstate: &str,
         message: &str,
     ) -> Result<(), ProtocolError> {

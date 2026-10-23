@@ -9,6 +9,9 @@ authors.workspace = true
 default-run = "luxbyte"
 
 [dependencies]
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
 bytes.workspace = true
 luxbyte-core.workspace = true
 luxbyte-pool.workspace = true

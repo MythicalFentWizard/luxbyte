@@ -24,9 +24,11 @@ pub mod connection;
 pub mod error;
 pub mod pipeline;
 pub mod pool;
+pub mod tls;
 
 pub use cancel::{CancelScope, CancelTarget, send_cancel};
 pub use connection::{Connection, ConnectionTarget, Credentials, QueryResult};
 pub use error::PoolError;
 pub use pipeline::{Step, StepKind, StepReply};
 pub use pool::{Pool, PoolConfig, PoolSet, PoolStats, PooledConnection, ResetPolicy};
+pub use tls::{BackendTls, TlsMode};

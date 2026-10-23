@@ -15,6 +15,7 @@ pub mod metrics;
 pub mod server;
 pub mod session;
 pub mod split;
+pub mod tls;
 
 pub use config::{Config, ConfigError};
 pub use server::{Server, ServerHandle};

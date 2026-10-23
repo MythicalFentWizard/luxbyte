@@ -25,12 +25,27 @@ pub struct Config {
     /// The admin port: metrics, a snapshot, key lookup and a dashboard.
     #[serde(default)]
     pub admin: crate::admin::AdminConfig,
+    /// TLS to clients.
+    #[serde(default)]
+    pub tls: ClientTls,
     /// Regions and table placement.
     pub topology: Topology,
     /// Keys to seed the directory with, for a deployment that does not yet
     /// have a directory of its own.
     #[serde(default)]
     pub directory: Vec<DirectoryEntry>,
+}
+
+/// The `[tls]` section: TLS to clients.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClientTls {
+    /// The certificate chain, PEM.
+    pub cert_file: Option<PathBuf>,
+    /// Its private key, PEM.
+    pub key_file: Option<PathBuf>,
+    /// Refuse clients that do not ask for TLS, as `hostssl` does.
+    pub required: bool,
 }
 
 /// One pre-placed key.
@@ -88,6 +103,29 @@ pub struct BackendConfig {
     pub password: Option<String>,
     /// Database to connect to.
     pub database: String,
+    /// How backend connections are encrypted, with libpq's `sslmode`
+    /// names: `disable`, `prefer`, `require`, `verify-ca`, `verify-full`.
+    pub tls: SslMode,
+    /// CA certificates, PEM, to check backend certificates against.
+    /// Without one, Mozilla's roots are used.
+    pub tls_ca_file: Option<PathBuf>,
+}
+
+/// libpq's `sslmode`, as the configuration spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SslMode {
+    /// Never encrypt.
+    Disable,
+    /// Encrypt when the server offers it.
+    #[default]
+    Prefer,
+    /// Always encrypt; do not check the certificate.
+    Require,
+    /// Always encrypt; check the chain.
+    VerifyCa,
+    /// Always encrypt; check the chain and the host name.
+    VerifyFull,
 }
 
 impl Default for BackendConfig {
@@ -96,11 +134,33 @@ impl Default for BackendConfig {
             user: "postgres".to_owned(),
             password: None,
             database: "postgres".to_owned(),
+            tls: SslMode::Prefer,
+            tls_ca_file: None,
         }
     }
 }
 
 impl BackendConfig {
+    /// The TLS configuration backend connections use.
+    pub fn backend_tls(&self) -> Result<luxbyte_pool::BackendTls, String> {
+        use luxbyte_pool::TlsMode;
+        let mode = match self.tls {
+            SslMode::Disable => TlsMode::Disable,
+            SslMode::Prefer => TlsMode::Prefer,
+            SslMode::Require => TlsMode::Require,
+            SslMode::VerifyCa => TlsMode::VerifyCa,
+            SslMode::VerifyFull => TlsMode::VerifyFull,
+        };
+        let ca = match &self.tls_ca_file {
+            Some(path) => Some(
+                std::fs::read(path)
+                    .map_err(|error| format!("could not read {}: {error}", path.display()))?,
+            ),
+            None => None,
+        };
+        luxbyte_pool::BackendTls::new(mode, ca.as_deref()).map_err(|error| error.to_string())
+    }
+
     /// The credentials to authenticate with.
     #[must_use]
     pub fn credentials(&self) -> Credentials {
@@ -164,8 +224,9 @@ impl Default for PoolSettings {
 impl PoolSettings {
     /// Converts to the pool's own configuration.
     #[must_use]
-    pub fn to_pool_config(&self) -> PoolConfig {
+    pub fn to_pool_config(&self, tls: luxbyte_pool::BackendTls) -> PoolConfig {
         PoolConfig {
+            tls,
             max_size: self.max_size,
             acquire_timeout: Duration::from_millis(self.acquire_timeout_ms),
             connect_timeout: Duration::from_millis(self.connect_timeout_ms),
@@ -344,7 +405,7 @@ primary = { host = "eu.db" }
             idle_timeout_s: 60,
             ..PoolSettings::default()
         };
-        let config = settings.to_pool_config();
+        let config = settings.to_pool_config(luxbyte_pool::BackendTls::disabled());
         assert_eq!(config.acquire_timeout, Duration::from_millis(1_500));
         assert_eq!(config.idle_timeout, Duration::from_secs(60));
     }

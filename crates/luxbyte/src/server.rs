@@ -30,6 +30,9 @@ pub enum ServerError {
     /// The commit log could not be opened.
     #[error("could not open the commit log: {0}")]
     CommitLog(#[from] luxbyte_txn::TxnError),
+    /// TLS could not be set up.
+    #[error("tls: {0}")]
+    Tls(String),
     /// The `[auth]` section is invalid.
     #[error("{0}")]
     Auth(#[from] crate::auth::AuthError),
@@ -78,8 +81,8 @@ fn is_loopback(address: &str) -> bool {
 pub struct Server {
     shared: Arc<Shared>,
     listener: TcpListener,
-    /// The admin port and its password, when configured.
-    admin: Option<(TcpListener, Option<String>)>,
+    /// The admin port, its password and its TLS, when configured.
+    admin: Option<(TcpListener, Option<String>, Option<crate::tls::Acceptor>)>,
 }
 
 impl Server {
@@ -115,7 +118,11 @@ impl Server {
                 Arc::clone(&directory) as Arc<dyn Directory>,
             ),
             cache: AnalysisCache::default(),
-            pools: PoolSet::new(config.pool.to_pool_config()),
+            pools: PoolSet::new(
+                config
+                    .pool
+                    .to_pool_config(config.backend.backend_tls().map_err(ServerError::Tls)?),
+            ),
             coordinator: Coordinator::new(&config.server.node, log),
             directory,
             credentials: config.backend.credentials(),
@@ -123,6 +130,8 @@ impl Server {
             backend_database: config.backend.database.clone(),
             auth,
             cancels: crate::cancel::CancelRegistry::new(),
+            tls: crate::tls::acceptor(&config.tls).map_err(ServerError::Tls)?,
+            tls_required: config.tls.required,
             aggregates: parking_lot::Mutex::new(None),
             metrics: crate::metrics::Metrics::default(),
         });
@@ -149,7 +158,20 @@ impl Server {
                         source,
                     }
                 })?;
-                Some((admin_listener, password))
+                let tls = if config.admin.tls {
+                    Some(
+                        crate::tls::acceptor(&config.tls)
+                            .map_err(ServerError::Tls)?
+                            .ok_or_else(|| {
+                                ServerError::Tls(
+                                    "admin.tls needs tls.cert_file and tls.key_file".to_owned(),
+                                )
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                Some((admin_listener, password, tls))
             }
         };
 
@@ -164,15 +186,16 @@ impl Server {
     pub fn admin_addr(&self) -> Option<SocketAddr> {
         self.admin
             .as_ref()
-            .and_then(|(listener, _)| listener.local_addr().ok())
+            .and_then(|(listener, _, _)| listener.local_addr().ok())
     }
 
     /// Starts the admin port in the background, if it is configured.
     fn start_admin(&mut self) -> Option<tokio::task::JoinHandle<()>> {
-        let (listener, password) = self.admin.take()?;
+        let (listener, password, tls) = self.admin.take()?;
         let admin = Arc::new(crate::admin::Admin::new(
             Arc::clone(&self.shared),
             password.as_deref(),
+            tls,
         ));
         Some(tokio::spawn(crate::admin::serve(listener, admin)))
     }
