@@ -20,6 +20,8 @@ pub mod combine;
 pub mod hint;
 pub mod key;
 pub mod merge;
+#[cfg(feature = "pg-parser")]
+mod pg;
 mod scope;
 pub mod shape;
 pub mod statements;

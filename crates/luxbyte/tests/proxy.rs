@@ -284,6 +284,20 @@ async fn a_join_on_the_shard_key_runs_in_every_region_and_the_rows_are_merged() 
 }
 
 #[tokio::test]
+async fn an_insert_copying_rows_key_for_key_runs_as_it_is_in_every_region() {
+    let f = fixture(&placed()).await;
+    let mut client = client(&f.proxy).await;
+    let copy = "INSERT INTO orders (tenant_id, id) SELECT tenant_id, id + 1000 FROM orders";
+    client
+        .simple_query(copy)
+        .await
+        .expect("each region copies its own rows");
+    for backend in [&f.eu, &f.us, &f.ap] {
+        assert!(backend.saw(copy), "{}", backend.name());
+    }
+}
+
+#[tokio::test]
 async fn an_ordered_scatter_comes_back_in_order() {
     // int4 ids, so the regions' sorted rows are merged here exactly.
     let ids =

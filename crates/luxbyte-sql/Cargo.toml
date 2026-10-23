@@ -7,7 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# PostgreSQL's own parser, for statements sqlparser cannot read and to
+# check the tables it finds. Builds C code, and needs a C compiler and
+# libclang.
+pg-parser = ["dep:pg_query"]
+
 [dependencies]
+pg_query = { workspace = true, optional = true }
 serde.workspace = true
 sqlparser.workspace = true
 thiserror.workspace = true
@@ -21,4 +28,5 @@ harness = false
 workspace = true
 
 [dev-dependencies]
+pg_query.workspace = true
 criterion.workspace = true

@@ -8,6 +8,11 @@ license.workspace = true
 authors.workspace = true
 default-run = "luxbyte"
 
+[features]
+default = ["pg-parser"]
+# PostgreSQL's own parser behind sqlparser: see luxbyte-sql.
+pg-parser = ["luxbyte-sql/pg-parser"]
+
 [dependencies]
 rustls.workspace = true
 tokio-rustls.workspace = true

@@ -16,6 +16,26 @@ use crate::scope::Walker;
 use crate::{Access, SqlError, StatementAnalysis, StatementKind, TableRef, TransactionOp};
 
 pub(crate) fn analyze(sql: &str) -> Result<Vec<StatementAnalysis>, SqlError> {
+    let ours = analyze_with_sqlparser(sql);
+    // PostgreSQL's own parser checks what sqlparser read, and reads what it
+    // could not: see `crate::pg`.
+    #[cfg(feature = "pg-parser")]
+    {
+        let checked = match &ours {
+            Ok(analyses) => crate::pg::agrees(sql, analyses),
+            Err(_) => false,
+        };
+        if !checked {
+            if let Ok(theirs) = crate::pg::analyze(sql) {
+                return Ok(theirs);
+            }
+        }
+    }
+    ours
+}
+
+/// Analyses a statement with sqlparser alone.
+pub(crate) fn analyze_with_sqlparser(sql: &str) -> Result<Vec<StatementAnalysis>, SqlError> {
     let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
         .map_err(|error| SqlError::Parse(error.to_string()))?;
     let highest_parameter = scan_highest_placeholder(sql);
@@ -76,6 +96,7 @@ fn literal(value: &Value) -> Option<KeyValue> {
         | Value::NationalStringLiteral(text)
         | Value::UnicodeStringLiteral(text) => text.clone(),
         Value::Boolean(flag) => flag.to_string(),
+        Value::DollarQuotedString(quoted) => quoted.value.clone(),
         Value::Placeholder(name) => {
             // `$1` is a parameter; `?` and named placeholders are not
             // PostgreSQL and carry no position to report.
@@ -163,9 +184,37 @@ pub(crate) fn constraints_of(expr: &Expr) -> KeyConstraints {
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => constraints_of(left).and(constraints_of(right)),
             BinaryOperator::Or => constraints_of(left).or(constraints_of(right)),
-            BinaryOperator::Eq => equality(left, right),
+            BinaryOperator::Eq => match (left.as_ref(), right.as_ref()) {
+                // `(a, b) = (1, 2)` is `a = 1 AND b = 2`.
+                (Expr::Tuple(lefts), Expr::Tuple(rights)) if lefts.len() == rights.len() => lefts
+                    .iter()
+                    .zip(rights)
+                    .fold(KeyConstraints::unconstrained(), |all, (left, right)| {
+                        all.and(equality(left, right))
+                    }),
+                _ => equality(left, right),
+            },
             // Ranges, inequalities and pattern matches do not pin a key.
             // `tenant_id > 5` is a scan however it is written.
+            _ => KeyConstraints::unconstrained(),
+        },
+        // `tenant_id = ANY (ARRAY['a', 'b'])` is an IN list.
+        Expr::AnyOp {
+            left,
+            compare_op: BinaryOperator::Eq,
+            right,
+            ..
+        } => match (column_of(left), right.as_ref()) {
+            (Some(column), Expr::Array(array)) => {
+                let mut values = BTreeSet::new();
+                for item in &array.elem {
+                    let Some(value) = value_of(item) else {
+                        return KeyConstraints::unconstrained();
+                    };
+                    values.insert(value);
+                }
+                KeyConstraints::pinned_to_any_of(column, values)
+            }
             _ => KeyConstraints::unconstrained(),
         },
         Expr::InList {
@@ -369,7 +418,11 @@ fn analyze_statement(statement: &Statement, highest_parameter: u16) -> Statement
     let mut branches = Vec::new();
     let reads_rows = matches!(
         statement,
-        Statement::Query(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        Statement::Query(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+            | Statement::Merge(_)
     );
 
     let (kind, access) = match statement {
@@ -408,6 +461,36 @@ fn analyze_statement(statement: &Statement, highest_parameter: u16) -> Statement
             walker.statement(statement);
             assigned_columns = assigned(update);
             (StatementKind::Update, Access::ReadWrite)
+        }
+        // A MERGE that may insert is an INSERT whose key it does not name:
+        // run in several regions it would insert the row in each one that
+        // has no match. One that only updates or deletes is an UPDATE.
+        Statement::Merge(merge) => {
+            walker.statement(statement);
+            let inserts = merge
+                .clauses
+                .iter()
+                .any(|clause| matches!(clause.action, sqlparser::ast::MergeAction::Insert(_)));
+            for clause in &merge.clauses {
+                if let sqlparser::ast::MergeAction::Update(update) = &clause.action {
+                    if let sqlparser::ast::MergeUpdateKind::Set(assignments) = &update.kind {
+                        assigned_columns.extend(assignments.iter().filter_map(|assignment| {
+                            match &assignment.target {
+                                sqlparser::ast::AssignmentTarget::ColumnName(name) => {
+                                    name.0.last().and_then(|part| part.as_ident()).map(fold)
+                                }
+                                sqlparser::ast::AssignmentTarget::Tuple(_) => None,
+                            }
+                        }));
+                    }
+                }
+            }
+            let kind = if inserts {
+                StatementKind::Insert
+            } else {
+                StatementKind::Update
+            };
+            (kind, Access::ReadWrite)
         }
         Statement::StartTransaction { .. } => (
             StatementKind::TransactionControl(TransactionOp::Begin),
@@ -1178,5 +1261,48 @@ mod tests {
             [0, 1]
         );
         assert_eq!(one("UPDATE orders SET x = 1 FROM users").anchors, [0]);
+    }
+
+    #[test]
+    fn an_insert_select_writes_the_key_it_reads() {
+        let sql = "INSERT INTO orders (tenant_id, id, total) \
+                   SELECT tenant_id, id + 1000, total FROM orders WHERE tenant_id = 'a'";
+        let analysis = one(sql);
+        assert_eq!(names(sql), ["orders", "orders"]);
+        assert_eq!(values(sql, "orders", "tenant_id"), ["a"]);
+        assert!(analysis.links.iter().any(|link| link.left == 0
+            && link.left_column == "tenant_id"
+            && link.right == 1
+            && link.right_column == "tenant_id"));
+        // Without a column list nothing says which column is which.
+        assert!(
+            one("INSERT INTO orders SELECT * FROM orders")
+                .links
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_merge_that_only_updates_is_joined_on_its_condition() {
+        let analysis = one(
+            "MERGE INTO users u USING orders o ON u.tenant_id = o.tenant_id \
+             WHEN MATCHED THEN UPDATE SET vip = true",
+        );
+        assert_eq!(analysis.kind, StatementKind::Update);
+        assert_eq!(
+            names(
+                "MERGE INTO users u USING orders o ON u.tenant_id = o.tenant_id \
+                          WHEN MATCHED THEN DELETE"
+            ),
+            ["users", "orders"]
+        );
+        assert_eq!(analysis.anchors, [0]);
+        assert_eq!(analysis.links.len(), 1);
+        let inserting = one(
+            "MERGE INTO users u USING orders o ON u.tenant_id = o.tenant_id \
+             WHEN NOT MATCHED THEN INSERT (tenant_id) VALUES (o.tenant_id)",
+        );
+        assert_eq!(inserting.kind, StatementKind::Insert);
+        assert!(inserting.links.is_empty(), "it has to name its key");
     }
 }
