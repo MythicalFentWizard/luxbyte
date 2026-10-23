@@ -112,7 +112,9 @@ pub struct Refusal {
 }
 
 impl Refusal {
-    fn new(sqlstate: &str, message: impl Into<String>) -> Self {
+    /// A refusal with a SQLSTATE and a message.
+    #[must_use]
+    pub fn new(sqlstate: &str, message: impl Into<String>) -> Self {
         Self {
             sqlstate: sqlstate.to_owned(),
             message: message.into(),
@@ -121,7 +123,9 @@ impl Refusal {
         }
     }
 
-    fn with_hint(mut self, hint: impl Into<String>) -> Self {
+    /// Adds what to do about it.
+    #[must_use]
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
         self
     }
@@ -198,12 +202,20 @@ pub enum Routing {
     /// the move is over it routes normally; the refusal is what to say if
     /// it cannot wait.
     Held(Refusal),
+    /// It writes keys the directory has never seen, as `(table, key)`, and
+    /// the directory is shared: another proxy may be placing the same key
+    /// in its own home region, so the keys are claimed in the shared
+    /// directory first and the statement is planned again.
+    Claim(Vec<(String, String)>),
 }
 
 /// Decides where statements go.
 pub struct Router {
     topology: Topology,
     directory: Arc<dyn Directory>,
+    /// Whether a write to a key nobody has seen is claimed rather than
+    /// placed in the home region outright.
+    claims: bool,
 }
 
 impl std::fmt::Debug for Router {
@@ -212,6 +224,7 @@ impl std::fmt::Debug for Router {
             .field("home_region", &self.topology.home_region)
             .field("regions", &self.topology.regions.len())
             .field("directory_entries", &self.directory.len())
+            .field("claims", &self.claims)
             .finish()
     }
 }
@@ -238,7 +251,16 @@ impl Router {
         Self {
             topology,
             directory,
+            claims: false,
         }
+    }
+
+    /// Asks for new keys to be claimed before they are written, as a
+    /// directory several proxies share needs; see [`Routing::Claim`].
+    #[must_use]
+    pub const fn claiming(mut self, claims: bool) -> Self {
+        self.claims = claims;
+        self
     }
 
     /// The topology this router plans against.
@@ -267,10 +289,18 @@ impl Router {
     /// `40001`; [`Router::route`] tells the two apart, for a caller that can
     /// wait.
     #[must_use]
+    ///
+    /// A new key is shown in the home region, where it is placed unless
+    /// another proxy claimed it first.
     pub fn plan(&self, analysis: &StatementAnalysis, parameters: Option<&ParameterValues>) -> Plan {
-        match self.route(analysis, parameters) {
+        match self.route_with(analysis, parameters, false) {
             Routing::Ready(plan) => plan,
             Routing::Held(refusal) => Plan::Refuse(refusal),
+            // Never asked for when planning without claims.
+            Routing::Claim(_) => Plan::Refuse(Refusal::new(
+                "XX000",
+                "a statement planned without claims asked for one",
+            )),
         }
     }
 
@@ -281,6 +311,15 @@ impl Router {
         &self,
         analysis: &StatementAnalysis,
         parameters: Option<&ParameterValues>,
+    ) -> Routing {
+        self.route_with(analysis, parameters, self.claims)
+    }
+
+    fn route_with(
+        &self,
+        analysis: &StatementAnalysis,
+        parameters: Option<&ParameterValues>,
+        claims: bool,
     ) -> Routing {
         match analysis.kind {
             StatementKind::TransactionControl(op) => {
@@ -301,7 +340,7 @@ impl Router {
             // Each region would answer for its own rows only, and their
             // answers cannot be joined into one.
             StatementKind::Explain | StatementKind::CopyOut => {
-                match self.plan_data_statement(analysis, parameters) {
+                match self.plan_data_statement(analysis, parameters, claims) {
                     Routing::Ready(
                         Plan::ScatterGather { regions, .. } | Plan::Distributed { regions },
                     ) => Routing::Ready(Plan::Refuse(
@@ -322,7 +361,7 @@ impl Router {
                     other => other,
                 }
             }
-            _ => self.plan_data_statement(analysis, parameters),
+            _ => self.plan_data_statement(analysis, parameters, claims),
         }
     }
 
@@ -342,6 +381,7 @@ impl Router {
         &self,
         analysis: &StatementAnalysis,
         parameters: Option<&ParameterValues>,
+        claims: bool,
     ) -> Routing {
         let user_tables: Vec<&TableRef> = analysis
             .tables
@@ -360,6 +400,7 @@ impl Router {
 
         let mut regions: BTreeSet<String> = BTreeSet::new();
         let mut pending: BTreeSet<u16> = BTreeSet::new();
+        let mut unclaimed: Option<Vec<(String, String)>> = claims.then(Vec::new);
 
         for table in &user_tables {
             let Some(placement) = self
@@ -418,7 +459,14 @@ impl Router {
                         ));
                     }
 
-                    match self.resolve_key(analysis, table, key, parameters, &mut pending) {
+                    match self.resolve_key(
+                        analysis,
+                        table,
+                        key,
+                        parameters,
+                        &mut pending,
+                        unclaimed.as_mut(),
+                    ) {
                         KeyResolution::Regions(found) => regions.extend(found),
                         KeyResolution::Deferred => {}
                         KeyResolution::Refused(refusal) => {
@@ -430,6 +478,9 @@ impl Router {
             }
         }
 
+        if let Some(keys) = unclaimed.filter(|keys| !keys.is_empty()) {
+            return Routing::Claim(keys);
+        }
         if !pending.is_empty() {
             return Routing::Ready(Plan::NeedsParameters {
                 parameters: pending.into_iter().collect(),
@@ -509,6 +560,7 @@ impl Router {
         key: &str,
         parameters: Option<&ParameterValues>,
         pending: &mut BTreeSet<u16>,
+        mut unclaimed: Option<&mut Vec<(String, String)>>,
     ) -> KeyResolution {
         let Some(values) = analysis.shard_key_values(&table.name, key) else {
             // A statement over every key touches the moving ones too: a write
@@ -567,8 +619,12 @@ impl Router {
                     if analysis.access.needs_primary() {
                         // A key nobody has seen is created where the client
                         // is. This is the whole premise: new rows land in
-                        // the region of whoever made them.
-                        found.push(self.topology.home_region.clone());
+                        // the region of whoever made them. With proxies in
+                        // several regions, the first to claim it decides.
+                        match unclaimed.as_deref_mut() {
+                            Some(keys) => keys.push((table.name.clone(), text)),
+                            None => found.push(self.topology.home_region.clone()),
+                        }
                     } else {
                         // Reading a key with no directory entry: it may
                         // genuinely not exist, or the entry may be missing.

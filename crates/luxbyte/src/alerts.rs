@@ -4,7 +4,8 @@
 //! threshold over a counter: a backend is down, a replica is too far behind
 //! to serve reads, a server plays a role the topology does not give it, a
 //! two-phase commit is decided but not acknowledged everywhere, a move has
-//! committed but a region has not confirmed it. They are served as
+//! committed but a region has not confirmed it, the shared directory cannot
+//! be reached, another proxy's move has held a key for a long time. They are served as
 //! `luxbyte_alert` series, one per condition and subject, and by
 //! `SHOW ALERTS`.
 
@@ -12,6 +13,10 @@ use luxbyte_core::directory::{KeyState, RelocationPhase};
 
 use crate::health::State;
 use crate::session::Shared;
+
+/// How long another proxy's move may hold a key before it is worth a look:
+/// a move that takes this long has usually lost its mover.
+const STALLED: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// One condition, about one thing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +84,28 @@ pub fn current(shared: &Shared) -> Vec<Alert> {
                 record.participants.join(", ")
             ),
         });
+    }
+    if let Some(peers) = &shared.peers {
+        if peers.fenced() {
+            alerts.push(Alert {
+                name: "directory_unreachable",
+                subject: peers.authority().to_owned(),
+                detail: peers.fence_refusal().message,
+            });
+        }
+        for (key, to, _, held) in peers.following() {
+            if held > STALLED {
+                alerts.push(Alert {
+                    name: "move_stalled",
+                    subject: key,
+                    detail: format!(
+                        "another proxy has been moving it to {to} for {} s; writes to it wait \
+                         until the move is withdrawn",
+                        held.as_secs()
+                    ),
+                });
+            }
+        }
     }
     for (table, key, state) in shared.directory.snapshot() {
         if let KeyState::Relocating {

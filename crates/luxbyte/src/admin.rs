@@ -487,6 +487,7 @@ fn snapshot(shared: &Shared) -> Value {
         "in_doubt": rows_as_json(&console(shared, "SHOW IN DOUBT")),
         "health": rows_as_json(&console(shared, "SHOW HEALTH")),
         "alerts": rows_as_json(&console(shared, "SHOW ALERTS")),
+        "peers": rows_as_json(&console(shared, "SHOW PEERS")),
         "directory_keys": shared.directory.snapshot().len(),
         "statement_cache": {
             "hits": cache.hits,
@@ -743,7 +744,7 @@ fn dashboard(shared: &Shared) -> String {
          <h2>Where is a key?</h2><form action=\"/key\" method=\"get\">\
          <input name=\"table\" placeholder=\"table\" required>\
          <input name=\"key\" placeholder=\"key\" required><button>Look up</button></form>\
-         <h2>Alerts</h2>{alerts}<h2>Health</h2>{health}\
+         <h2>Alerts</h2>{alerts}<h2>Health</h2>{health}<h2>Proxies</h2>{peers}\
          <h2>Regions</h2>{regions}<h2>Pools</h2>{pools}\
          <h2>In-doubt transactions</h2>{in_doubt}</body></html>",
         home = escape_html(&shared.router.topology().home_region),
@@ -751,6 +752,7 @@ fn dashboard(shared: &Shared) -> String {
         counters = counters.join(""),
         alerts = html_table(&console(shared, "SHOW ALERTS")),
         health = html_table(&console(shared, "SHOW HEALTH")),
+        peers = html_table(&console(shared, "SHOW PEERS")),
         regions = html_table(&console(shared, "SHOW REGIONS")),
         pools = html_table(&console(shared, "SHOW POOLS")),
         in_doubt = html_table(&console(shared, "SHOW IN DOUBT")),
