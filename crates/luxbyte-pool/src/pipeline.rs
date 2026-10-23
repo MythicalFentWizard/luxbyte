@@ -7,8 +7,8 @@
 //! reads the previous borrower's rows.
 
 use bytes::Bytes;
-use luxbyte_proto::RawMessage;
 use luxbyte_proto::tag;
+use luxbyte_proto::{ProtocolError, RawMessage, frontend};
 
 /// Which extended-query message a [`Step`] carries.
 ///
@@ -70,13 +70,50 @@ pub struct Step {
     pub kind: StepKind,
     /// The message as it goes on the wire.
     pub message: Bytes,
+    /// For a `Parse` of a named statement, what it prepares.
+    pub(crate) prepares: Option<Box<Preparation>>,
+}
+
+/// A named statement a `Parse` prepares.
+///
+/// The connection records it when the server answers `ParseComplete`, and
+/// not when the step is built: a batch that was never sent, or that failed
+/// before reaching the `Parse`, then leaves no record of a statement the
+/// server does not have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Preparation {
+    pub(crate) name: String,
+    pub(crate) sql: String,
+    pub(crate) types: Vec<i32>,
 }
 
 impl Step {
     /// Pairs an encoded message with its kind.
     #[must_use]
     pub const fn new(kind: StepKind, message: Bytes) -> Self {
-        Self { kind, message }
+        Self {
+            kind,
+            message,
+            prepares: None,
+        }
+    }
+
+    /// A `Parse` of a named statement the connection should remember having
+    /// prepared, so it can be bound again without parsing.
+    ///
+    /// # Errors
+    ///
+    /// When the statement cannot be encoded, as when its text holds a NUL.
+    pub fn prepare(name: &str, sql: &str, types: &[i32]) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            kind: StepKind::Parse,
+            message: frontend::parse(name, sql, types)?,
+            prepares: Some(Box::new(Preparation {
+                name: name.to_owned(),
+                sql: sql.to_owned(),
+                types: types.to_vec(),
+            })),
+        })
     }
 }
 

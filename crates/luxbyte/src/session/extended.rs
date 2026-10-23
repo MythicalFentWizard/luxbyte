@@ -8,10 +8,20 @@
 //! batch borrows whatever pooled connection is free. Forwarding the client's
 //! `Parse` to one backend would leave the statement on a connection the next
 //! `Bind` may never see. So the proxy holds every statement and portal
-//! itself, and re-parses the statement as the backend's unnamed statement on
-//! whichever connection a `Bind` is routed to. It costs the backend a parse;
-//! it saves the client from a "prepared statement does not exist" that
-//! depends on which connection it happened to get.
+//! itself, and prepares it on whichever connection a `Bind` is routed to.
+//!
+//! A statement the client named is prepared there under a name the proxy
+//! derives from its text, and the connection remembers it, so binding it
+//! again on that connection costs no parse: once each pooled connection has
+//! seen it, a named statement runs as cheaply as it would against
+//! PostgreSQL directly. A connection's copy is only used if it was parsed
+//! after the client's own `Parse`, so a schema change behaves as it would on
+//! one server: before the client prepared, it is simply part of the
+//! statement; after, PostgreSQL replans, or refuses as it would directly
+//! when the change alters the result type. An unnamed statement stays
+//! unnamed on the backend, because a client that did not name it asked for
+//! a one-off plan, and a named one would let PostgreSQL switch to a generic
+//! plan behind its back.
 //!
 //! # Batches
 //!
@@ -106,6 +116,12 @@ enum Body {
 struct Statement {
     key: StatementKey,
     body: Body,
+    /// The name it is prepared under on backend connections, for a
+    /// statement the client named; `None` keeps it unnamed there.
+    backend_name: Option<String>,
+    /// When the client parsed it: a backend copy parsed earlier is not
+    /// used.
+    parsed_at: std::time::Instant,
 }
 
 impl Statement {
@@ -203,6 +219,11 @@ struct Lane {
     /// What the backend's unnamed statement holds, so a statement bound
     /// many times in one batch is parsed once.
     unnamed: Option<StatementKey>,
+    /// The named statements queued steps use since the last send, with
+    /// what each holds: one prepared earlier in the same batch is not
+    /// prepared twice, and if the server says it lost one they are
+    /// forgotten.
+    named: Vec<(String, StatementKey)>,
 }
 
 impl Lane {
@@ -214,8 +235,20 @@ impl Lane {
             backlog: Backlog::Clean,
             prepared_settings: false,
             unnamed: None,
+            named: Vec::new(),
         }
     }
+}
+
+/// Whether a lane's connection holds a named statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// It does; bind it as it is.
+    Already,
+    /// It does not, and will once the queued `Parse` runs.
+    Now,
+    /// It holds as many as it should; parse this one unnamed.
+    Unnamed,
 }
 
 /// What to pass on from a step's answer.
@@ -416,9 +449,13 @@ impl Session {
             }
         };
 
+        let backend_name = (!parse.name.is_empty() && matches!(body, Body::Sql(_)))
+            .then(|| backend_name(parse.sql, &parse.parameter_types));
         let statement = Arc::new(Statement {
             key: (parse.sql.to_owned(), parse.parameter_types.clone()),
             body,
+            backend_name,
+            parsed_at: std::time::Instant::now(),
         });
         let previous = self
             .extended
@@ -452,11 +489,11 @@ impl Session {
         };
 
         if let Destination::Backend(lane) = &destination {
-            self.queue_parse(sequence, lane, &statement).await?;
+            let name = self.queue_parse(sequence, lane, &statement).await?;
             self.queue(
                 sequence,
                 lane,
-                Step::new(StepKind::Bind, bind.encode_from("")?),
+                Step::new(StepKind::Bind, bind.encode_from(&name)?),
                 Relay::Answer,
                 None,
             )
@@ -658,10 +695,10 @@ impl Session {
             }
             participant
         };
-        self.queue_parse(sequence, &lane, &statement).await?;
+        let name = self.queue_parse(sequence, &lane, &statement).await?;
         let step = Step::new(
             StepKind::DescribeStatement,
-            frontend::describe(Target::Statement, "")?,
+            frontend::describe(Target::Statement, &name)?,
         );
         self.queue(
             sequence,
@@ -1574,18 +1611,40 @@ impl Session {
     }
 
     /// Queues the `Parse` a statement needs on a lane, unless the lane's
-    /// unnamed statement already holds it.
+    /// connection already holds it, and returns the name the backend knows
+    /// it by.
     async fn queue_parse(
         &mut self,
         sequence: u64,
         lane: &LaneId,
         statement: &Statement,
-    ) -> Result<(), SessionError> {
+    ) -> Result<String, SessionError> {
         self.switch_to(lane).await?;
         if self.extended.skipping {
-            return Ok(());
+            return Ok(String::new());
         }
         self.queue_settings(sequence, lane)?;
+        if let Some(name) = &statement.backend_name {
+            match self.prepared_on(lane, name, statement) {
+                Held::Already => return Ok(name.clone()),
+                Held::Now => {
+                    // The server may hold a statement by this name: one
+                    // parsed before the client's, or one the connection
+                    // forgot; closing a statement that does not exist is not
+                    // an error, while preparing one that does is.
+                    self.push_step(
+                        sequence,
+                        Step::new(StepKind::Close, frontend::close(Target::Statement, name)?),
+                        Relay::Quiet,
+                        None,
+                    );
+                    let step = Step::prepare(name, statement.sql(), statement.declared())?;
+                    self.push_step(sequence, step, Relay::Quiet, None);
+                    return Ok(name.clone());
+                }
+                Held::Unnamed => {}
+            }
+        }
         let parsed = self
             .extended
             .lane_mut(lane)
@@ -1600,7 +1659,73 @@ impl Session {
                 state.unnamed = Some(statement.key.clone());
             }
         }
-        Ok(())
+        Ok(String::new())
+    }
+
+    /// Whether a lane's connection holds `statement` as `name`, or will once
+    /// what is queued for it runs.
+    fn prepared_on(&mut self, lane: &LaneId, name: &str, statement: &Statement) -> Held {
+        let mut lanes = std::mem::take(&mut self.extended.lanes);
+        let held =
+            lanes
+                .iter_mut()
+                .find(|state| &state.id == lane)
+                .map_or(Held::Unnamed, |state| {
+                    if let Some((_, key)) = state.named.iter().find(|(queued, _)| queued == name) {
+                        // Another statement hashing to the same name is not
+                        // this one; it goes unnamed rather than wrong.
+                        return if *key == statement.key {
+                            Held::Already
+                        } else {
+                            Held::Unnamed
+                        };
+                    }
+                    let held = match self.lane_connection(state) {
+                        Some(connection)
+                            if connection.holds_statement(
+                                name,
+                                statement.sql(),
+                                statement.declared(),
+                                statement.parsed_at,
+                            ) =>
+                        {
+                            Held::Already
+                        }
+                        Some(connection) if connection.can_prepare(name) => Held::Now,
+                        _ => Held::Unnamed,
+                    };
+                    if held != Held::Unnamed {
+                        state.named.push((name.to_owned(), statement.key.clone()));
+                    }
+                    held
+                });
+        self.extended.lanes = lanes;
+        held
+    }
+
+    /// Makes a lane's connection forget the named statements its last
+    /// batch used.
+    ///
+    /// Called when the server said one of them does not exist, which it can
+    /// only say if something dropped it unseen; preparing them again costs
+    /// a parse each. Other errors leave them alone: a statement whose plan
+    /// a schema change broke keeps failing until the client prepares it
+    /// again, as it would on one server.
+    fn forget_statements(&mut self, lane: &LaneId, names: &[(String, StatementKey)]) {
+        if names.is_empty() {
+            return;
+        }
+        let mut lanes = std::mem::take(&mut self.extended.lanes);
+        if let Some(connection) = lanes
+            .iter_mut()
+            .find(|state| &state.id == lane)
+            .and_then(|state| self.lane_connection(state))
+        {
+            for (name, _) in names {
+                connection.forget_statement(name);
+            }
+        }
+        self.extended.lanes = lanes;
     }
 
     /// Queues a step on a lane.
@@ -1698,12 +1823,14 @@ impl Session {
     async fn flush_to(&mut self, id: &LaneId, synced: bool) -> Result<(), SessionError> {
         let steps = std::mem::take(&mut self.extended.steps);
         self.extended.pending_lane = None;
+        let mut named = Vec::new();
         let replies = if steps.is_empty() {
             Ok(Vec::new())
         } else {
             let mut lanes = std::mem::take(&mut self.extended.lanes);
             let outcome = match lanes.iter_mut().find(|lane| &lane.id == id) {
                 Some(lane) => {
+                    named = std::mem::take(&mut lane.named);
                     lane.backlog = if synced {
                         Backlog::Clean
                     } else {
@@ -1732,7 +1859,14 @@ impl Session {
                 return self.deliver(&[], Some(&refusal)).map(|_| ());
             }
         };
-        if self.deliver(&replies, None)?.is_some() {
+        if let Some(index) = self.deliver(&replies, None)? {
+            if replies
+                .get(index)
+                .and_then(sqlstate)
+                .is_some_and(|code| code == "26000")
+            {
+                self.forget_statements(id, &named);
+            }
             if let Some(lane) = self.extended.lane_mut(id) {
                 // Once its `Sync` is answered the backend has rolled back and
                 // is ready again; before that it is discarding until one.
@@ -1790,12 +1924,7 @@ impl Session {
                         self.learn(&key, reply);
                     }
                     if reply.failed {
-                        if let Some(code) = reply.messages.iter().find_map(|message| {
-                            match Backend::decode(message) {
-                                Ok(Backend::Error(notice)) => Some(notice.code().to_owned()),
-                                _ => None,
-                            }
-                        }) {
+                        if let Some(code) = sqlstate(reply) {
                             self.shared.metrics.error(&code);
                         }
                         self.fail_from(sequence);
@@ -1837,6 +1966,10 @@ impl Session {
         self.extended.journal.clear();
         self.extended.outputs.clear();
         self.extended.steps.clear();
+        // The statements those steps would have prepared never were.
+        for lane in &mut self.extended.lanes {
+            lane.named.clear();
+        }
         self.extended.pending_lane = None;
         self.extended.skipping = true;
         self.extended.batch_failed = true;
@@ -1844,6 +1977,17 @@ impl Session {
             self.status = TransactionStatus::Failed;
         }
     }
+}
+
+/// The SQLSTATE of the error in a step's answer, if it has one.
+fn sqlstate(reply: &StepReply) -> Option<String> {
+    reply
+        .messages
+        .iter()
+        .find_map(|message| match Backend::decode(message) {
+            Ok(Backend::Error(notice)) => Some(notice.code().to_owned()),
+            _ => None,
+        })
 }
 
 fn restore<T>(map: &mut HashMap<String, T>, name: String, previous: Option<T>) {
@@ -1866,6 +2010,21 @@ fn failure(replies: &[StepReply]) -> Option<Refusal> {
             Ok(Backend::Error(notice)) => Some(plain(notice.code(), notice.message())),
             _ => None,
         })
+}
+
+/// The name a client's named statement is prepared under on a backend.
+///
+/// Derived from the text and declared types rather than the client's name,
+/// so sessions preparing the same statement share it on a connection, and a
+/// client reusing a name for different text gets a different one. Two
+/// statements hashing alike cost a re-parse, never a wrong statement: the
+/// connection checks the text before skipping the parse.
+fn backend_name(sql: &str, types: &[i32]) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    sql.hash(&mut hasher);
+    types.hash(&mut hasher);
+    format!("luxbyte_{:016x}", hasher.finish())
 }
 
 /// A string literal that means the same whatever

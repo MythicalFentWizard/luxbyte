@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -366,6 +366,29 @@ impl PooledConnection {
     pub async fn next_reply(&mut self) -> Result<Option<luxbyte_proto::RawMessage>, PoolError> {
         let connection = self.connection.as_mut().ok_or(PoolError::Closed)?;
         connection.next_reply().await
+    }
+
+    /// See [`Connection::holds_statement`].
+    #[must_use]
+    pub fn holds_statement(&self, name: &str, sql: &str, types: &[i32], since: Instant) -> bool {
+        self.connection
+            .as_ref()
+            .is_some_and(|connection| connection.holds_statement(name, sql, types, since))
+    }
+
+    /// See [`Connection::can_prepare`].
+    #[must_use]
+    pub fn can_prepare(&self, name: &str) -> bool {
+        self.connection
+            .as_ref()
+            .is_some_and(|connection| connection.can_prepare(name))
+    }
+
+    /// See [`Connection::forget_statement`].
+    pub fn forget_statement(&mut self, name: &str) {
+        if let Some(connection) = self.connection.as_mut() {
+            connection.forget_statement(name);
+        }
     }
 
     /// Which backend this connection goes to.
